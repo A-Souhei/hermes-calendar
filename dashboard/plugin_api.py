@@ -3,12 +3,18 @@
 Mounted by the Hermes dashboard at /api/plugins/calendar/ (session auth is
 applied by the dashboard middleware — no auth code needed here).
 
-This module NEVER writes. It reuses the calendar plugin's own ``store`` and
-``recurrence`` modules (loaded as a tiny synthetic package so their relative
-imports resolve) — that keeps occurrence math identical to what fires the
-real alerts, with no logic drift. We deliberately avoid importing the plugin's
-``__init__`` (which pulls in ``tools.registry`` / ``notify``) so this stays
-loadable inside the dashboard service regardless of agent wiring.
+All routes here are read-only — they only SELECT via ``store``. It reuses the
+calendar plugin's own ``store`` and ``recurrence`` modules (loaded as a tiny
+synthetic package so their relative imports resolve) — that keeps occurrence
+math identical to what fires the real alerts, with no logic drift. We
+deliberately avoid importing the plugin's ``__init__`` (which pulls in
+``tools.registry`` / ``notify``) so this stays loadable inside the dashboard
+service regardless of agent wiring.
+
+Note: importing ``store`` runs its idempotent ``init_db()`` (CREATE TABLE IF
+NOT EXISTS) on first import, so loading this module may create the DB
+file/schema if it does not already exist. That is the only write path; every
+HTTP route is strictly read-only.
 """
 
 from __future__ import annotations
@@ -24,6 +30,10 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Query
 
 router = APIRouter()
+
+# Cap the /events window so a huge range can't force expansion of an enormous
+# recurrence set + per-event report loads (DoS guard). Mirrors /upcoming's limit.
+_MAX_RANGE_DAYS = 400
 
 # --- plugin module reuse ----------------------------------------------------
 
@@ -113,6 +123,10 @@ def _parse_range(frm: Optional[str], to: Optional[str]):
     end = end.astimezone(timezone.utc)
     if end <= start:
         raise HTTPException(400, "'to' must be after 'from'")
+    if (end - start) > timedelta(days=_MAX_RANGE_DAYS):
+        raise HTTPException(
+            400, f"range too large; keep 'to' - 'from' within {_MAX_RANGE_DAYS} days"
+        )
     return start, end
 
 

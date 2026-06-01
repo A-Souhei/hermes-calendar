@@ -356,7 +356,10 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
         ):
             base.pop("until", None)
         else:
-            until_dt = _parse_start(raw_until, ev.get("tz") or recurrence_mod.DEFAULT_TZ)
+            # Use the EFFECTIVE tz — if this same call also changes tz, a naive
+            # date must be read in the new zone, not the old one.
+            eff_tz = fields.get("tz") or ev.get("tz") or recurrence_mod.DEFAULT_TZ
+            until_dt = _parse_start(raw_until, eff_tz)
             if until_dt is None:
                 return tool_error(f"Could not parse until date: {raw_until!r}")
             base["until"] = until_dt.astimezone(timezone.utc).isoformat()
@@ -653,7 +656,7 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
             "tz": {"type": "string"},
             "recurrence": {"description": _RECURRENCE_DESCRIPTION},
             "until": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": (
                     "End-date for a recurring series. Merges an 'until' cutoff "
                     "into the EXISTING recurrence rule without restating it "
