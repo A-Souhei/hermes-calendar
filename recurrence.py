@@ -122,7 +122,7 @@ def next_occurrence(event: Dict[str, Any], after_utc: datetime) -> Optional[date
     # Search up to 5 years ahead
     range_end = after_utc + timedelta(days=365 * 5)
     # Inject exceptions into the event dict for occurrences()
-    from store import get_exceptions  # local import to avoid circular at module level
+    from .store import get_exceptions  # local import to avoid circular at module level
     ev = dict(event)
     try:
         ev["_exceptions"] = get_exceptions(event["id"])
@@ -184,7 +184,7 @@ def due_alerts(
     window_start = since_utc - timedelta(days=1)
     window_end = now_utc + timedelta(seconds=max_lead) + timedelta(days=1)
 
-    from store import get_exceptions  # local import to avoid circular
+    from .store import get_exceptions  # local import to avoid circular
     ev = dict(event)
     try:
         ev["_exceptions"] = get_exceptions(event["id"])
