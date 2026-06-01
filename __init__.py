@@ -910,19 +910,13 @@ def register(ctx) -> None:
     # Start the background alert scheduler. start() is idempotent, and the loop
     # only needs SQLite + Home Assistant (not the messaging runtime), so starting
     # at register time is safe and reliable. Also hook on_ready as a backup.
+    # In-gateway scheduler thread (bonus, sub-minute responsiveness when the
+    # agent is active). The RELIABLE alert engine is the every-minute
+    # `hermes cron --no-agent --script calendar_tick.py` job (see README), which
+    # fires reminders regardless of agent activity. Both share fired_alerts dedup.
     scheduler.start()
     if hasattr(ctx, "on_ready"):
         try:
             ctx.on_ready(scheduler.start)
         except Exception:
             pass
-
-
-# Also start the alert loop at module import — the gateway may load plugins
-# lazily and call register() only on the first agent turn, but reminders must
-# run regardless. start() is idempotent, so this is harmless if register() also
-# calls it.
-try:
-    scheduler.start()
-except Exception:
-    logging.getLogger(__name__).exception("calendar: scheduler failed to start at import")

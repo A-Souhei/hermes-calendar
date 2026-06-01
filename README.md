@@ -33,6 +33,22 @@ Reports are stored per `(event, occurrence)`, so each instance of a recurring ev
 - `ha_notify` (default) — push notification (title + message body)
 - `ha_speak` — TTS spoken on phone
 
+## Alert engine
+
+Reminders fire from an **every-minute cron tick** — reliable, independent of
+agent activity (the gateway loads plugins lazily, so the in-gateway thread alone
+is not enough). Put `calendar_tick.py` in `~/.hermes/scripts/` and:
+
+```
+hermes cron create "* * * * *" --name calendar-alerts --no-agent --script calendar_tick.py
+```
+
+`calendar_tick.py` fires due reminders via Home Assistant and prints nothing
+(so cron delivers nothing to chat — alerts go to your phone). It looks back to
+the last tick (capped at `max_catchup_seconds`) so brief downtime still catches
+up; `fired_alerts` dedup guarantees each alert fires once. The in-gateway thread
+is a bonus for sub-minute responsiveness when the agent is active.
+
 ## Storage
 
 SQLite at `$HERMES_HOME/calendar.db` (default `~/.hermes/calendar.db`), WAL mode.
@@ -46,7 +62,9 @@ Optional `~/.hermes/calendar_config.json`:
   "default_lead_seconds": 3600,
   "daily_alert_hour": 9,
   "check_interval_seconds": 60,
-  "boot_catchup_seconds": 7200
+  "boot_catchup_seconds": 7200,
+  "lookback_seconds": 180,
+  "max_catchup_seconds": 21600
 }
 ```
 
