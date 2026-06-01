@@ -21,15 +21,28 @@ import os
 import sys
 
 
+def _hermes_home() -> str:
+    return os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+
+
 def _plugin_dir() -> str:
     return os.environ.get("CALENDAR_PLUGIN_DIR") or os.path.join(
-        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-        "plugins",
-        "calendar",
+        _hermes_home(), "plugins", "calendar"
     )
 
 
+def _load_env() -> None:
+    """Load ~/.hermes/.env so HASS_TOKEN etc. are present regardless of how the
+    cron invokes us (the reminders fire via Home Assistant and need the token)."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(_hermes_home(), ".env"))
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _load_env()
     d = _plugin_dir()
     init_py = os.path.join(d, "__init__.py")
     if not os.path.exists(init_py):
