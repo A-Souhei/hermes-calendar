@@ -187,6 +187,16 @@ def _parse_start(raw: Any, tz_name: str) -> Optional[datetime]:
         return None
 
 
+_CHANNEL_ENUM = ["ha_notify", "ha_speak", "both", "chat", "all", "none"]
+_VALID_CHANNELS = set(_CHANNEL_ENUM)
+_CHANNEL_DESCRIPTION = (
+    "Delivery channel for reminders (default: ha_notify). "
+    "'ha_notify' = phone push; 'ha_speak' = spoken TTS on the phone; "
+    "'both' = push + speak; 'chat' = a text from Calypso in this chat; "
+    "'all' = push + speak + chat; 'none' = no reminder."
+)
+
+
 def _human_recurrence(rec: Optional[Dict]) -> Optional[str]:
     if not rec:
         return None
@@ -250,7 +260,7 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
     lead = _parse_lead(args.get("alert_lead"))
 
     channel = str(args.get("alert_channel") or "ha_notify").strip().lower()
-    if channel not in ("ha_notify", "ha_speak", "none"):
+    if channel not in _VALID_CHANNELS:
         channel = "ha_notify"
 
     meeting_raw = args.get("meeting")
@@ -326,12 +336,38 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
     if "recurrence" in args:
         fields["recurrence"] = _parse_recurrence(args["recurrence"])
 
+    # Convenience: merge an end-date into the EXISTING recurrence rule without
+    # restating it, so freq/byweekday/interval are never lost. Operates on a
+    # recurrence also being set this call, else the stored one.
+    if "until" in args:
+        base = fields.get("recurrence")
+        if base is None:
+            base = ev.get("recurrence")
+        if not base:
+            return tool_error(
+                "`until` only applies to a recurring event — this one has no "
+                "recurrence rule. Set a recurrence first, or pass a full "
+                "`recurrence` that includes 'until'."
+            )
+        base = dict(base)
+        raw_until = args["until"]
+        if raw_until is None or str(raw_until).strip().lower() in (
+            "never", "none", "", "forever", "no end", "indefinite",
+        ):
+            base.pop("until", None)
+        else:
+            until_dt = _parse_start(raw_until, ev.get("tz") or recurrence_mod.DEFAULT_TZ)
+            if until_dt is None:
+                return tool_error(f"Could not parse until date: {raw_until!r}")
+            base["until"] = until_dt.astimezone(timezone.utc).isoformat()
+        fields["recurrence"] = base
+
     if "alert_lead" in args:
         fields["alert_lead_seconds"] = _parse_lead(args["alert_lead"])
 
     if "alert_channel" in args and args["alert_channel"] is not None:
         ch = str(args["alert_channel"]).strip().lower()
-        fields["alert_channel"] = ch if ch in ("ha_notify", "ha_speak", "none") else "ha_notify"
+        fields["alert_channel"] = ch if ch in _VALID_CHANNELS else "ha_notify"
 
     if "meeting" in args:
         meeting_raw = args["meeting"]
@@ -378,10 +414,14 @@ def _handle_calendar_remove_event(args: Dict[str, Any], **kw) -> str:
     if scope == "occurrence":
         if not occurrence_raw:
             return tool_error("occurrence date is required when scope is 'occurrence'")
-        occ_dt = _parse_start(occurrence_raw)
-        if occ_dt is None:
-            return tool_error(f"Could not parse occurrence: {occurrence_raw!r}")
-        occ_iso = occ_dt.astimezone(timezone.utc).isoformat()
+        ev_occ = store.get_event(event_id)
+        if ev_occ is None:
+            return tool_error(f"Event not found: {event_id}")
+        # Snap the given date to the real occurrence on that local day so the
+        # exception actually matches the series' occurrence instant.
+        occ_iso = _resolve_occurrence(ev_occ, occurrence_raw)
+        if occ_iso is None:
+            return tool_error(f"Could not resolve occurrence: {occurrence_raw!r}")
         try:
             store.add_exception(event_id, occ_iso)
         except Exception as e:
@@ -568,8 +608,8 @@ CALENDAR_ADD_EVENT_SCHEMA = {
             "alert_lead": {"description": _ALERT_LEAD_DESCRIPTION},
             "alert_channel": {
                 "type": "string",
-                "enum": ["ha_notify", "ha_speak", "none"],
-                "description": "Delivery channel for reminders (default: ha_notify).",
+                "enum": _CHANNEL_ENUM,
+                "description": _CHANNEL_DESCRIPTION,
             },
             "meeting": {
                 "type": "object",
@@ -612,10 +652,21 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
             "all_day": {"type": "boolean"},
             "tz": {"type": "string"},
             "recurrence": {"description": _RECURRENCE_DESCRIPTION},
+            "until": {
+                "type": "string",
+                "description": (
+                    "End-date for a recurring series. Merges an 'until' cutoff "
+                    "into the EXISTING recurrence rule without restating it "
+                    "(freq/byweekday/interval are preserved) — use this to stop "
+                    "a series on a date, e.g. '2026-12-31'. Pass 'never' or null "
+                    "to remove an existing end date. Only valid for recurring events."
+                ),
+            },
             "alert_lead": {"description": _ALERT_LEAD_DESCRIPTION},
             "alert_channel": {
                 "type": "string",
-                "enum": ["ha_notify", "ha_speak", "none"],
+                "enum": _CHANNEL_ENUM,
+                "description": _CHANNEL_DESCRIPTION,
             },
             "meeting": {
                 "type": "object",
@@ -907,16 +958,10 @@ def register(ctx) -> None:
             emoji=emoji,
         )
 
-    # Start the background alert scheduler. start() is idempotent, and the loop
-    # only needs SQLite + Home Assistant (not the messaging runtime), so starting
-    # at register time is safe and reliable. Also hook on_ready as a backup.
-    # In-gateway scheduler thread (bonus, sub-minute responsiveness when the
-    # agent is active). The RELIABLE alert engine is the every-minute
-    # `hermes cron --no-agent --script calendar_tick.py` job (see README), which
-    # fires reminders regardless of agent activity. Both share fired_alerts dedup.
-    scheduler.start()
-    if hasattr(ctx, "on_ready"):
-        try:
-            ctx.on_ready(scheduler.start)
-        except Exception:
-            pass
+    # Alert delivery is driven SOLELY by the every-minute
+    # `hermes cron --no-agent --script calendar_tick.py` job (see README): it
+    # fires reminders regardless of agent activity and is the only path that can
+    # deliver the "chat" channel (its stdout is posted into the chat). We do NOT
+    # start the in-gateway scheduler thread here — a second firing path would
+    # race the cron on the per-occurrence fired_alerts dedup and could mark a
+    # chat reminder fired before the cron gets a chance to print it.

@@ -1,0 +1,11 @@
+{
+  "name": "calendar",
+  "label": "Calendar",
+  "description": "Your secretary book — events, reminders, meeting details and per-occurrence reports (read-only).",
+  "icon": "CalendarDays",
+  "version": "1.0.0",
+  "tab": { "path": "/calendar", "position": "after:skills" },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
