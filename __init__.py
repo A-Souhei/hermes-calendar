@@ -916,3 +916,13 @@ def register(ctx) -> None:
             ctx.on_ready(scheduler.start)
         except Exception:
             pass
+
+
+# Also start the alert loop at module import — the gateway may load plugins
+# lazily and call register() only on the first agent turn, but reminders must
+# run regardless. start() is idempotent, so this is harmless if register() also
+# calls it.
+try:
+    scheduler.start()
+except Exception:
+    logging.getLogger(__name__).exception("calendar: scheduler failed to start at import")
