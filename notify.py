@@ -6,9 +6,16 @@ Reuses the same config pattern as ha_notify_plugin:
   env HA_NOTIFY_TARGET   — default notify service
   ~/.hermes/ha_notify.json — file overrides (non-empty keys win)
 
-Two channels:
+Delivery channels:
   ha_notify — push notification (title + message body)
   ha_speak  — TTS spoken on phone
+  chat      — a text from Calypso in the chat (delivered out-of-band: the
+              every-minute cron tick prints it to stdout, which the
+              `--no-agent` cron posts into the chat; NOT sent via fire())
+
+The stored ``alert_channel`` is a logical value (ha_notify / ha_speak / both /
+chat / all / none) that ``resolve_channels`` expands into the concrete set
+above.
 """
 
 from __future__ import annotations
@@ -46,6 +53,37 @@ def _load_config() -> dict:
             pass
     cfg["url"] = cfg["url"].rstrip("/")
     return cfg
+
+
+# Logical alert_channel value -> concrete delivery channels. "chat" is handled
+# by the scheduler (printed to stdout), the rest go through fire().
+_CHANNEL_MAP = {
+    "none": [],
+    "ha_notify": ["ha_notify"],
+    "ha_speak": ["ha_speak"],
+    "both": ["ha_notify", "ha_speak"],
+    "chat": ["chat"],
+    "all": ["ha_notify", "ha_speak", "chat"],
+}
+
+
+def resolve_channels(alert_channel) -> list:
+    """Expand a stored alert_channel into concrete delivery channels.
+
+    Accepts a string (the stored form) or a list of strings. Unknown values
+    fall back to ha_notify. Order preserved, deduped. "none" -> [].
+    """
+    if alert_channel is None:
+        return ["ha_notify"]
+    if isinstance(alert_channel, (list, tuple)):
+        out: list = []
+        for c in alert_channel:
+            for r in resolve_channels(c):
+                if r not in out:
+                    out.append(r)
+        return out
+    key = str(alert_channel).strip().lower()
+    return list(_CHANNEL_MAP.get(key, ["ha_notify"]))
 
 
 def available() -> bool:

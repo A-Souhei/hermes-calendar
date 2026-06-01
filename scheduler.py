@@ -85,9 +85,16 @@ def _build_message(event: dict, occ_utc: datetime) -> str:
     return "\n".join(lines)
 
 
-def _process_due(since_utc, now_utc, default_lead, daily_hour) -> int:
-    """Fire any due, unfired alerts in (since_utc, now_utc]. Returns count fired."""
+def _process_due(since_utc, now_utc, default_lead, daily_hour):
+    """Fire any due, unfired alerts in (since_utc, now_utc].
+
+    Returns (fired_count, chat_messages). HA channels (ha_notify / ha_speak)
+    are sent immediately via notify.fire(); the "chat" channel can't be sent
+    from here (no chat runtime) so its message is returned for the cron tick
+    to print to stdout, which the --no-agent cron posts into the chat.
+    """
     fired = 0
+    chat_msgs: list[str] = []
     for ev in store.list_events():
         try:
             for occ_iso, _alert_utc in recurrence.due_alerts(
@@ -98,22 +105,28 @@ def _process_due(since_utc, now_utc, default_lead, daily_hour) -> int:
                 try:
                     occ_utc = datetime.fromisoformat(occ_iso)
                     msg = _build_message(ev, occ_utc)
-                    channel = ev.get("alert_channel") or "ha_notify"
-                    result = notify.fire(channel, ev["title"], msg)
-                    if result.get("ok"):
-                        fired += 1
-                        logger.info("calendar: fired alert event=%s occ=%s channel=%s",
-                                    ev["id"], occ_iso, channel)
-                    else:
-                        logger.warning("calendar: notify failed event=%s occ=%s: %s",
-                                       ev["id"], occ_iso, result.get("error"))
+                    for channel in notify.resolve_channels(ev.get("alert_channel")):
+                        if channel == "chat":
+                            chat_msgs.append(msg)
+                            fired += 1
+                            logger.info("calendar: queued chat reminder event=%s occ=%s",
+                                        ev["id"], occ_iso)
+                            continue
+                        result = notify.fire(channel, ev["title"], msg)
+                        if result.get("ok"):
+                            fired += 1
+                            logger.info("calendar: fired alert event=%s occ=%s channel=%s",
+                                        ev["id"], occ_iso, channel)
+                        else:
+                            logger.warning("calendar: notify failed event=%s occ=%s channel=%s: %s",
+                                           ev["id"], occ_iso, channel, result.get("error"))
                 except Exception as fire_exc:
                     logger.exception("calendar: error firing alert event=%s occ=%s: %s",
                                      ev["id"], occ_iso, fire_exc)
                 store.mark_fired(ev["id"], occ_iso)  # mark even on failure (no retry storm)
         except Exception as ev_exc:
             logger.exception("calendar: error processing event=%s: %s", ev.get("id"), ev_exc)
-    return fired
+    return fired, chat_msgs
 
 
 def _state_path() -> str:
@@ -142,12 +155,19 @@ def tick_once() -> int:
         last = None
     since = (now - timedelta(seconds=lookback)) if last is None \
         else max(last, now - timedelta(seconds=max_catch))
-    fired = _process_due(since, now, int(cfg["default_lead_seconds"]), int(cfg["daily_alert_hour"]))
+    fired, chat_msgs = _process_due(
+        since, now, int(cfg["default_lead_seconds"]), int(cfg["daily_alert_hour"])
+    )
     try:
         with open(sp, "w") as f:
             f.write(now.isoformat())
     except Exception:
         logger.warning("calendar: could not write last-tick state")
+    # Print any "chat"-channel reminders to stdout — the --no-agent cron that
+    # runs this tick delivers stdout straight into the chat. Nothing printed
+    # when there are no chat reminders, so the cron stays silent otherwise.
+    if chat_msgs:
+        print("\n\n".join(chat_msgs))
     return fired
 
 
@@ -162,6 +182,8 @@ def _loop() -> None:
     while True:
         try:
             now = datetime.now(timezone.utc)
+            # Chat reminders are intentionally dropped on this path — the loop
+            # has no chat runtime; "chat" is delivered only by the cron tick.
             _process_due(last_check, now, default_lead, daily_hour)
             last_check = now
         except Exception as tick_exc:
