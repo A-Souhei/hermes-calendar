@@ -163,19 +163,25 @@ def _check_available() -> bool:
     return True
 
 
-def _parse_start(raw: Any) -> Optional[datetime]:
+def _parse_start(raw: Any, tz_name: str) -> Optional[datetime]:
     """Parse a start string to an aware datetime.
 
-    The agent must supply an absolute datetime string — dateutil.parser handles
-    most ISO and human formats. Returns None on failure.
+    The agent supplies an absolute datetime string — dateutil.parser handles
+    most ISO and human formats. A NAIVE datetime (no offset, e.g. "2026-06-05
+    15:00") is interpreted in the event's LOCAL timezone (tz_name) — so "3pm"
+    means 3pm where the user is, not UTC. Callers convert to UTC for storage.
+    Returns None on failure.
     """
     if raw is None:
         return None
     try:
+        from zoneinfo import ZoneInfo
         dt = dtparser.parse(str(raw))
         if dt.tzinfo is None:
-            # Treat naively as UTC
-            dt = dt.replace(tzinfo=timezone.utc)
+            try:
+                dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+            except Exception:
+                dt = dt.replace(tzinfo=ZoneInfo(recurrence_mod.DEFAULT_TZ))
         return dt
     except Exception:
         return None
@@ -233,11 +239,11 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         return tool_error(
             "start is required — pass an absolute datetime string, e.g. '2026-06-10T14:00:00+03:00'"
         )
-    start_dt = _parse_start(start_raw)
+    tz_name = args.get("tz") or recurrence_mod.DEFAULT_TZ
+    start_dt = _parse_start(start_raw, tz_name)
     if start_dt is None:
         return tool_error(f"Could not parse start datetime: {start_raw!r}")
 
-    tz_name = args.get("tz") or recurrence_mod.DEFAULT_TZ
     start_utc = start_dt.astimezone(timezone.utc).isoformat()
 
     rec = _parse_recurrence(args.get("recurrence"))
@@ -305,7 +311,8 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
         fields["description"] = args["description"]
 
     if "start" in args and args["start"] is not None:
-        start_dt = _parse_start(args["start"])
+        start_tz = args.get("tz") or ev.get("tz") or recurrence_mod.DEFAULT_TZ
+        start_dt = _parse_start(args["start"], start_tz)
         if start_dt is None:
             return tool_error(f"Could not parse start: {args['start']!r}")
         fields["start_utc"] = start_dt.astimezone(timezone.utc).isoformat()
