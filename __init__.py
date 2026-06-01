@@ -703,6 +703,184 @@ CALENDAR_GET_EVENT_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Reports — per-occurrence minutes / transcription / notes (one-time & recurring)
+# ---------------------------------------------------------------------------
+
+_REPORT_TEXT_FIELDS = ("minutes", "transcription", "summary", "outcome", "notes")
+_REPORT_LIST_FIELDS = ("attendees", "action_items", "decisions", "links", "tags")
+
+
+def _resolve_occurrence(ev: Dict[str, Any], occurrence_arg: Any) -> Optional[str]:
+    """Resolve the UTC-iso occurrence key a report attaches to.
+
+    one-time + no occurrence -> the event's own start; occurrence given -> snap
+    to the real occurrence on that local day if any, else the provided instant;
+    recurring + no occurrence -> None (caller must supply a date).
+    """
+    tz_name = ev.get("tz") or recurrence_mod.DEFAULT_TZ
+    if not occurrence_arg:
+        if not ev.get("recurrence"):
+            return ev["start_utc"]
+        return None
+    dt = _parse_start(occurrence_arg, tz_name)
+    if dt is None:
+        return None
+    occ_utc = dt.astimezone(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        etz = ZoneInfo(tz_name)
+        local = occ_utc.astimezone(etz)
+        day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        occs = recurrence_mod.occurrences(
+            ev, day_start.astimezone(timezone.utc), day_end.astimezone(timezone.utc)
+        )
+        if occs:
+            return occs[0].astimezone(timezone.utc).isoformat()
+    except Exception:
+        pass
+    return occ_utc.isoformat()
+
+
+def _build_report(args: Dict[str, Any]) -> Dict[str, Any]:
+    report: Dict[str, Any] = {}
+    for k in _REPORT_TEXT_FIELDS:
+        v = args.get(k)
+        if v is not None and str(v).strip():
+            report[k] = v
+    for k in _REPORT_LIST_FIELDS:
+        v = args.get(k)
+        if v is not None:
+            report[k] = v if isinstance(v, list) else [v]
+    return report
+
+
+def _report_event_id(args: Dict[str, Any]) -> str:
+    return str(args.get("id") or args.get("event_id") or "").strip()
+
+
+def _handle_calendar_set_report(args: Dict[str, Any], **kw) -> str:
+    event_id = _report_event_id(args)
+    if not event_id:
+        return tool_error("id (the event id) is required")
+    ev = store.get_event(event_id)
+    if ev is None:
+        return tool_error(f"Event not found: {event_id}")
+    occ = _resolve_occurrence(ev, args.get("occurrence"))
+    if occ is None:
+        return tool_error(
+            "This is a recurring event — pass 'occurrence' (the date of the occurrence, "
+            "e.g. '2026-06-05') so the report attaches to the right day."
+        )
+    report = _build_report(args)
+    if not report:
+        return tool_error(
+            "Provide at least one of: minutes, transcription, summary, outcome, notes, "
+            "attendees, action_items, decisions, links, tags."
+        )
+    existing = store.get_report(event_id, occ)
+    merged = {**existing["report"], **report} if (existing and isinstance(existing.get("report"), dict)) else report
+    store.set_report(event_id, occ, merged)
+    return tool_result({"saved": True, "event_id": event_id, "title": ev.get("title"),
+                        "occurrence_utc": occ, "report": merged})
+
+
+def _handle_calendar_get_report(args: Dict[str, Any], **kw) -> str:
+    event_id = _report_event_id(args)
+    if not event_id:
+        return tool_error("id (the event id) is required")
+    ev = store.get_event(event_id)
+    if ev is None:
+        return tool_error(f"Event not found: {event_id}")
+    occ = _resolve_occurrence(ev, args.get("occurrence"))
+    if occ is None:
+        return tool_error("Recurring event — pass 'occurrence' (the occurrence date).")
+    rep = store.get_report(event_id, occ)
+    if not rep:
+        return tool_result({"found": False, "event_id": event_id,
+                            "title": ev.get("title"), "occurrence_utc": occ})
+    return tool_result({"found": True, "event_id": event_id, "title": ev.get("title"),
+                        "occurrence_utc": occ, "report": rep["report"],
+                        "created_utc": rep.get("created_utc"), "updated_utc": rep.get("updated_utc")})
+
+
+def _handle_calendar_list_reports(args: Dict[str, Any], **kw) -> str:
+    event_id = _report_event_id(args)
+    if not event_id:
+        return tool_error("id (the event id) is required")
+    ev = store.get_event(event_id)
+    if ev is None:
+        return tool_error(f"Event not found: {event_id}")
+    reps = store.list_reports(event_id)
+    return tool_result({"event_id": event_id, "title": ev.get("title"), "count": len(reps),
+                        "reports": [{"occurrence_utc": r["occurrence_utc"], "report": r["report"],
+                                     "updated_utc": r.get("updated_utc")} for r in reps]})
+
+
+_REPORT_FIELDS_DESC = (
+    "Provide any of (they merge into an existing report): minutes, transcription, "
+    "summary, outcome, notes (text); attendees, action_items, decisions, links, tags (lists)."
+)
+
+CALENDAR_SET_REPORT_SCHEMA = {
+    "name": "calendar_set_report",
+    "description": (
+        "Attach/update a REPORT for a specific occurrence of an event — the minutes, "
+        "transcription, attendees, decisions or outcome of a meeting/visio that happened. "
+        "Works for one-time AND recurring events (for recurring, pass 'occurrence' = the date). "
+        + _REPORT_FIELDS_DESC
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "The event id."},
+            "occurrence": {"type": "string", "description": "Occurrence date/datetime — required for recurring events; omit for one-time."},
+            "minutes": {"type": "string", "description": "Meeting minutes / what happened."},
+            "transcription": {"type": "string", "description": "Full transcription of the meeting."},
+            "summary": {"type": "string", "description": "Short summary."},
+            "outcome": {"type": "string", "description": "Outcome / result."},
+            "notes": {"type": "string", "description": "Freeform notes."},
+            "attendees": {"type": "array", "items": {"type": "string"}, "description": "Who actually attended."},
+            "action_items": {"type": "array", "items": {"type": "string"}, "description": "Action items / TODOs."},
+            "decisions": {"type": "array", "items": {"type": "string"}, "description": "Decisions made."},
+            "links": {"type": "array", "items": {"type": "string"}, "description": "Related links / recordings."},
+            "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags."},
+        },
+        "required": ["id"],
+    },
+}
+
+CALENDAR_GET_REPORT_SCHEMA = {
+    "name": "calendar_get_report",
+    "description": (
+        "Read the report (minutes/transcription/attendees/outcome/…) for a specific "
+        "occurrence of an event. For a recurring event pass 'occurrence' (the date)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "The event id."},
+            "occurrence": {"type": "string", "description": "Occurrence date/datetime — required for recurring; omit for one-time."},
+        },
+        "required": ["id"],
+    },
+}
+
+CALENDAR_LIST_REPORTS_SCHEMA = {
+    "name": "calendar_list_reports",
+    "description": (
+        "List every report recorded for an event across its occurrences (e.g. all "
+        "weekly-standup minutes). Returns each occurrence date and its report."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"id": {"type": "string", "description": "The event id."}},
+        "required": ["id"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -712,6 +890,9 @@ _TOOLS = (
     ("calendar_remove_event", CALENDAR_REMOVE_EVENT_SCHEMA, _handle_calendar_remove_event, "🗑️"),
     ("calendar_list_events",  CALENDAR_LIST_EVENTS_SCHEMA,  _handle_calendar_list_events,  "📋"),
     ("calendar_get_event",    CALENDAR_GET_EVENT_SCHEMA,    _handle_calendar_get_event,    "🔍"),
+    ("calendar_set_report",   CALENDAR_SET_REPORT_SCHEMA,   _handle_calendar_set_report,   "📝"),
+    ("calendar_get_report",   CALENDAR_GET_REPORT_SCHEMA,   _handle_calendar_get_report,   "📖"),
+    ("calendar_list_reports", CALENDAR_LIST_REPORTS_SCHEMA, _handle_calendar_list_reports, "🗂️"),
 )
 
 
@@ -726,8 +907,12 @@ def register(ctx) -> None:
             emoji=emoji,
         )
 
-    # Start the background alert scheduler after Hermes is fully initialised
+    # Start the background alert scheduler. start() is idempotent, and the loop
+    # only needs SQLite + Home Assistant (not the messaging runtime), so starting
+    # at register time is safe and reliable. Also hook on_ready as a backup.
+    scheduler.start()
     if hasattr(ctx, "on_ready"):
-        ctx.on_ready(scheduler.start)
-    else:
-        scheduler.start()
+        try:
+            ctx.on_ready(scheduler.start)
+        except Exception:
+            pass

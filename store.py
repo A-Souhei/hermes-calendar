@@ -69,6 +69,15 @@ def init_db() -> None:
                 fired_utc       TEXT NOT NULL,
                 PRIMARY KEY (event_id, occurrence_utc)
             );
+
+            CREATE TABLE IF NOT EXISTS reports (
+                event_id        TEXT NOT NULL,
+                occurrence_utc  TEXT NOT NULL,
+                report          TEXT NOT NULL,
+                created_utc     TEXT,
+                updated_utc     TEXT,
+                PRIMARY KEY (event_id, occurrence_utc)
+            );
         """)
         conn.commit()
 
@@ -173,6 +182,7 @@ def remove_event(event_id: str) -> bool:
         cursor = conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
         conn.execute("DELETE FROM exceptions WHERE event_id = ?", (event_id,))
         conn.execute("DELETE FROM fired_alerts WHERE event_id = ?", (event_id,))
+        conn.execute("DELETE FROM reports WHERE event_id = ?", (event_id,))
         conn.commit()
     return cursor.rowcount > 0
 
@@ -229,6 +239,59 @@ def mark_fired(event_id: str, occurrence_iso: str) -> None:
             (event_id, occurrence_iso, _now_iso()),
         )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Reports (per-occurrence minutes / transcription / notes)
+# ---------------------------------------------------------------------------
+
+def set_report(event_id: str, occurrence_utc: str, report: Dict[str, Any]) -> None:
+    """Create or replace the report for one occurrence of an event (preserves created_utc)."""
+    now = _now_iso()
+    with _lock:
+        conn = _get_conn()
+        existing = conn.execute(
+            "SELECT created_utc FROM reports WHERE event_id = ? AND occurrence_utc = ?",
+            (event_id, occurrence_utc),
+        ).fetchone()
+        created = existing["created_utc"] if existing else now
+        conn.execute(
+            """INSERT INTO reports (event_id, occurrence_utc, report, created_utc, updated_utc)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(event_id, occurrence_utc)
+               DO UPDATE SET report = excluded.report, updated_utc = excluded.updated_utc""",
+            (event_id, occurrence_utc, json.dumps(report), created, now),
+        )
+        conn.commit()
+
+
+def _row_to_report(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    try:
+        d["report"] = json.loads(d["report"])
+    except (json.JSONDecodeError, TypeError):
+        d["report"] = {}
+    return d
+
+
+def get_report(event_id: str, occurrence_utc: str) -> Optional[Dict[str, Any]]:
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT * FROM reports WHERE event_id = ? AND occurrence_utc = ?",
+            (event_id, occurrence_utc),
+        ).fetchone()
+    return _row_to_report(row) if row else None
+
+
+def list_reports(event_id: str) -> List[Dict[str, Any]]:
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM reports WHERE event_id = ? ORDER BY occurrence_utc",
+            (event_id,),
+        ).fetchall()
+    return [_row_to_report(r) for r in rows]
 
 
 # Run on import

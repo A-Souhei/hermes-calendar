@@ -13,6 +13,11 @@ is added separately.
 | `calendar_remove_event` | Delete a series (`scope=all`) or skip one occurrence (`scope=occurrence`). |
 | `calendar_list_events` | Expand occurrences in a date range; optional substring filter. |
 | `calendar_get_event` | Full details: recurrence, alert config, meeting, next occurrence. |
+| `calendar_set_report` | Attach/update a **report** for one occurrence — minutes, transcription, attendees, decisions, outcome (a meeting/visio that happened). One-time *and* recurring (pass `occurrence` for recurring). Fields merge. |
+| `calendar_get_report` | Read the report for a given occurrence. |
+| `calendar_list_reports` | All reports for an event across its occurrences. |
+
+Reports are stored per `(event, occurrence)`, so each instance of a recurring event (e.g. every weekly standup) keeps its own minutes/transcription, and one-off meetings get a report too.
 
 ## Alert defaults
 
