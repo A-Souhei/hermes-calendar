@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from dateutil import parser as dtparser
 
+from . import notify
 from . import recurrence as recurrence_mod
 from . import scheduler
 from . import store
@@ -189,13 +190,31 @@ def _parse_start(raw: Any, tz_name: str) -> Optional[datetime]:
 
 _STATUS_ENUM = ["confirmed", "missed", "floating"]
 
-_CHANNEL_ENUM = ["ha_notify", "ha_speak", "both", "chat", "all", "none"]
+_CHANNEL_ENUM = ["ha_notify", "ha_speak", "both", "chat", "email", "all", "none"]
 _VALID_CHANNELS = set(_CHANNEL_ENUM)
 _CHANNEL_DESCRIPTION = (
     "Delivery channel for reminders (default: ha_notify). "
     "'ha_notify' = phone push; 'ha_speak' = spoken TTS on the phone; "
     "'both' = push + speak; 'chat' = a text from Calypso in this chat; "
-    "'all' = push + speak + chat; 'none' = no reminder."
+    "'email' = emailed reminder to the asker's registered address (set via "
+    "calendar_set_user_email) or an explicit notify_email; only sends to "
+    "addresses in the allowlist, and sends nothing if no address is known; "
+    "'all' = push + speak + chat + email; 'none' = no reminder."
+)
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+_OWNER_DESCRIPTION = (
+    "Name/identifier of the person this event belongs to (the asker). Set it "
+    "from who is making the request, and use a CONSISTENT identifier per person "
+    "so their email association resolves. Required for email reminders unless an "
+    "explicit notify_email is given."
+)
+
+_NOTIFY_EMAIL_DESCRIPTION = (
+    "Explicit email address to send this event's email reminder to (overrides "
+    "the owner's registered address). Only used if the address is in the "
+    "allowlist; otherwise no email is sent."
 )
 
 _LANGUAGE_ENUM = ["en", "fr"]
@@ -244,6 +263,8 @@ def _event_summary(ev: Dict) -> Dict:
         "language": ev.get("language"),
         "location": ev.get("location"),
         "tags": ev.get("tags"),
+        "owner": ev.get("owner"),
+        "notify_email": ev.get("notify_email"),
     }
 
 
@@ -295,6 +316,14 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         lang_lower = str(lang_raw).strip().lower()
         language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
 
+    owner_raw = args.get("owner")
+    owner = str(owner_raw).strip() or None if owner_raw is not None else None
+    notify_email_raw = args.get("notify_email")
+    notify_email = (
+        str(notify_email_raw).strip().lower() or None
+        if notify_email_raw is not None else None
+    )
+
     d = {
         "title": title,
         "description": args.get("description"),
@@ -308,6 +337,8 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         "location": args.get("location"),
         "tags": tags,
         "language": language,
+        "owner": owner,
+        "notify_email": notify_email,
     }
     try:
         event_id = store.add_event(d)
@@ -416,6 +447,16 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
         else:
             lang_lower = str(lang_raw).strip().lower()
             fields["language"] = lang_lower if lang_lower in _LANGUAGE_ENUM else None
+
+    if "owner" in args:
+        owner_raw = args["owner"]
+        fields["owner"] = (str(owner_raw).strip() or None) if owner_raw is not None else None
+
+    if "notify_email" in args:
+        ne_raw = args["notify_email"]
+        fields["notify_email"] = (
+            (str(ne_raw).strip().lower() or None) if ne_raw is not None else None
+        )
 
     if not fields:
         return tool_error("No updatable fields provided")
@@ -590,6 +631,8 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
         "language": ev.get("language"),
+        "owner": ev.get("owner"),
+        "notify_email": ev.get("notify_email"),
         "meeting": ev.get("meeting"),
         "location": ev.get("location"),
         "tags": ev.get("tags"),
@@ -599,6 +642,41 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
         "created_utc": ev.get("created_utc"),
         "updated_utc": ev.get("updated_utc"),
     })
+
+
+# ---------------------------------------------------------------------------
+# User email registry handlers
+# ---------------------------------------------------------------------------
+
+def _handle_calendar_set_user_email(args: Dict[str, Any], **kw) -> str:
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return tool_error("name is required")
+    email = str(args.get("email") or "").strip().lower()
+    if not email or not _EMAIL_RE.match(email):
+        return tool_error(f"That does not look like a valid email address: {args.get('email')!r}")
+
+    allowed = notify.allowed_email_recipients()
+    if email not in allowed:
+        return tool_error(
+            f"Refusing to store {email!r}: email reminders may only be sent to "
+            "allowlisted addresses (EMAIL_ALLOWED_USERS). Ask an admin to add it "
+            "to the allowlist before associating it."
+        )
+
+    try:
+        store.set_user_email(name, email)
+    except Exception as e:
+        logger.exception("calendar_set_user_email store error")
+        return tool_error(f"Failed to store email association: {e}")
+    return tool_result({"associated": name, "email": email})
+
+
+def _handle_calendar_list_user_emails(args: Dict[str, Any], **kw) -> str:
+    try:
+        return tool_result({"associations": store.list_user_emails()})
+    except Exception as e:
+        return tool_error(f"Failed to list email associations: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +755,8 @@ CALENDAR_ADD_EVENT_SCHEMA = {
                 "enum": ["en", "fr", None],
                 "description": _LANGUAGE_DESCRIPTION,
             },
+            "owner": {"type": ["string", "null"], "description": _OWNER_DESCRIPTION},
+            "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
         },
         "required": ["title", "start"],
     },
@@ -730,6 +810,8 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
                 "enum": ["en", "fr", None],
                 "description": _LANGUAGE_DESCRIPTION,
             },
+            "owner": {"type": ["string", "null"], "description": _OWNER_DESCRIPTION},
+            "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
         },
         "required": ["id"],
     },
@@ -1053,6 +1135,14 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
         lang_lower = str(lang_raw).strip().lower()
         timer_language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
 
+    owner_raw = args.get("owner")
+    timer_owner = str(owner_raw).strip() or None if owner_raw is not None else None
+    notify_email_raw = args.get("notify_email")
+    timer_notify_email = (
+        str(notify_email_raw).strip().lower() or None
+        if notify_email_raw is not None else None
+    )
+
     event_data = {
         "title": title,
         "description": args.get("description"),
@@ -1066,6 +1156,8 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
         "location": args.get("location"),
         "tags": tags,
         "language": timer_language,
+        "owner": timer_owner,
+        "notify_email": timer_notify_email,
     }
     try:
         event_id = store.add_event(event_data)
@@ -1248,6 +1340,8 @@ CALENDAR_START_TIMER_SCHEMA = {
                 "enum": ["en", "fr", None],
                 "description": _LANGUAGE_DESCRIPTION,
             },
+            "owner": {"type": ["string", "null"], "description": _OWNER_DESCRIPTION},
+            "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
         },
         "required": ["title"],
     },
@@ -1282,6 +1376,50 @@ CALENDAR_STOP_TIMER_SCHEMA = {
 }
 
 
+CALENDAR_SET_USER_EMAIL_SCHEMA = {
+    "name": "calendar_set_user_email",
+    "description": (
+        "Associate a person's name/identifier with their email address so EMAIL-channel "
+        "reminders reach them. When someone first asks for email reminders, ASK them for "
+        "the address they want reminders sent to, then call this with their consistent "
+        "identifier (the same 'owner' you set on their events) and that address. "
+        "SECURITY: only addresses in the configured allowlist (EMAIL_ALLOWED_USERS) are "
+        "accepted — a non-allowlisted address is rejected and not stored. Once associated, "
+        "any event whose owner matches this name and whose channel includes 'email' will be "
+        "emailed here (unless the event overrides it with an explicit notify_email)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": (
+                    "The person's name/identifier — use the SAME value you set as an event's "
+                    "'owner' so reminders resolve. Case-insensitive."
+                ),
+            },
+            "email": {
+                "type": "string",
+                "description": "Their email address. Must be one of the allowlisted addresses.",
+            },
+        },
+        "required": ["name", "email"],
+    },
+}
+
+CALENDAR_LIST_USER_EMAILS_SCHEMA = {
+    "name": "calendar_list_user_emails",
+    "description": (
+        "List all name -> email associations the calendar knows about (so you or the user "
+        "can see who email reminders are routed to). Takes no arguments."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
@@ -1298,6 +1436,8 @@ _TOOLS = (
     ("calendar_set_status",   CALENDAR_SET_STATUS_SCHEMA,   _handle_calendar_set_status,   "✅"),
     ("calendar_start_timer",  CALENDAR_START_TIMER_SCHEMA,  _handle_calendar_start_timer,  "⏱️"),
     ("calendar_stop_timer",   CALENDAR_STOP_TIMER_SCHEMA,   _handle_calendar_stop_timer,   "⏹️"),
+    ("calendar_set_user_email",   CALENDAR_SET_USER_EMAIL_SCHEMA,   _handle_calendar_set_user_email,   "📧"),
+    ("calendar_list_user_emails", CALENDAR_LIST_USER_EMAILS_SCHEMA, _handle_calendar_list_user_emails, "📇"),
 )
 
 

@@ -55,8 +55,17 @@ def init_db() -> None:
                 location        TEXT,
                 tags            TEXT,
                 language        TEXT,
+                owner           TEXT,
+                notify_email    TEXT,
                 created_utc     TEXT,
                 updated_utc     TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS user_emails (
+                name        TEXT PRIMARY KEY,
+                email       TEXT NOT NULL,
+                created_utc TEXT,
+                updated_utc TEXT
             );
 
             CREATE TABLE IF NOT EXISTS exceptions (
@@ -101,6 +110,12 @@ def init_db() -> None:
         if "language" not in cols:
             conn.execute("ALTER TABLE events ADD COLUMN language TEXT")
             conn.commit()
+        if "owner" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN owner TEXT")
+            conn.commit()
+        if "notify_email" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN notify_email TEXT")
+            conn.commit()
 
 
 def _now_iso() -> str:
@@ -137,8 +152,9 @@ def add_event(d: Dict[str, Any]) -> str:
             INSERT INTO events
                 (id, title, description, start_utc, tz, all_day,
                  recurrence, alert_lead_seconds, alert_channel,
-                 meeting, location, tags, language, created_utc, updated_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 meeting, location, tags, language, owner, notify_email,
+                 created_utc, updated_utc)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 event_id,
@@ -154,6 +170,8 @@ def add_event(d: Dict[str, Any]) -> str:
                 d.get("location"),
                 json.dumps(d["tags"]) if d.get("tags") is not None else None,
                 d.get("language"),
+                d.get("owner"),
+                d.get("notify_email"),
                 now,
                 now,
             ),
@@ -215,6 +233,65 @@ def list_events() -> List[Dict[str, Any]]:
         conn = _get_conn()
         rows = conn.execute("SELECT * FROM events ORDER BY start_utc").fetchall()
     return [_row_to_event(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# User email registry (name -> email, for email-channel reminders)
+# ---------------------------------------------------------------------------
+
+def set_user_email(name: str, email: str) -> None:
+    """Upsert a person's email association. The name (lowercased+stripped) is
+    the key; the email is stored lowercased+stripped. created_utc is preserved
+    on conflict; updated_utc is always bumped."""
+    key = str(name).strip().lower()
+    addr = str(email).strip().lower()
+    now = _now_iso()
+    with _lock:
+        conn = _get_conn()
+        existing = conn.execute(
+            "SELECT created_utc FROM user_emails WHERE name = ?", (key,)
+        ).fetchone()
+        created = existing["created_utc"] if existing else now
+        conn.execute(
+            """INSERT INTO user_emails (name, email, created_utc, updated_utc)
+               VALUES (?,?,?,?)
+               ON CONFLICT(name) DO UPDATE SET
+                 email       = excluded.email,
+                 updated_utc = excluded.updated_utc""",
+            (key, addr, created, now),
+        )
+        conn.commit()
+
+
+def get_user_email(name: str) -> Optional[str]:
+    """Return the registered email for a name (lookup by lowercased name), or None."""
+    key = str(name).strip().lower()
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT email FROM user_emails WHERE name = ?", (key,)
+        ).fetchone()
+    return row["email"] if row else None
+
+
+def list_user_emails() -> List[Dict[str, Any]]:
+    """Return all name -> email associations."""
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM user_emails ORDER BY name"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_user_email(name: str) -> bool:
+    """Delete a name's email association. Returns True if a row was deleted."""
+    key = str(name).strip().lower()
+    with _lock:
+        conn = _get_conn()
+        cursor = conn.execute("DELETE FROM user_emails WHERE name = ?", (key,))
+        conn.commit()
+    return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

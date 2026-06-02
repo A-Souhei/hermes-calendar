@@ -181,6 +181,30 @@ def _process_due(since_utc, now_utc, default_lead, daily_hour):
                             logger.info("calendar: queued chat reminder event=%s occ=%s",
                                         ev["id"], occ_iso)
                             continue
+                        if channel == "email":
+                            recipient = ev.get("notify_email") or (
+                                store.get_user_email(ev["owner"]) if ev.get("owner") else None
+                            )
+                            if not recipient:
+                                logger.info(
+                                    "calendar: email channel but no recipient (owner=%s) — skipping",
+                                    ev.get("owner"))
+                                continue
+                            allowed = notify.allowed_email_recipients()
+                            if recipient.lower() not in allowed:
+                                logger.warning(
+                                    "calendar: refusing email to non-allowlisted recipient %s",
+                                    recipient)
+                                continue
+                            result = notify.fire("email", ev["title"], msg, target=recipient)
+                            if result.get("ok"):
+                                fired += 1
+                                logger.info("calendar: emailed reminder event=%s occ=%s to=%s",
+                                            ev["id"], occ_iso, recipient)
+                            else:
+                                logger.warning("calendar: email failed event=%s occ=%s: %s",
+                                               ev["id"], occ_iso, result.get("error"))
+                            continue
                         result = notify.fire(channel, ev["title"], msg)
                         if result.get("ok"):
                             fired += 1
