@@ -152,14 +152,16 @@
     const derived = isDerivedMiss(ev);
     const glyph = statusGlyph(eff);
     const prefix = (glyph ? h("span", { className: cn("cal-status-glyph", derived && "cal-status-derived") }, glyph) : null);
+    const planGlyph = ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null;
     return h(
       "button",
       {
         className: cn("cal-chip", ev.recurring ? "cal-chip-recurring" : "cal-chip-once"),
-        title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (eff !== "floating" ? " · " + (derived ? "missed (unconfirmed)" : eff) : ""),
+        title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (eff !== "floating" ? " · " + (derived ? "missed (unconfirmed)" : eff) : "") + (ev.planning ? " · plan: " + ev.planning : ""),
         onClick: function () { props.onOpen(ev.id); },
       },
       prefix,
+      planGlyph,
       h("span", { className: "cal-chip-title" }, (ev.has_report ? "📝 " : "") + ev.title)
     );
   }
@@ -235,10 +237,11 @@
                     {
                       key: ev.id + "@" + ev.occurrence_utc + i,
                       className: cn("cal-chip cal-dayrow", ev.recurring ? "cal-chip-recurring" : "cal-chip-once"),
-                      title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : ""),
+                      title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (ev.planning ? " · plan: " + ev.planning : ""),
                       onClick: function () { props.onOpenEvent(ev.id); },
                     },
                     glyph ? h("span", { className: cn("cal-status-glyph", derived && "cal-status-derived") }, glyph) : null,
+                    ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null,
                     h("span", { className: "cal-chip-title" }, (ev.has_report ? "📝 " : "") + timeStr + " · " + ev.title + durStr)
                   );
                 })
@@ -370,6 +373,9 @@
                   "dl",
                   { className: "cal-kv" },
                   h(KV, { label: "When", value: fmtDateTime(data.start_utc, data.tz, data.all_day) + (data.all_day ? " (all day)" : "") }),
+                  data.planning
+                    ? h(KV, { label: "Planning", value: h(Badge, { variant: "secondary" }, "🗜️ " + data.planning) })
+                    : null,
                   h(KV, { label: "Timezone", value: data.tz }),
                   h(KV, { label: "Location", value: data.location }),
                   h(KV, { label: "Alert", value: data.alert_channel }),
@@ -476,9 +482,9 @@
     );
   }
 
-  // --- main page ------------------------------------------------------------
+  // --- month-grid calendar view --------------------------------------------
 
-  function CalendarPage() {
+  function CalendarView() {
     const [anchor, setAnchor] = useState(function () { return monthAnchor(new Date()); });
     const [openId, setOpenId] = useState(null);
     const [openDay, setOpenDay] = useState(null);
@@ -593,7 +599,269 @@
     );
   }
 
+  // --- plannings ------------------------------------------------------------
+
+  function ProgressBar(props) {
+    var pct = Math.max(0, Math.min(100, Number(props.pct) || 0));
+    return h(
+      "div",
+      { className: "cal-progress" },
+      h("div", { className: "cal-progress-fill", style: { width: pct + "%" } })
+    );
+  }
+
+  function PlanningDetail(props) {
+    const id = props.planningId;
+    const [data, setData] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+
+    useEffect(function () {
+      let alive = true;
+      setLoading(true);
+      setError(null);
+      SDK.fetchJSON(API + "/planning/" + encodeURIComponent(id))
+        .then(function (d) { if (alive) { setData(d); setLoading(false); } })
+        .catch(function (err) { if (alive) { setError((err && err.message) || "Failed to load"); setLoading(false); } });
+      return function () { alive = false; };
+    }, [id]);
+
+    const overall = (data && data.overall) || {};
+    const objectives = (data && data.objectives) || [];
+    const events = (data && data.events) || [];
+
+    return h(
+      "div",
+      {
+        className: "fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-8 bg-black/60 cal-overlay",
+        onClick: function (e) { if (e.target === e.currentTarget) props.onClose(); },
+      },
+      h(
+        "div",
+        { className: "cal-modal w-full max-w-2xl shadow-xl" },
+        h(
+          "div",
+          { className: "cal-modal-body p-5 space-y-4" },
+          h(
+            "div",
+            { className: "cal-modal-head flex items-start justify-between gap-3" },
+            h(
+              "div",
+              { className: "space-y-1" },
+              h("h2", { className: "text-lg font-semibold leading-tight" }, data ? "🗜️ " + data.name : "Loading…"),
+              data && data.period_label ? h("span", { className: "text-sm opacity-60" }, data.period_label) : null
+            ),
+            h(Button, { variant: "ghost", size: "sm", onClick: props.onClose }, "✕")
+          ),
+
+          loading ? h("div", { className: "text-sm opacity-60 py-6" }, "Loading…") : null,
+          error ? h("div", { className: "text-sm text-red-600 py-6" }, error) : null,
+
+          data
+            ? h(
+                "div",
+                { className: "space-y-4" },
+                data.description
+                  ? h("div", { className: "text-sm whitespace-pre-wrap opacity-80" }, data.description)
+                  : null,
+
+                // overall progress
+                h(
+                  "div",
+                  { className: "space-y-1" },
+                  h(
+                    "div",
+                    { className: "flex items-center justify-between gap-2 text-sm" },
+                    h("span", { className: "font-medium" }, "Overall"),
+                    h("span", { className: "opacity-70" }, (overall.confirmed || 0) + "/" + (overall.total || 0) + " completed (" + (overall.completion_pct || 0) + "%)")
+                  ),
+                  h(ProgressBar, { pct: overall.completion_pct })
+                ),
+
+                // per-objective
+                objectives.length
+                  ? h(
+                      "div",
+                      { className: "space-y-2" },
+                      h("div", { className: "text-sm font-semibold" }, "Objectives (" + objectives.length + ")"),
+                      objectives.map(function (o, i) {
+                        var total = o.total || 0;
+                        var conf = o.confirmed || 0;
+                        var pct = total > 0 ? Math.round((conf / total) * 100) : 0;
+                        return h(
+                          "div",
+                          { key: i, className: "space-y-1" },
+                          h(
+                            "div",
+                            { className: "flex items-center justify-between gap-2 text-sm" },
+                            h("span", null, o.title),
+                            h("span", { className: "opacity-70 text-xs" }, conf + "/" + total)
+                          ),
+                          h(ProgressBar, { pct: pct })
+                        );
+                      })
+                    )
+                  : null,
+
+                // events
+                events.length
+                  ? h(
+                      "div",
+                      { className: "space-y-2" },
+                      h("div", { className: "text-sm font-semibold" }, "Events (" + events.length + ")"),
+                      h(
+                        "div",
+                        { className: "space-y-1" },
+                        events.map(function (ev) {
+                          return h(
+                            "div",
+                            { key: ev.id, className: "rounded-md border p-2 text-sm space-y-0.5" },
+                            h("div", { className: "font-medium" }, ev.title),
+                            h(
+                              "div",
+                              { className: "text-xs opacity-60" },
+                              fmtDateTime(ev.start_utc, null, ev.all_day) + (ev.recurrence_human ? " · " + ev.recurrence_human : "")
+                            )
+                          );
+                        })
+                      )
+                    )
+                  : null,
+
+                // report preview
+                h(
+                  "div",
+                  { className: "space-y-1" },
+                  h(
+                    "div",
+                    { className: "flex items-center justify-between gap-2" },
+                    h("div", { className: "text-sm font-semibold" }, "Report"),
+                    h(Badge, { variant: data.report_sent ? "secondary" : "outline" }, data.report_sent ? "report sent" : "pending")
+                  ),
+                  data.report_text
+                    ? h("div", { className: "cal-transcript" }, String(data.report_text))
+                    : h("div", { className: "text-sm opacity-60" }, "No report yet."),
+                  h("div", { className: "text-xs opacity-40" }, "Reports are emailed to the owner; this is a preview.")
+                ),
+
+                h("div", { className: "text-xs opacity-40 pt-2 border-t" }, "Read-only — edits are made by talking to Calypso.")
+              )
+            : null
+        )
+      )
+    );
+  }
+
+  function PlanningsView() {
+    const [plannings, setPlannings] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [openId, setOpenId] = useState(null);
+
+    const load = useCallback(function () {
+      setLoading(true);
+      setError(null);
+      SDK.fetchJSON(API + "/plannings")
+        .then(function (data) {
+          setPlannings((data && data.plannings) || []);
+          setLoading(false);
+        })
+        .catch(function (err) {
+          setError((err && err.message) || "Failed to load plannings");
+          setLoading(false);
+        });
+    }, []);
+
+    useEffect(load, [load]);
+
+    return h(
+      "div",
+      { className: "p-4 sm:p-6 space-y-4" },
+      h(
+        "div",
+        { className: "flex items-center justify-between gap-3 flex-wrap" },
+        h("h1", { className: "text-xl font-semibold" }, "🗜️ Plannings"),
+        h(Button, { variant: "ghost", size: "sm", onClick: load, title: "Refresh" }, "⟳")
+      ),
+
+      error ? h("div", { className: "text-sm text-red-600" }, "⚠ " + error) : null,
+      loading ? h("div", { className: "text-sm opacity-60" }, "Loading…") : null,
+
+      !loading && !error && plannings.length === 0
+        ? h("div", { className: "text-sm opacity-60" }, "No plannings yet — ask Calypso to create one.")
+        : null,
+
+      !loading && plannings.length
+        ? h(
+            "div",
+            { className: "space-y-3" },
+            plannings.map(function (p) {
+              var ov = p.overall || {};
+              return h(
+                "div",
+                {
+                  key: p.id,
+                  className: "cal-plan-card",
+                  onClick: function () { setOpenId(p.id); },
+                },
+                h(
+                  "div",
+                  { className: "flex items-start justify-between gap-3" },
+                  h(
+                    "div",
+                    { className: "space-y-0.5" },
+                    h("div", { className: "font-semibold text-sm" }, p.name),
+                    p.period_label ? h("div", { className: "text-xs opacity-60" }, p.period_label) : null
+                  ),
+                  h(Badge, { variant: p.report_sent ? "secondary" : "outline" }, p.report_sent ? "report sent" : "pending")
+                ),
+                h("div", { className: "mt-2" }, h(ProgressBar, { pct: ov.completion_pct })),
+                h(
+                  "div",
+                  { className: "text-xs opacity-70 mt-1" },
+                  (ov.confirmed || 0) + "/" + (ov.total || 0) + " completed (" + (ov.completion_pct || 0) + "%)"
+                )
+              );
+            })
+          )
+        : null,
+
+      openId ? h(PlanningDetail, { planningId: openId, onClose: function () { setOpenId(null); } }) : null
+    );
+  }
+
+  // --- app wrapper (tab toggle) --------------------------------------------
+
+  function CalendarApp() {
+    const [view, setView] = useState("calendar");
+    return h(
+      "div",
+      null,
+      h(
+        "div",
+        { className: "cal-tabs p-4 sm:p-6 pb-0" },
+        h(
+          "button",
+          {
+            className: cn("cal-tab", view === "calendar" && "cal-tab-active"),
+            onClick: function () { setView("calendar"); },
+          },
+          "📅 Calendar"
+        ),
+        h(
+          "button",
+          {
+            className: cn("cal-tab", view === "plannings" && "cal-tab-active"),
+            onClick: function () { setView("plannings"); },
+          },
+          "🗜️ Plannings"
+        )
+      ),
+      view === "plannings" ? h(PlanningsView, null) : h(CalendarView, null)
+    );
+  }
+
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
-    window.__HERMES_PLUGINS__.register("calendar", CalendarPage);
+    window.__HERMES_PLUGINS__.register("calendar", CalendarApp);
   }
 })();

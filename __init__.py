@@ -22,10 +22,14 @@ from typing import Any, Dict, List, Optional
 from dateutil import parser as dtparser
 
 from . import notify
+from . import planning as planning_mod
 from . import recurrence as recurrence_mod
 from . import scheduler
 from . import store
 from tools.registry import tool_error, tool_result
+
+# Glyph used by the dashboard (later stage) to mark planning-tagged events.
+PLANNING_GLYPH = "📋"
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +253,29 @@ def _human_recurrence(rec: Optional[Dict]) -> Optional[str]:
     return label
 
 
+def _resolve_planning(id_or_name: Any) -> Optional[Dict[str, Any]]:
+    """Resolve a planning by id first, then case-insensitive name. None if not found."""
+    key = str(id_or_name or "").strip()
+    if not key:
+        return None
+    p = store.get_planning(key)
+    if p is None:
+        p = store.get_planning_by_name(key)
+    return p
+
+
+def _planning_name_for(ev: Dict) -> Optional[str]:
+    """Return the planning name for an event with planning_id set, else None."""
+    pid = ev.get("planning_id")
+    if not pid:
+        return None
+    try:
+        p = store.get_planning(pid)
+        return p["name"] if p else None
+    except Exception:
+        return None
+
+
 def _event_summary(ev: Dict) -> Dict:
     """Return a compact summary suitable for tool responses."""
     return {
@@ -265,6 +292,7 @@ def _event_summary(ev: Dict) -> Dict:
         "tags": ev.get("tags"),
         "owner": ev.get("owner"),
         "notify_email": ev.get("notify_email"),
+        "planning": _planning_name_for(ev),
     }
 
 
@@ -324,6 +352,26 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         if notify_email_raw is not None else None
     )
 
+    # Optional attachment to a planning (by id or name). When attached:
+    #   - tag the event with planning_id;
+    #   - bound a recurring series to the planning's period end (unless the
+    #     caller gave an explicit `until`);
+    #   - inherit the planning's owner/language when not supplied.
+    planning_id: Optional[str] = None
+    planning_raw = args.get("planning")
+    if planning_raw is not None and str(planning_raw).strip():
+        planning = _resolve_planning(planning_raw)
+        if planning is None:
+            return tool_error(f"Planning not found: {planning_raw!r}")
+        planning_id = planning["id"]
+        if rec is not None and not rec.get("until"):
+            rec = dict(rec)
+            rec["until"] = planning["period_end_utc"]
+        if owner is None and planning.get("owner"):
+            owner = planning["owner"]
+        if language is None and planning.get("language") in _LANGUAGE_ENUM:
+            language = planning["language"]
+
     d = {
         "title": title,
         "description": args.get("description"),
@@ -339,6 +387,7 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         "language": language,
         "owner": owner,
         "notify_email": notify_email,
+        "planning_id": planning_id,
     }
     try:
         event_id = store.add_event(d)
@@ -568,6 +617,7 @@ def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
             event_tz = ZoneInfo(recurrence_mod.DEFAULT_TZ)
 
         is_recurring = bool(ev.get("recurrence"))
+        planning_name = _planning_name_for(ev)
         for occ_utc in occs:
             occ_local = occ_utc.astimezone(event_tz)
             occ_iso = occ_utc.isoformat()
@@ -582,6 +632,7 @@ def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
                 "alert_channel": ev.get("alert_channel"),
                 "location": ev.get("location"),
                 "tags": ev.get("tags"),
+                "planning": planning_name,
                 "status": status_row["status"] if status_row else "floating",
                 "duration_seconds": status_row.get("duration_seconds") if status_row else None,
             })
@@ -633,6 +684,7 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
         "language": ev.get("language"),
         "owner": ev.get("owner"),
         "notify_email": ev.get("notify_email"),
+        "planning": _planning_name_for(ev),
         "meeting": ev.get("meeting"),
         "location": ev.get("location"),
         "tags": ev.get("tags"),
@@ -682,6 +734,16 @@ def _handle_calendar_list_user_emails(args: Dict[str, Any], **kw) -> str:
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+
+_PLANNING_PARAM_DESCRIPTION = (
+    "Optional: attach this event to an existing PLANNING (pass the planning's "
+    "name or id). A planning is a named, period-bounded set of events; attaching "
+    "tags the event so it is scored in the planning's report. If the event is "
+    "RECURRING and you don't pass an explicit `until`, its series is automatically "
+    "bounded to the planning's period end (occurrences stop at period end). The "
+    "event also inherits the planning's owner and language when you don't supply "
+    "them. Create the planning first with calendar_create_planning."
+)
 
 _RECURRENCE_DESCRIPTION = (
     "Recurrence pattern. Examples: 'daily', 'weekly', 'every 2 weeks', "
@@ -757,6 +819,7 @@ CALENDAR_ADD_EVENT_SCHEMA = {
             },
             "owner": {"type": ["string", "null"], "description": _OWNER_DESCRIPTION},
             "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
+            "planning": {"type": ["string", "null"], "description": _PLANNING_PARAM_DESCRIPTION},
         },
         "required": ["title", "start"],
     },
@@ -1421,6 +1484,348 @@ CALENDAR_LIST_USER_EMAILS_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Plannings — named, period-bounded sets of events with emailed reports
+# ---------------------------------------------------------------------------
+
+def _planning_summary(p: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact planning summary for tool responses."""
+    return {
+        "id": p["id"],
+        "name": p["name"],
+        "period_label": p.get("period_label"),
+        "period_start_utc": p.get("period_start_utc"),
+        "period_end_utc": p.get("period_end_utc"),
+        "owner": p.get("owner"),
+        "language": p.get("language"),
+        "description": p.get("description"),
+        "report_sent": bool(p.get("report_sent")),
+        "report_sent_utc": p.get("report_sent_utc"),
+    }
+
+
+def _handle_calendar_create_planning(args: Dict[str, Any], **kw) -> str:
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return tool_error("name is required")
+
+    start_raw = args.get("period_start")
+    end_raw = args.get("period_end")
+    if not start_raw or not end_raw:
+        return tool_error(
+            "period_start and period_end are required — period_end is EXCLUSIVE "
+            "(the start of the day AFTER the period). E.g. June 2026 → "
+            "period_start '2026-06-01', period_end '2026-07-01'."
+        )
+
+    tz_name = args.get("tz") or recurrence_mod.DEFAULT_TZ
+    start_dt = _parse_start(start_raw, tz_name)
+    if start_dt is None:
+        return tool_error(f"Could not parse period_start: {start_raw!r}")
+    end_dt = _parse_start(end_raw, tz_name)
+    if end_dt is None:
+        return tool_error(f"Could not parse period_end: {end_raw!r}")
+
+    start_utc = start_dt.astimezone(timezone.utc).isoformat()
+    end_utc = end_dt.astimezone(timezone.utc).isoformat()
+    if end_dt <= start_dt:
+        return tool_error("period_end must be after period_start (and is exclusive).")
+
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner or store.get_user_email(owner) is None:
+        return tool_error(
+            f"Planning needs an email for {owner!r}. Associate one first with "
+            "calendar_set_user_email (reports are emailed)."
+        )
+
+    lang_raw = args.get("language")
+    language: Optional[str] = None
+    if lang_raw is not None:
+        lang_lower = str(lang_raw).strip().lower()
+        language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
+
+    d = {
+        "name": name,
+        "period_label": args.get("period_label"),
+        "period_start_utc": start_utc,
+        "period_end_utc": end_utc,
+        "owner": owner,
+        "language": language,
+        "description": args.get("description"),
+    }
+    try:
+        planning_id = store.add_planning(d)
+    except Exception as e:
+        logger.exception("calendar_create_planning store error")
+        return tool_error(f"Failed to create planning: {e}")
+
+    p = store.get_planning(planning_id)
+    return tool_result({"created": True, **_planning_summary(p)})
+
+
+def _handle_calendar_list_plannings(args: Dict[str, Any], **kw) -> str:
+    try:
+        plannings = store.list_plannings()
+    except Exception as e:
+        return tool_error(f"Failed to list plannings: {e}")
+    out = []
+    for p in plannings:
+        summary = _planning_summary(p)
+        try:
+            stats = planning_mod.planning_stats(p)["overall"]
+            summary["confirmed"] = stats["confirmed"]
+            summary["total"] = stats["total"]
+            summary["completion_pct"] = stats["completion_pct"]
+        except Exception:
+            summary["confirmed"] = summary["total"] = summary["completion_pct"] = 0
+        out.append(summary)
+    return tool_result({"count": len(out), "plannings": out})
+
+
+def _handle_calendar_get_planning(args: Dict[str, Any], **kw) -> str:
+    p = _resolve_planning(args.get("id_or_name"))
+    if p is None:
+        return tool_error(f"Planning not found: {args.get('id_or_name')!r}")
+    try:
+        stats = planning_mod.planning_stats(p)
+    except Exception as e:
+        logger.exception("calendar_get_planning stats error")
+        return tool_error(f"Failed to compute planning stats: {e}")
+
+    events = []
+    for ev in store.list_planning_events(p["id"]):
+        events.append({
+            "id": ev["id"],
+            "title": ev["title"],
+            "start_utc": ev.get("start_utc"),
+            "recurrence_human": _human_recurrence(ev.get("recurrence")),
+        })
+
+    return tool_result({
+        **_planning_summary(p),
+        "events": events,
+        "overall": stats["overall"],
+        "objectives": stats["objectives"],
+        "report_text": stats["text"],
+    })
+
+
+def _planning_report_filename(planning: Dict[str, Any]) -> str:
+    """Localized-ish PDF filename: planning name with non-alnum collapsed to '-'."""
+    import re
+    name = planning.get("name") or "planning"
+    safe = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "planning"
+    return f"planning-report-{safe}.pdf"
+
+
+def _handle_calendar_planning_report(args: Dict[str, Any], **kw) -> str:
+    p = _resolve_planning(args.get("id_or_name"))
+    if p is None:
+        return tool_error(f"Planning not found: {args.get('id_or_name')!r}")
+
+    try:
+        stats = planning_mod.planning_stats(p)
+    except Exception as e:
+        logger.exception("calendar_planning_report stats error")
+        return tool_error(f"Failed to compute planning report: {e}")
+
+    do_email = bool(args.get("email", False))
+    emailed = False
+    pdf_attached = False
+    email_error: Optional[str] = None
+    if do_email:
+        owner_email = store.get_user_email(p["owner"]) if p.get("owner") else None
+        if not owner_email:
+            email_error = "no registered email for the planning owner"
+        else:
+            allowed = notify.allowed_email_recipients()
+            if owner_email.lower() not in allowed:
+                email_error = "owner email not allowlisted"
+            else:
+                lang = planning_mod._planning_lang(p)
+                pdf = planning_mod.render_report_pdf(stats, lang)
+                attachments = None
+                if pdf:
+                    fname = _planning_report_filename(p)
+                    attachments = [(fname, pdf, "pdf")]
+                result = notify.fire(
+                    "email",
+                    planning_mod.report_subject(p),
+                    stats["text"],
+                    target=owner_email,
+                    attachments=attachments,
+                )
+                if result.get("ok"):
+                    emailed = True
+                    pdf_attached = bool(pdf)
+                else:
+                    email_error = result.get("error") or "email send failed"
+
+    return tool_result({
+        **_planning_summary(p),
+        "overall": stats["overall"],
+        "objectives": stats["objectives"],
+        "report_text": stats["text"],
+        "emailed": emailed,
+        "pdf_attached": pdf_attached,
+        "email_error": email_error,
+    })
+
+
+def _handle_calendar_remove_planning(args: Dict[str, Any], **kw) -> str:
+    p = _resolve_planning(args.get("id_or_name"))
+    if p is None:
+        return tool_error(f"Planning not found: {args.get('id_or_name')!r}")
+    remove_events = bool(args.get("remove_events", False))
+    try:
+        removed = store.remove_planning(p["id"], remove_events=remove_events)
+    except Exception as e:
+        logger.exception("calendar_remove_planning store error")
+        return tool_error(f"Failed to remove planning: {e}")
+    if not removed:
+        return tool_error(f"Planning not found: {p['id']}")
+    return tool_result({
+        "removed": True, "id": p["id"], "name": p["name"],
+        "removed_events": remove_events,
+    })
+
+
+CALENDAR_CREATE_PLANNING_SCHEMA = {
+    "name": "calendar_create_planning",
+    "description": (
+        "Create a PLANNING — a named set of events bound to a period (a week, "
+        "month, year, or custom range). A planning groups time-bound objectives "
+        "and is scored from each event's per-occurrence status: only CONFIRMED "
+        "occurrences count as completed; everything else (unconfirmed, missed) "
+        "counts as not done. Reports are EMAILED to the owner (the chat only "
+        "announces a report is ready) — so the owner MUST have a registered email "
+        "(set via calendar_set_user_email) or creation is refused. A report is "
+        "auto-emailed once at 09:00 the morning after the period ends, and can "
+        "also be produced on demand with calendar_planning_report. "
+        "COMPUTE period_start and period_end yourself from the user's phrasing: "
+        "period_end is EXCLUSIVE — pass the START of the day AFTER the period. "
+        "E.g. 'June 2026' → period_start '2026-06-01', period_end '2026-07-01'; "
+        "'2026' → '2026-01-01'..'2027-01-01'; 'first week of June 2026' → "
+        "'2026-06-01'..'2026-06-08'. After creating, attach events to it via the "
+        "`planning` param of calendar_add_event. If a desired objective lacks a "
+        "time or period, ASK the user for precisions before creating events."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Planning name (required), e.g. 'June objectives'."},
+            "period_start": {
+                "type": "string",
+                "description": "Start of the period (datetime/date string), e.g. '2026-06-01'.",
+            },
+            "period_end": {
+                "type": "string",
+                "description": (
+                    "EXCLUSIVE end of the period — the START of the day AFTER the "
+                    "last day. E.g. for June 2026 pass '2026-07-01'; for the year "
+                    "2026 pass '2027-01-01'."
+                ),
+            },
+            "period_label": {
+                "type": "string",
+                "description": "Optional human display label for the period, e.g. 'June 2026'.",
+            },
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Name/identifier of the asker who owns this planning — MUST "
+                    "have a registered email (the report is emailed to them). Use "
+                    "the same consistent identifier as their event 'owner'."
+                ),
+            },
+            "language": {
+                "type": ["string", "null"],
+                "enum": ["en", "fr", None],
+                "description": _LANGUAGE_DESCRIPTION,
+            },
+            "description": {"type": "string", "description": "Optional free-text description of the planning."},
+            "tz": {
+                "type": "string",
+                "description": (
+                    f"IANA timezone used to interpret period_start/period_end. "
+                    f"Defaults to {recurrence_mod.DEFAULT_TZ}."
+                ),
+            },
+        },
+        "required": ["name", "period_start", "period_end", "owner"],
+    },
+}
+
+CALENDAR_LIST_PLANNINGS_SCHEMA = {
+    "name": "calendar_list_plannings",
+    "description": (
+        "List all plannings with a quick completion snapshot for each "
+        "(confirmed/total occurrences and completion percentage). Takes no arguments."
+    ),
+    "parameters": {"type": "object", "properties": {}},
+}
+
+CALENDAR_GET_PLANNING_SCHEMA = {
+    "name": "calendar_get_planning",
+    "description": (
+        "Get a planning's details, its events (titles + recurrence), and computed "
+        "completion stats per objective and overall (confirmed = done, everything "
+        "else = not done), plus the rendered report text."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id_or_name": {"type": "string", "description": "Planning id or name (case-insensitive)."},
+        },
+        "required": ["id_or_name"],
+    },
+}
+
+CALENDAR_PLANNING_REPORT_SCHEMA = {
+    "name": "calendar_planning_report",
+    "description": (
+        "Produce a planning's completion report on demand. Returns the structured "
+        "stats and the rendered report text. Reports are EMAIL-ONLY: set email=true "
+        "to email it to the planning owner's registered address (only sent if that "
+        "address is allowlisted). In chat, just announce that the report is ready — "
+        "the detail goes by email."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id_or_name": {"type": "string", "description": "Planning id or name (case-insensitive)."},
+            "email": {
+                "type": "boolean",
+                "description": "If true, email the report to the planning owner. Default false.",
+            },
+        },
+        "required": ["id_or_name"],
+    },
+}
+
+CALENDAR_REMOVE_PLANNING_SCHEMA = {
+    "name": "calendar_remove_planning",
+    "description": (
+        "Remove a planning. By default the planning's events are KEPT (just "
+        "detached — their planning_id is cleared). Set remove_events=true to also "
+        "delete every event in the planning (cascading their statuses, reports and "
+        "skipped-occurrence exceptions)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id_or_name": {"type": "string", "description": "Planning id or name (case-insensitive)."},
+            "remove_events": {
+                "type": "boolean",
+                "description": "If true, also delete the planning's events. Default false (detach only).",
+            },
+        },
+        "required": ["id_or_name"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -1438,6 +1843,11 @@ _TOOLS = (
     ("calendar_stop_timer",   CALENDAR_STOP_TIMER_SCHEMA,   _handle_calendar_stop_timer,   "⏹️"),
     ("calendar_set_user_email",   CALENDAR_SET_USER_EMAIL_SCHEMA,   _handle_calendar_set_user_email,   "📧"),
     ("calendar_list_user_emails", CALENDAR_LIST_USER_EMAILS_SCHEMA, _handle_calendar_list_user_emails, "📇"),
+    ("calendar_create_planning",  CALENDAR_CREATE_PLANNING_SCHEMA,  _handle_calendar_create_planning,  "📋"),
+    ("calendar_list_plannings",   CALENDAR_LIST_PLANNINGS_SCHEMA,   _handle_calendar_list_plannings,   "🗒️"),
+    ("calendar_get_planning",     CALENDAR_GET_PLANNING_SCHEMA,     _handle_calendar_get_planning,     "🔎"),
+    ("calendar_planning_report",  CALENDAR_PLANNING_REPORT_SCHEMA,  _handle_calendar_planning_report,  "📊"),
+    ("calendar_remove_planning",  CALENDAR_REMOVE_PLANNING_SCHEMA,  _handle_calendar_remove_planning,  "🗑️"),
 )
 
 

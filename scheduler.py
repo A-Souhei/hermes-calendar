@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from . import notify
+from . import planning as planning_mod
 from . import recurrence
 from . import store
 
@@ -222,6 +223,86 @@ def _process_due(since_utc, now_utc, default_lead, daily_hour):
     return fired, chat_msgs
 
 
+def _process_due_planning_reports(now_utc: datetime) -> list[str]:
+    """Auto-email end-of-period reports for plannings whose report is due.
+
+    For each planning with report_sent==0 whose report_due (09:00 in DEFAULT_TZ
+    on the calendar date of period_end_utc, i.e. the morning after the period)
+    has passed, build the localized report, email it to the owner if a known &
+    allowlisted address exists, mark it sent (so it fires once), and return a
+    localized one-liner per planning for the cron to post into chat.
+
+    Robust per-planning: one bad planning never breaks the tick.
+    """
+    notices: list[str] = []
+    try:
+        plannings = store.list_plannings()
+    except Exception as exc:
+        logger.exception("calendar: failed to list plannings for reports: %s", exc)
+        return notices
+
+    for p in plannings:
+        try:
+            if p.get("report_sent"):
+                continue
+            due = planning_mod.report_due_utc(p)
+            if now_utc < due:
+                continue
+
+            stats = planning_mod.planning_stats(p)
+            owner = p.get("owner")
+            owner_email = store.get_user_email(owner) if owner else None
+
+            emailed = False
+            if owner_email and owner_email.lower() in notify.allowed_email_recipients():
+                lang = planning_mod._planning_lang(p)
+                pdf = planning_mod.render_report_pdf(stats, lang)
+                attachments = None
+                if pdf:
+                    import re
+                    raw = p.get("name") or "planning"
+                    safe = re.sub(r"[^A-Za-z0-9]+", "-", raw).strip("-").lower() or "planning"
+                    attachments = [(f"planning-report-{safe}.pdf", pdf, "pdf")]
+                result = notify.fire(
+                    "email",
+                    planning_mod.report_subject(p),
+                    stats["text"],
+                    target=owner_email,
+                    attachments=attachments,
+                )
+                emailed = bool(result.get("ok"))
+                if not emailed:
+                    logger.warning(
+                        "calendar: planning report email failed planning=%s: %s",
+                        p.get("id"), result.get("error"))
+
+            lang = planning_mod._planning_lang(p)
+            name = p.get("name") or ""
+            if emailed:
+                if lang == "fr":
+                    notices.append(
+                        f"📋 Le rapport de ton planning « {name} » est prêt "
+                        "— envoyé par email.")
+                else:
+                    notices.append(
+                        f"📋 Your '{name}' planning report is ready — emailed to you.")
+            else:
+                if lang == "fr":
+                    notices.append(
+                        f"📋 Le rapport de ton planning « {name} » est prêt "
+                        "— aucune adresse email enregistrée.")
+                else:
+                    notices.append(
+                        f"📋 Your '{name}' planning report is ready "
+                        "— no email address on file.")
+
+            store.set_report_sent(p["id"])
+        except Exception as exc:
+            logger.exception("calendar: error processing planning report %s: %s",
+                             p.get("id"), exc)
+    return notices
+
+
 def _state_path() -> str:
     return os.path.join(
         os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "calendar_last_tick"
@@ -251,16 +332,20 @@ def tick_once() -> int:
     fired, chat_msgs = _process_due(
         since, now, int(cfg["default_lead_seconds"]), int(cfg["daily_alert_hour"])
     )
+    # End-of-period planning reports (auto-emailed once at 09:00 the morning
+    # after the period; deduped via report_sent). Returns localized chat notices.
+    planning_notices = _process_due_planning_reports(now)
     try:
         with open(sp, "w") as f:
             f.write(now.isoformat())
     except Exception:
         logger.warning("calendar: could not write last-tick state")
-    # Print any "chat"-channel reminders to stdout — the --no-agent cron that
-    # runs this tick delivers stdout straight into the chat. Nothing printed
-    # when there are no chat reminders, so the cron stays silent otherwise.
-    if chat_msgs:
-        print("\n\n".join(chat_msgs))
+    # Print any "chat"-channel reminders AND planning report notices to stdout —
+    # the --no-agent cron that runs this tick delivers stdout straight into the
+    # chat. Nothing printed when there's nothing to say, so the cron stays silent.
+    out_lines = list(chat_msgs) + list(planning_notices)
+    if out_lines:
+        print("\n\n".join(out_lines))
     return fired
 
 

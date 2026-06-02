@@ -61,10 +61,39 @@ def _load_plugin_modules():
         spec.loader.exec_module(mod)
         return mod
 
-    return _sub("store"), _sub("recurrence")
+    # store + recurrence must be imported before planning (planning relative-
+    # imports both); planning is dependency-light (no notify/tools.registry).
+    return _sub("store"), _sub("recurrence"), _sub("planning")
 
 
-store, recurrence = _load_plugin_modules()
+store, recurrence, planning = _load_plugin_modules()
+
+
+def _planning_name_for(ev: Dict[str, Any]) -> Optional[str]:
+    """Planning name for an event with planning_id set, else None."""
+    pid = ev.get("planning_id")
+    if not pid:
+        return None
+    try:
+        p = store.get_planning(pid)
+        return p["name"] if p else None
+    except Exception:
+        return None
+
+
+def _planning_summary(p: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": p["id"],
+        "name": p["name"],
+        "period_label": p.get("period_label"),
+        "period_start_utc": p.get("period_start_utc"),
+        "period_end_utc": p.get("period_end_utc"),
+        "owner": p.get("owner"),
+        "language": p.get("language"),
+        "description": p.get("description"),
+        "report_sent": bool(p.get("report_sent")),
+        "report_sent_utc": p.get("report_sent_utc"),
+    }
 
 
 # --- helpers ----------------------------------------------------------------
@@ -165,6 +194,7 @@ def _occurrences_in_range(start_utc: datetime, end_utc: datetime) -> List[Dict[s
             status_map = {s["occurrence_utc"]: s for s in store.list_statuses(ev["id"])}
         except Exception:
             status_map = {}
+        planning_name = _planning_name_for(ev)
         for occ in occs:
             occ_iso = occ.isoformat()
             status_row = status_map.get(occ_iso)
@@ -180,6 +210,7 @@ def _occurrences_in_range(start_utc: datetime, end_utc: datetime) -> List[Dict[s
                 "alert_channel": ev.get("alert_channel"),
                 "location": ev.get("location"),
                 "tags": ev.get("tags") or [],
+                "planning": planning_name,
                 "has_report": occ_iso in report_keys,
                 "status": status_row["status"] if status_row else "floating",
                 "effective_status": _effective_status(
@@ -270,6 +301,7 @@ def event_detail(event_id: str):
         "language": ev.get("language"),
         "owner": ev.get("owner"),
         "notify_email": ev.get("notify_email"),
+        "planning": _planning_name_for(ev),
         "meeting": ev.get("meeting"),
         "location": ev.get("location"),
         "tags": ev.get("tags") or [],
@@ -313,3 +345,56 @@ def list_timers():
             "elapsed_seconds": elapsed,
         })
     return {"timers": rows}
+
+
+@router.get("/plannings")
+def list_plannings():
+    """All plannings, each with overall completion stats."""
+    out = []
+    try:
+        plannings = store.list_plannings()
+    except Exception:
+        plannings = []
+    for p in plannings:
+        summary = _planning_summary(p)
+        try:
+            summary["overall"] = planning.planning_stats(p)["overall"]
+        except Exception:
+            summary["overall"] = {
+                "total": 0, "confirmed": 0, "failed": 0, "completion_pct": 0,
+            }
+        out.append(summary)
+    return {"plannings": out}
+
+
+@router.get("/planning/{planning_id}")
+def planning_detail(planning_id: str):
+    """A planning plus its events and computed completion stats."""
+    p = store.get_planning(planning_id)
+    if not p:
+        raise HTTPException(404, "planning not found")
+    try:
+        stats = planning.planning_stats(p)
+    except Exception:
+        stats = {"overall": {"total": 0, "confirmed": 0, "failed": 0,
+                             "completion_pct": 0}, "objectives": [], "text": ""}
+    events = []
+    try:
+        for ev in store.list_planning_events(planning_id):
+            events.append({
+                "id": ev["id"],
+                "title": ev["title"],
+                "start_utc": ev.get("start_utc"),
+                "recurrence": ev.get("recurrence"),
+                "recurrence_human": _human_recurrence(ev.get("recurrence")),
+                "all_day": bool(ev.get("all_day")),
+            })
+    except Exception:
+        events = []
+    return {
+        **_planning_summary(p),
+        "events": events,
+        "overall": stats["overall"],
+        "objectives": stats["objectives"],
+        "report_text": stats["text"],
+    }

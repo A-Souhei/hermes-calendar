@@ -188,3 +188,67 @@
 /* Derived "missed" (past + still floating) — muted so it reads as
    unconfirmed rather than an explicit miss. */
 .cal-status-derived { opacity: 0.45; }
+
+/* ---- Tabs (Calendar / Plannings toggle) --------------------------------- */
+
+.cal-tabs {
+  display: flex;
+  gap: 8px;
+}
+
+.cal-tab {
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 500;
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  background: var(--color-card);
+  color: var(--color-muted-foreground);
+  cursor: pointer;
+}
+.cal-tab:hover { background: var(--color-muted); color: var(--color-foreground); }
+
+.cal-tab-active {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: var(--color-secondary, var(--color-muted));
+  font-weight: 600;
+}
+
+/* ---- Planning glyph ------------------------------------------------------ */
+
+.cal-plan-glyph {
+  font-size: 0.65rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+/* ---- Progress bar -------------------------------------------------------- */
+
+.cal-progress {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--color-muted);
+  overflow: hidden;
+  width: 100%;
+}
+
+.cal-progress-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--color-success, var(--color-primary));
+  transition: width 0.3s ease;
+}
+
+/* ---- Planning cards ------------------------------------------------------ */
+
+.cal-plan-card {
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  cursor: pointer;
+  background: var(--color-card);
+  color: var(--color-card-foreground);
+}
+.cal-plan-card:hover { background: var(--color-muted); }
