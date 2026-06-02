@@ -12,10 +12,12 @@ Delivery channels:
   chat      — a text from Calypso in the chat (delivered out-of-band: the
               every-minute cron tick prints it to stdout, which the
               `--no-agent` cron posts into the chat; NOT sent via fire())
+  email     — an emailed reminder sent via SMTP (Gmail creds in env); only
+              ever sent to an address present in EMAIL_ALLOWED_USERS.
 
 The stored ``alert_channel`` is a logical value (ha_notify / ha_speak / both /
-chat / all / none) that ``resolve_channels`` expands into the concrete set
-above.
+chat / email / all / none) that ``resolve_channels`` expands into the concrete
+set above.
 """
 
 from __future__ import annotations
@@ -23,8 +25,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import smtplib
 import urllib.error
 import urllib.request
+from email.mime.text import MIMEText
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -63,8 +67,16 @@ _CHANNEL_MAP = {
     "ha_speak": ["ha_speak"],
     "both": ["ha_notify", "ha_speak"],
     "chat": ["chat"],
-    "all": ["ha_notify", "ha_speak", "chat"],
+    "email": ["email"],
+    "all": ["ha_notify", "ha_speak", "chat", "email"],
 }
+
+
+def allowed_email_recipients() -> set:
+    """The allowlist of addresses the calendar may email, from EMAIL_ALLOWED_USERS
+    (comma-separated). Lowercased, stripped, empties dropped."""
+    raw = os.environ.get("EMAIL_ALLOWED_USERS", "")
+    return {a.strip().lower() for a in raw.split(",") if a.strip()}
 
 
 def resolve_channels(alert_channel) -> list:
@@ -98,13 +110,49 @@ def fire(
     message: str,
     target: Optional[str] = None,
 ) -> dict:
-    """Send a reminder via HA.
+    """Send a reminder.
 
-    channel: "ha_notify" | "ha_speak" | "none"
+    channel:
+      "ha_notify" / "ha_speak" — via Home Assistant (cfg target or `target`)
+      "email"                  — via SMTP to `target` (must be allowlisted)
+      "none"                   — no-op
+    ("chat" is delivered by the scheduler's stdout, not here.)
     Returns {"ok": bool, "status": int|None, "error": str|None}
     """
     if channel == "none":
         return {"ok": True, "status": None, "error": None}
+
+    if channel == "email":
+        host = os.environ.get("EMAIL_SMTP_HOST")
+        try:
+            port = int(os.environ.get("EMAIL_SMTP_PORT") or 587)
+        except (TypeError, ValueError):
+            return {"ok": False, "status": None, "error": "invalid EMAIL_SMTP_PORT"}
+        addr = os.environ.get("EMAIL_ADDRESS")
+        pw = os.environ.get("EMAIL_PASSWORD")
+        if not (addr and pw and host):
+            return {"ok": False, "status": None, "error": "email not configured"}
+        if not target:
+            return {"ok": False, "status": None, "error": "no recipient"}
+        # Second-layer guard (defense in depth; the scheduler also checks): only
+        # ever send to an allowlisted address.
+        if target.lower() not in allowed_email_recipients():
+            return {"ok": False, "status": None, "error": "recipient not allowlisted"}
+        try:
+            mime = MIMEText(message, _charset="utf-8")
+            mime["From"] = addr
+            mime["To"] = target
+            mime["Subject"] = title
+            with smtplib.SMTP(host, port, timeout=15) as smtp:
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.ehlo()
+                smtp.login(addr, pw)
+                smtp.sendmail(addr, [target], mime.as_string())
+            return {"ok": True, "status": None, "error": None}
+        except Exception as e:
+            logger.warning("calendar email send error: %s", e)
+            return {"ok": False, "status": None, "error": str(e)}
 
     cfg = _load_config()
     if not cfg.get("token"):

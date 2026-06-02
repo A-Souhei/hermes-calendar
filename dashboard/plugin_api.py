@@ -268,6 +268,8 @@ def event_detail(event_id: str):
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
         "language": ev.get("language"),
+        "owner": ev.get("owner"),
+        "notify_email": ev.get("notify_email"),
         "meeting": ev.get("meeting"),
         "location": ev.get("location"),
         "tags": ev.get("tags") or [],
