@@ -48,7 +48,13 @@
   font-weight: 600;
   align-self: flex-end;
   color: var(--color-muted-foreground);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
 }
+.cal-daynum:hover { color: var(--color-foreground); text-decoration: underline; }
 
 .cal-chip {
   display: flex;
@@ -81,8 +87,22 @@
 .cal-more {
   font-size: 0.68rem;
   color: var(--color-muted-foreground);
-  padding-left: 6px;
+  padding: 1px 6px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
 }
+.cal-more:hover { color: var(--color-foreground); text-decoration: underline; }
+
+/* Day-view rows: full width, allow wrapping (unlike the truncated grid chips). */
+.cal-dayrow {
+  white-space: normal;
+  padding: 6px 8px;
+  line-height: 1.3;
+}
+.cal-dayrow .cal-chip-title { white-space: normal; overflow: visible; }
 
 /* ---- Detail modal ------------------------------------------------------- */
 

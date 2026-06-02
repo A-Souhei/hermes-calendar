@@ -93,6 +93,17 @@
     return { events, loading, error, reload: load };
   }
 
+  function fmtTime(iso, tz) {
+    try {
+      const d = new Date(iso);
+      const opts = { hour: "2-digit", minute: "2-digit" };
+      if (tz) opts.timeZone = tz;
+      return d.toLocaleTimeString(undefined, opts);
+    } catch (e) {
+      return "";
+    }
+  }
+
   // --- chips & cells --------------------------------------------------------
 
   function EventChip(props) {
@@ -109,17 +120,82 @@
   }
 
   function DayCell(props) {
-    const { date, inMonth, isToday, events, onOpen } = props;
+    const { date, inMonth, isToday, events, onOpen, onOpenDay } = props;
     const shown = events.slice(0, MAX_CHIPS);
     const extra = events.length - shown.length;
+    const dayNum = h(
+      "button",
+      {
+        className: "cal-daynum",
+        title: events.length ? "View all events on this day" : undefined,
+        onClick: function () { if (events.length) onOpenDay(date, events); },
+      },
+      String(date.getDate())
+    );
     return h(
       "div",
       { className: cn("cal-cell", !inMonth && "cal-cell-muted", isToday && "cal-cell-today") },
-      h("div", { className: "cal-daynum" }, String(date.getDate())),
+      dayNum,
       shown.map(function (ev, i) {
         return h(EventChip, { key: ev.id + "@" + ev.occurrence_utc + i, event: ev, onOpen: onOpen });
       }),
-      extra > 0 ? h("div", { className: "cal-more" }, "+" + extra + " more") : null
+      extra > 0
+        ? h(
+            "button",
+            { className: "cal-more", onClick: function () { onOpenDay(date, events); } },
+            "+" + extra + " more"
+          )
+        : null
+    );
+  }
+
+  // Day view — lists ALL events for one day; each row opens the detail modal.
+  function DayModal(props) {
+    const date = props.date;
+    const events = props.events || [];
+    const label = date.toLocaleDateString(undefined, {
+      weekday: "long", year: "numeric", month: "long", day: "numeric",
+    });
+    return h(
+      "div",
+      {
+        className: "fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-8 bg-black/60 cal-overlay",
+        onClick: function (e) { if (e.target === e.currentTarget) props.onClose(); },
+      },
+      h(
+        "div",
+        { className: "cal-modal w-full max-w-md shadow-xl" },
+        h(
+          "div",
+          { className: "cal-modal-body p-5 space-y-3" },
+          h(
+            "div",
+            { className: "cal-modal-head flex items-start justify-between gap-3" },
+            h("h2", { className: "text-base font-semibold leading-tight" }, label),
+            h(Button, { variant: "ghost", size: "sm", onClick: props.onClose }, "✕")
+          ),
+          events.length === 0
+            ? h("div", { className: "text-sm opacity-60" }, "No events.")
+            : h(
+                "div",
+                { className: "space-y-1" },
+                events.map(function (ev, i) {
+                  const prefix = (ev.has_report ? "📝 " : "") +
+                    (ev.all_day ? "All day · " : (fmtTime(ev.occurrence_local, ev.tz) + " · "));
+                  return h(
+                    "button",
+                    {
+                      key: ev.id + "@" + ev.occurrence_utc + i,
+                      className: cn("cal-chip cal-dayrow", ev.recurring ? "cal-chip-recurring" : "cal-chip-once"),
+                      title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : ""),
+                      onClick: function () { props.onOpenEvent(ev.id); },
+                    },
+                    h("span", { className: "cal-chip-title" }, prefix + ev.title)
+                  );
+                })
+              )
+        )
+      )
     );
   }
 
@@ -319,6 +395,7 @@
   function CalendarPage() {
     const [anchor, setAnchor] = useState(function () { return monthAnchor(new Date()); });
     const [openId, setOpenId] = useState(null);
+    const [openDay, setOpenDay] = useState(null);
     const { events, loading, error, reload } = useEvents(anchor);
 
     const byDate = useMemo(function () {
@@ -400,6 +477,7 @@
                 isToday: c.isToday,
                 events: c.events,
                 onOpen: setOpenId,
+                onOpenDay: function (date, evs) { setOpenDay({ date: date, events: evs }); },
               });
             })
           )
@@ -414,6 +492,13 @@
         h("span", null, h("span", { className: "cal-chip cal-chip-recurring", style: { padding: "1px 6px" } }, "recurring")),
         h("span", null, "📝 has report")
       ),
+
+      openDay ? h(DayModal, {
+        date: openDay.date,
+        events: openDay.events,
+        onOpenEvent: function (id) { setOpenDay(null); setOpenId(id); },
+        onClose: function () { setOpenDay(null); },
+      }) : null,
 
       openId ? h(DetailModal, { eventId: openId, onClose: function () { setOpenId(null); } }) : null
     );
