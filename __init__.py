@@ -187,6 +187,8 @@ def _parse_start(raw: Any, tz_name: str) -> Optional[datetime]:
         return None
 
 
+_STATUS_ENUM = ["confirmed", "missed", "floating"]
+
 _CHANNEL_ENUM = ["ha_notify", "ha_speak", "both", "chat", "all", "none"]
 _VALID_CHANNELS = set(_CHANNEL_ENUM)
 _CHANNEL_DESCRIPTION = (
@@ -194,6 +196,15 @@ _CHANNEL_DESCRIPTION = (
     "'ha_notify' = phone push; 'ha_speak' = spoken TTS on the phone; "
     "'both' = push + speak; 'chat' = a text from Calypso in this chat; "
     "'all' = push + speak + chat; 'none' = no reminder."
+)
+
+_LANGUAGE_ENUM = ["en", "fr"]
+_LANGUAGE_DESCRIPTION = (
+    "Language for THIS event's reminder text — the labels and the date are rendered "
+    "in this language ('en' = English, 'fr' = French). "
+    "Infer it from how the user phrased the request: a French-phrased request → 'fr', "
+    "an English one → 'en'. "
+    "Omit to use the configured default (CALENDAR_DEFAULT_LANG env or 'en')."
 )
 
 
@@ -230,6 +241,7 @@ def _event_summary(ev: Dict) -> Dict:
         "recurrence": _human_recurrence(ev.get("recurrence")),
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
+        "language": ev.get("language"),
         "location": ev.get("location"),
         "tags": ev.get("tags"),
     }
@@ -277,6 +289,12 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
     if isinstance(tags_raw, list):
         tags = [str(t) for t in tags_raw]
 
+    lang_raw = args.get("language")
+    language: Optional[str] = None
+    if lang_raw is not None:
+        lang_lower = str(lang_raw).strip().lower()
+        language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
+
     d = {
         "title": title,
         "description": args.get("description"),
@@ -289,6 +307,7 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         "meeting": meeting,
         "location": args.get("location"),
         "tags": tags,
+        "language": language,
     }
     try:
         event_id = store.add_event(d)
@@ -389,6 +408,14 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
     if "tags" in args:
         tags_raw = args["tags"]
         fields["tags"] = [str(t) for t in tags_raw] if isinstance(tags_raw, list) else None
+
+    if "language" in args:
+        lang_raw = args["language"]
+        if lang_raw is None:
+            fields["language"] = None
+        else:
+            lang_lower = str(lang_raw).strip().lower()
+            fields["language"] = lang_lower if lang_lower in _LANGUAGE_ENUM else None
 
     if not fields:
         return tool_error("No updatable fields provided")
@@ -502,16 +529,20 @@ def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
         is_recurring = bool(ev.get("recurrence"))
         for occ_utc in occs:
             occ_local = occ_utc.astimezone(event_tz)
+            occ_iso = occ_utc.isoformat()
+            status_row = store.get_status(ev["id"], occ_iso)
             items.append({
                 "id": ev["id"],
                 "title": ev["title"],
                 "occurrence_local": occ_local.isoformat(),
-                "occurrence_utc": occ_utc.isoformat(),
+                "occurrence_utc": occ_iso,
                 "recurring": is_recurring,
                 "all_day": ev.get("all_day", False),
                 "alert_channel": ev.get("alert_channel"),
                 "location": ev.get("location"),
                 "tags": ev.get("tags"),
+                "status": status_row["status"] if status_row else "floating",
+                "duration_seconds": status_row.get("duration_seconds") if status_row else None,
             })
 
     items.sort(key=lambda x: x["occurrence_utc"])
@@ -541,6 +572,12 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
     except Exception:
         pass
 
+    statuses = []
+    try:
+        statuses = store.list_statuses(event_id)
+    except Exception:
+        pass
+
     return tool_result({
         "id": ev["id"],
         "title": ev["title"],
@@ -552,11 +589,13 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
         "recurrence_human": _human_recurrence(ev.get("recurrence")),
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
+        "language": ev.get("language"),
         "meeting": ev.get("meeting"),
         "location": ev.get("location"),
         "tags": ev.get("tags"),
         "next_occurrence_utc": next_occ_iso,
         "skipped_occurrences": exceptions,
+        "statuses": statuses,
         "created_utc": ev.get("created_utc"),
         "updated_utc": ev.get("updated_utc"),
     })
@@ -633,6 +672,11 @@ CALENDAR_ADD_EVENT_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "Free-form tags for filtering, e.g. ['work', 'health'].",
             },
+            "language": {
+                "type": ["string", "null"],
+                "enum": ["en", "fr", None],
+                "description": _LANGUAGE_DESCRIPTION,
+            },
         },
         "required": ["title", "start"],
     },
@@ -681,6 +725,11 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
             },
             "location": {"type": "string"},
             "tags": {"type": "array", "items": {"type": "string"}},
+            "language": {
+                "type": ["string", "null"],
+                "enum": ["en", "fr", None],
+                "description": _LANGUAGE_DESCRIPTION,
+            },
         },
         "required": ["id"],
     },
@@ -835,6 +884,14 @@ def _handle_calendar_set_report(args: Dict[str, Any], **kw) -> str:
     existing = store.get_report(event_id, occ)
     merged = {**existing["report"], **report} if (existing and isinstance(existing.get("report"), dict)) else report
     store.set_report(event_id, occ, merged)
+    # Auto-confirm the occurrence when a report is saved, unless a live timer
+    # is currently running (status='active') — don't clobber it.
+    try:
+        cur_status = store.get_status(event_id, occ)
+        if cur_status is None or cur_status["status"] in ("floating", "missed", "confirmed"):
+            store.set_status(event_id, occ, "confirmed", source="report")
+    except Exception:
+        pass
     return tool_result({"saved": True, "event_id": event_id, "title": ev.get("title"),
                         "occurrence_utc": occ, "report": merged})
 
@@ -935,6 +992,297 @@ CALENDAR_LIST_REPORTS_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Status lifecycle + work timers
+# ---------------------------------------------------------------------------
+
+def _handle_calendar_set_status(args: Dict[str, Any], **kw) -> str:
+    event_id = str(args.get("id") or "").strip()
+    if not event_id:
+        return tool_error("id is required")
+    ev = store.get_event(event_id)
+    if ev is None:
+        return tool_error(f"Event not found: {event_id}")
+
+    occ = _resolve_occurrence(ev, args.get("occurrence"))
+    if occ is None:
+        return tool_error(
+            "This is a recurring event — pass 'occurrence' (the date of the specific instance, "
+            "e.g. '2026-06-10') so the status attaches to the right occurrence."
+        )
+
+    status = str(args.get("status") or "confirmed").strip().lower()
+    if status not in _STATUS_ENUM:
+        return tool_error(f"status must be one of: {_STATUS_ENUM}")
+
+    note = args.get("note")
+
+    if status == "floating":
+        store.clear_status(event_id, occ)
+    else:
+        store.set_status(event_id, occ, status, note=note, source="manual")
+
+    return tool_result({"id": event_id, "occurrence_utc": occ, "status": status})
+
+
+def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
+    title = str(args.get("title") or "").strip()
+    if not title:
+        return tool_error("title is required")
+
+    # Validate duration BEFORE creating the event so a bad value doesn't leave
+    # an orphaned event behind, and the caller gets clear feedback.
+    duration_raw = args.get("duration")
+    duration_seconds: Optional[int] = None
+    if duration_raw is not None:
+        duration_seconds = _parse_lead(duration_raw)
+        if duration_seconds is None:
+            return tool_error(
+                f"Couldn't understand duration {duration_raw!r} — use e.g. '2 hours', "
+                "'90 min', '1h30m', or omit it for an open-ended timer."
+            )
+
+    tz_name = args.get("tz") or recurrence_mod.DEFAULT_TZ
+    now = datetime.now(timezone.utc)
+
+    tags_raw = args.get("tags")
+    tags: Optional[List[str]] = [str(t) for t in tags_raw] if isinstance(tags_raw, list) else None
+
+    lang_raw = args.get("language")
+    timer_language: Optional[str] = None
+    if lang_raw is not None:
+        lang_lower = str(lang_raw).strip().lower()
+        timer_language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
+
+    event_data = {
+        "title": title,
+        "description": args.get("description"),
+        "start_utc": now.isoformat(),
+        "tz": tz_name,
+        "all_day": False,
+        "recurrence": None,
+        "alert_lead_seconds": None,
+        "alert_channel": "none",
+        "meeting": None,
+        "location": args.get("location"),
+        "tags": tags,
+        "language": timer_language,
+    }
+    try:
+        event_id = store.add_event(event_data)
+    except Exception as e:
+        logger.exception("calendar_start_timer store error")
+        return tool_error(f"Failed to create timer event: {e}")
+
+    occ_iso = now.isoformat()
+
+    if duration_seconds is not None:
+        ended_utc = (now + timedelta(seconds=duration_seconds)).isoformat()
+        store.set_status(
+            event_id, occ_iso, "confirmed",
+            started_utc=now.isoformat(),
+            ended_utc=ended_utc,
+            duration_seconds=duration_seconds,
+            source="timer",
+        )
+        status = "confirmed"
+    else:
+        store.set_status(
+            event_id, occ_iso, "active",
+            started_utc=now.isoformat(),
+            source="timer",
+        )
+        status = "active"
+
+    result: Dict[str, Any] = {
+        "id": event_id,
+        "title": title,
+        "started_utc": now.isoformat(),
+        "status": status,
+    }
+    if duration_seconds is not None:
+        result["duration_seconds"] = duration_seconds
+    return tool_result(result)
+
+
+def _handle_calendar_stop_timer(args: Dict[str, Any], **kw) -> str:
+    given_id = str(args.get("id") or "").strip() or None
+    note = args.get("note")
+
+    actives = store.list_active()
+
+    if given_id:
+        row = next((r for r in actives if r["event_id"] == given_id), None)
+        if row is None:
+            return tool_error(f"No running timer found for event: {given_id}")
+    else:
+        if len(actives) == 0:
+            return tool_error("No running timer. Start one with calendar_start_timer.")
+        if len(actives) > 1:
+            lines = []
+            for r in actives:
+                ev = store.get_event(r["event_id"])
+                title = ev["title"] if ev else r["event_id"]
+                lines.append(f"  • {r['event_id']} — {title!r} (started {r.get('started_utc', '?')})")
+            return tool_error(
+                "Multiple active timers — pass 'id' to specify which to stop:\n" + "\n".join(lines)
+            )
+        row = actives[0]
+
+    event_id = row["event_id"]
+    occ_iso = row["occurrence_utc"]
+    started_iso = row.get("started_utc")
+
+    now = datetime.now(timezone.utc)
+    measured: Optional[int] = None
+    if started_iso:
+        try:
+            started_dt = datetime.fromisoformat(started_iso)
+            if started_dt.tzinfo is None:
+                started_dt = started_dt.replace(tzinfo=timezone.utc)
+            measured = max(0, round((now - started_dt).total_seconds()))
+        except Exception:
+            pass
+
+    store.set_status(
+        event_id, occ_iso, "confirmed",
+        ended_utc=now.isoformat(),
+        duration_seconds=measured,
+        note=note,
+        source="timer",
+    )
+
+    ev = store.get_event(event_id)
+    title = ev["title"] if ev else event_id
+
+    result: Dict[str, Any] = {
+        "id": event_id,
+        "title": title,
+        "started_utc": started_iso,
+        "ended_utc": now.isoformat(),
+    }
+    if measured is not None:
+        result["duration_seconds"] = measured
+    return tool_result(result)
+
+
+CALENDAR_SET_STATUS_SCHEMA = {
+    "name": "calendar_set_status",
+    "description": (
+        "Record whether a calendar event (or a specific occurrence of a recurring event) "
+        "actually happened — confirmed, missed, or reset to unknown. "
+        "Use 'confirmed' when the meeting/task/event took place and you attended or did it. "
+        "Use 'missed' when it did NOT happen (cancelled last-minute, skipped, no-show). "
+        "Use 'floating' to reset an occurrence back to the default unknown state. "
+        "For recurring events, pass 'occurrence' to target the right instance — the agent can "
+        "resolve a natural-language reference like 'the Monday standup that happened at 9am' "
+        "to the correct (id, occurrence) pair. "
+        "An optional 'note' (reason, context) is stored alongside the status."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "Event ID."},
+            "occurrence": {
+                "type": "string",
+                "description": (
+                    "The datetime of the specific occurrence to update — required for recurring "
+                    "events; for one-time events defaults to the event's own start time. "
+                    "E.g. '2026-06-10T09:00:00+03:00' or simply '2026-06-10'."
+                ),
+            },
+            "status": {
+                "type": "string",
+                "enum": _STATUS_ENUM,
+                "description": (
+                    "'confirmed' = it happened; 'missed' = it did not happen; "
+                    "'floating' = reset to unknown (default for new occurrences)."
+                ),
+            },
+            "note": {
+                "type": "string",
+                "description": "Optional free-text note stored alongside the status (reason, context, etc.).",
+            },
+        },
+        "required": ["id"],
+    },
+}
+
+CALENDAR_START_TIMER_SCHEMA = {
+    "name": "calendar_start_timer",
+    "description": (
+        "Start a work timer right now — instantly creates a calendar event for this moment and "
+        "begins tracking time. Ideal for unplanned tasks, spontaneous work sessions, or anything "
+        "you want to log as you do it ('I'm starting the refactor now', 'begin the 1-on-1'). "
+        "If you provide a 'duration' (e.g. '2 hours', '90 min') the block is fully fixed and "
+        "marked confirmed immediately. If you omit duration the timer runs open-ended — stop it "
+        "later with calendar_stop_timer to record the measured elapsed time. "
+        "No reminder is set (alert_channel=none) since you're already doing the task."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "What you are starting (required)."},
+            "duration": {
+                "type": "string",
+                "description": (
+                    "Optional fixed duration, e.g. '2 hours', '90 min', '45 minutes', '1 hour 30 min'. "
+                    "If omitted the timer is open-ended and must be stopped with calendar_stop_timer."
+                ),
+            },
+            "description": {"type": "string", "description": "Optional notes about what is being worked on."},
+            "location": {"type": "string", "description": "Optional location."},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags for filtering, e.g. ['work', 'deep-focus'].",
+            },
+            "tz": {
+                "type": "string",
+                "description": (
+                    f"IANA timezone for the event, e.g. 'Indian/Antananarivo'. "
+                    f"Defaults to {recurrence_mod.DEFAULT_TZ}."
+                ),
+            },
+            "language": {
+                "type": ["string", "null"],
+                "enum": ["en", "fr", None],
+                "description": _LANGUAGE_DESCRIPTION,
+            },
+        },
+        "required": ["title"],
+    },
+}
+
+CALENDAR_STOP_TIMER_SCHEMA = {
+    "name": "calendar_stop_timer",
+    "description": (
+        "Stop a running work timer and record the measured elapsed duration. "
+        "If there is exactly one active timer, it is stopped automatically — no id needed. "
+        "If there are multiple active timers, pass 'id' to specify which one to stop "
+        "(the tool will list the choices if you omit id and multiple are running). "
+        "The timer's occurrence is marked 'confirmed' and the duration in seconds is stored. "
+        "An optional 'note' (what was accomplished, blockers, etc.) is saved alongside."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": (
+                    "Event ID of the timer to stop. Omit if there is only one running timer "
+                    "(the single active one is stopped automatically)."
+                ),
+            },
+            "note": {
+                "type": "string",
+                "description": "Optional note about what was accomplished or why the timer is stopping.",
+            },
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -947,6 +1295,9 @@ _TOOLS = (
     ("calendar_set_report",   CALENDAR_SET_REPORT_SCHEMA,   _handle_calendar_set_report,   "📝"),
     ("calendar_get_report",   CALENDAR_GET_REPORT_SCHEMA,   _handle_calendar_get_report,   "📖"),
     ("calendar_list_reports", CALENDAR_LIST_REPORTS_SCHEMA, _handle_calendar_list_reports, "🗂️"),
+    ("calendar_set_status",   CALENDAR_SET_STATUS_SCHEMA,   _handle_calendar_set_status,   "✅"),
+    ("calendar_start_timer",  CALENDAR_START_TIMER_SCHEMA,  _handle_calendar_start_timer,  "⏱️"),
+    ("calendar_stop_timer",   CALENDAR_STOP_TIMER_SCHEMA,   _handle_calendar_stop_timer,   "⏹️"),
 )
 
 

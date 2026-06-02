@@ -130,8 +130,18 @@ def _parse_range(frm: Optional[str], to: Optional[str]):
     return start, end
 
 
+def _effective_status(stored: str, occ: datetime, now: datetime) -> str:
+    """Display status: a still-floating occurrence whose time has passed reads
+    as 'missed' (unconfirmed), while the STORED status stays 'floating' so it
+    can still be confirmed later. Non-floating stored statuses pass through."""
+    if stored != "floating":
+        return stored
+    return "missed" if occ < now else "floating"
+
+
 def _occurrences_in_range(start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
     for ev in store.list_events():
         ev_local = dict(ev)
         try:
@@ -150,8 +160,14 @@ def _occurrences_in_range(start_utc: datetime, end_utc: datetime) -> List[Dict[s
             report_keys = {r["occurrence_utc"] for r in store.list_reports(ev["id"])}
         except Exception:
             report_keys = set()
+        # Batch statuses once per event (avoids an N+1 get_status per occurrence).
+        try:
+            status_map = {s["occurrence_utc"]: s for s in store.list_statuses(ev["id"])}
+        except Exception:
+            status_map = {}
         for occ in occs:
             occ_iso = occ.isoformat()
+            status_row = status_map.get(occ_iso)
             out.append({
                 "id": ev["id"],
                 "title": ev["title"],
@@ -165,6 +181,11 @@ def _occurrences_in_range(start_utc: datetime, end_utc: datetime) -> List[Dict[s
                 "location": ev.get("location"),
                 "tags": ev.get("tags") or [],
                 "has_report": occ_iso in report_keys,
+                "status": status_row["status"] if status_row else "floating",
+                "effective_status": _effective_status(
+                    status_row["status"] if status_row else "floating", occ, now
+                ),
+                "duration_seconds": status_row.get("duration_seconds") if status_row else None,
             })
     out.sort(key=lambda e: e["occurrence_utc"])
     return out
@@ -214,6 +235,27 @@ def event_detail(event_id: str):
     except Exception:
         reports = []
 
+    statuses = []
+    try:
+        for s in store.list_statuses(event_id):
+            occ_iso = s["occurrence_utc"]
+            try:
+                occ_local = datetime.fromisoformat(occ_iso).astimezone(tz).isoformat()
+            except Exception:
+                occ_local = occ_iso
+            statuses.append({
+                "occurrence_utc": occ_iso,
+                "occurrence_local": occ_local,
+                "status": s["status"],
+                "started_utc": s.get("started_utc"),
+                "ended_utc": s.get("ended_utc"),
+                "duration_seconds": s.get("duration_seconds"),
+                "note": s.get("note"),
+                "source": s.get("source"),
+            })
+    except Exception:
+        statuses = []
+
     return {
         "id": ev["id"],
         "title": ev["title"],
@@ -225,10 +267,47 @@ def event_detail(event_id: str):
         "recurrence_human": _human_recurrence(ev.get("recurrence")),
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
+        "language": ev.get("language"),
         "meeting": ev.get("meeting"),
         "location": ev.get("location"),
         "tags": ev.get("tags") or [],
         "created_utc": ev.get("created_utc"),
         "updated_utc": ev.get("updated_utc"),
         "reports": reports,
+        "statuses": statuses,
     }
+
+
+@router.get("/timers")
+def list_timers():
+    """Active (running) timers — occurrence_status rows where status='active'."""
+    now = datetime.now(timezone.utc)
+    rows = []
+    try:
+        actives = store.list_active()
+    except Exception:
+        actives = []
+    for row in actives:
+        ev = None
+        try:
+            ev = store.get_event(row["event_id"])
+        except Exception:
+            pass
+        elapsed: Optional[int] = None
+        started_iso = row.get("started_utc")
+        if started_iso:
+            try:
+                started_dt = datetime.fromisoformat(started_iso)
+                if started_dt.tzinfo is None:
+                    started_dt = started_dt.replace(tzinfo=timezone.utc)
+                elapsed = max(0, round((now - started_dt).total_seconds()))
+            except Exception:
+                pass
+        rows.append({
+            "event_id": row["event_id"],
+            "occurrence_utc": row["occurrence_utc"],
+            "title": ev["title"] if ev else row["event_id"],
+            "started_utc": started_iso,
+            "elapsed_seconds": elapsed,
+        })
+    return {"timers": rows}

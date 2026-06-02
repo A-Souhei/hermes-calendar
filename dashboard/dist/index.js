@@ -27,6 +27,46 @@
   const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const MAX_CHIPS = 3;
 
+  // --- status helpers -------------------------------------------------------
+
+  var STATUS_GLYPH = { confirmed: "✓", active: "●", missed: "✗" };
+
+  function statusGlyph(status) {
+    return STATUS_GLYPH[status] || null;
+  }
+
+  // Effective display status (backend-derived): a past, still-floating
+  // occurrence reads as "missed" while staying floating underneath.
+  function effStatus(ev) {
+    return ev.effective_status || ev.status || "floating";
+  }
+  // True when "missed" is only inferred from the past date, not explicitly set.
+  function isDerivedMiss(ev) {
+    return effStatus(ev) === "missed" && (ev.status === "floating" || !ev.status);
+  }
+
+  function fmtDuration(seconds) {
+    if (seconds == null || seconds < 0) return null;
+    var h = Math.floor(seconds / 3600);
+    var m = Math.floor((seconds % 3600) / 60);
+    var s = seconds % 60;
+    if (h > 0 && m > 0) return h + "h " + m + "m";
+    if (h > 0) return h + "h";
+    if (m > 0 && s > 0) return m + "m " + s + "s";
+    if (m > 0) return m + "m";
+    return s + "s";
+  }
+
+  function fmtElapsed(startedUtc) {
+    if (!startedUtc) return null;
+    try {
+      var elapsed = Math.max(0, Math.round((Date.now() - new Date(startedUtc).getTime()) / 1000));
+      return fmtDuration(elapsed);
+    } catch (e) {
+      return null;
+    }
+  }
+
   // --- date helpers ---------------------------------------------------------
 
   function pad2(n) { return String(n).padStart(2, "0"); }
@@ -108,13 +148,18 @@
 
   function EventChip(props) {
     const ev = props.event;
+    const eff = effStatus(ev);
+    const derived = isDerivedMiss(ev);
+    const glyph = statusGlyph(eff);
+    const prefix = (glyph ? h("span", { className: cn("cal-status-glyph", derived && "cal-status-derived") }, glyph) : null);
     return h(
       "button",
       {
         className: cn("cal-chip", ev.recurring ? "cal-chip-recurring" : "cal-chip-once"),
-        title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : ""),
+        title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (eff !== "floating" ? " · " + (derived ? "missed (unconfirmed)" : eff) : ""),
         onClick: function () { props.onOpen(ev.id); },
       },
+      prefix,
       h("span", { className: "cal-chip-title" }, (ev.has_report ? "📝 " : "") + ev.title)
     );
   }
@@ -180,8 +225,11 @@
                 "div",
                 { className: "space-y-1" },
                 events.map(function (ev, i) {
-                  const prefix = (ev.has_report ? "📝 " : "") +
-                    (ev.all_day ? "All day · " : (fmtTime(ev.occurrence_local, ev.tz) + " · "));
+                  const derived = isDerivedMiss(ev);
+                  const glyph = statusGlyph(effStatus(ev));
+                  const timeStr = ev.all_day ? "All day" : fmtTime(ev.occurrence_local, ev.tz);
+                  const dur = ev.duration_seconds != null ? fmtDuration(ev.duration_seconds) : null;
+                  const durStr = dur ? " · " + dur : "";
                   return h(
                     "button",
                     {
@@ -190,7 +238,8 @@
                       title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : ""),
                       onClick: function () { props.onOpenEvent(ev.id); },
                     },
-                    h("span", { className: "cal-chip-title" }, prefix + ev.title)
+                    glyph ? h("span", { className: cn("cal-status-glyph", derived && "cal-status-derived") }, glyph) : null,
+                    h("span", { className: "cal-chip-title" }, (ev.has_report ? "📝 " : "") + timeStr + " · " + ev.title + durStr)
                   );
                 })
               )
@@ -367,6 +416,43 @@
                     )
                   : null,
 
+                data.statuses && data.statuses.length
+                  ? h(
+                      "div",
+                      { className: "space-y-2" },
+                      h("div", { className: "text-sm font-semibold" }, "Status history (" + data.statuses.length + ")"),
+                      data.statuses.map(function (s) {
+                        var dur = s.duration_seconds != null ? fmtDuration(s.duration_seconds) : null;
+                        var running = s.status === "active" && s.started_utc ? fmtElapsed(s.started_utc) : null;
+                        return h(
+                          "div",
+                          { key: s.occurrence_utc, className: "rounded-md border p-3 space-y-1 text-sm" },
+                          h(
+                            "div",
+                            { className: "flex items-center justify-between gap-2 flex-wrap" },
+                            h("span", { className: "font-medium" }, fmtDateTime(s.occurrence_local || s.occurrence_utc, data.tz)),
+                            h("span", { className: "cal-status cal-status-" + s.status }, (STATUS_GLYPH[s.status] || "") + " " + s.status)
+                          ),
+                          s.started_utc
+                            ? h("div", { className: "text-xs opacity-60" }, "Started: " + fmtDateTime(s.started_utc, data.tz))
+                            : null,
+                          s.ended_utc
+                            ? h("div", { className: "text-xs opacity-60" }, "Ended: " + fmtDateTime(s.ended_utc, data.tz))
+                            : null,
+                          dur
+                            ? h("div", { className: "text-xs opacity-70" }, "Duration: " + dur)
+                            : null,
+                          running
+                            ? h("div", { className: "text-xs font-medium", style: { color: "var(--color-primary)" } }, "Running for " + running)
+                            : null,
+                          s.note
+                            ? h("div", { className: "text-xs opacity-70 italic" }, s.note)
+                            : null
+                        );
+                      })
+                    )
+                  : null,
+
                 h(
                   "div",
                   { className: "space-y-2" },
@@ -487,10 +573,13 @@
       // legend
       h(
         "div",
-        { className: "flex items-center gap-4 text-xs opacity-60" },
+        { className: "flex items-center gap-4 flex-wrap text-xs opacity-60" },
         h("span", null, h("span", { className: "cal-chip cal-chip-once", style: { padding: "1px 6px" } }, "one-time")),
         h("span", null, h("span", { className: "cal-chip cal-chip-recurring", style: { padding: "1px 6px" } }, "recurring")),
-        h("span", null, "📝 has report")
+        h("span", null, "📝 has report"),
+        h("span", null, h("span", { className: "cal-status-glyph" }, "✓"), " confirmed"),
+        h("span", null, h("span", { className: "cal-status-glyph" }, "●"), " active timer"),
+        h("span", null, h("span", { className: "cal-status-glyph" }, "✗"), " missed")
       ),
 
       openDay ? h(DayModal, {
