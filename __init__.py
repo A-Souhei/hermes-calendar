@@ -198,6 +198,15 @@ _CHANNEL_DESCRIPTION = (
     "'all' = push + speak + chat; 'none' = no reminder."
 )
 
+_LANGUAGE_ENUM = ["en", "fr"]
+_LANGUAGE_DESCRIPTION = (
+    "Language for THIS event's reminder text — the labels and the date are rendered "
+    "in this language ('en' = English, 'fr' = French). "
+    "Infer it from how the user phrased the request: a French-phrased request → 'fr', "
+    "an English one → 'en'. "
+    "Omit to use the configured default (CALENDAR_DEFAULT_LANG env or 'en')."
+)
+
 
 def _human_recurrence(rec: Optional[Dict]) -> Optional[str]:
     if not rec:
@@ -232,6 +241,7 @@ def _event_summary(ev: Dict) -> Dict:
         "recurrence": _human_recurrence(ev.get("recurrence")),
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
+        "language": ev.get("language"),
         "location": ev.get("location"),
         "tags": ev.get("tags"),
     }
@@ -279,6 +289,12 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
     if isinstance(tags_raw, list):
         tags = [str(t) for t in tags_raw]
 
+    lang_raw = args.get("language")
+    language: Optional[str] = None
+    if lang_raw is not None:
+        lang_lower = str(lang_raw).strip().lower()
+        language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
+
     d = {
         "title": title,
         "description": args.get("description"),
@@ -291,6 +307,7 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         "meeting": meeting,
         "location": args.get("location"),
         "tags": tags,
+        "language": language,
     }
     try:
         event_id = store.add_event(d)
@@ -391,6 +408,14 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
     if "tags" in args:
         tags_raw = args["tags"]
         fields["tags"] = [str(t) for t in tags_raw] if isinstance(tags_raw, list) else None
+
+    if "language" in args:
+        lang_raw = args["language"]
+        if lang_raw is None:
+            fields["language"] = None
+        else:
+            lang_lower = str(lang_raw).strip().lower()
+            fields["language"] = lang_lower if lang_lower in _LANGUAGE_ENUM else None
 
     if not fields:
         return tool_error("No updatable fields provided")
@@ -564,6 +589,7 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
         "recurrence_human": _human_recurrence(ev.get("recurrence")),
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
+        "language": ev.get("language"),
         "meeting": ev.get("meeting"),
         "location": ev.get("location"),
         "tags": ev.get("tags"),
@@ -646,6 +672,11 @@ CALENDAR_ADD_EVENT_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "Free-form tags for filtering, e.g. ['work', 'health'].",
             },
+            "language": {
+                "type": ["string", "null"],
+                "enum": ["en", "fr", None],
+                "description": _LANGUAGE_DESCRIPTION,
+            },
         },
         "required": ["title", "start"],
     },
@@ -694,6 +725,11 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
             },
             "location": {"type": "string"},
             "tags": {"type": "array", "items": {"type": "string"}},
+            "language": {
+                "type": ["string", "null"],
+                "enum": ["en", "fr", None],
+                "description": _LANGUAGE_DESCRIPTION,
+            },
         },
         "required": ["id"],
     },
@@ -1011,6 +1047,12 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
     tags_raw = args.get("tags")
     tags: Optional[List[str]] = [str(t) for t in tags_raw] if isinstance(tags_raw, list) else None
 
+    lang_raw = args.get("language")
+    timer_language: Optional[str] = None
+    if lang_raw is not None:
+        lang_lower = str(lang_raw).strip().lower()
+        timer_language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
+
     event_data = {
         "title": title,
         "description": args.get("description"),
@@ -1023,6 +1065,7 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
         "meeting": None,
         "location": args.get("location"),
         "tags": tags,
+        "language": timer_language,
     }
     try:
         event_id = store.add_event(event_data)
@@ -1199,6 +1242,11 @@ CALENDAR_START_TIMER_SCHEMA = {
                     f"IANA timezone for the event, e.g. 'Indian/Antananarivo'. "
                     f"Defaults to {recurrence_mod.DEFAULT_TZ}."
                 ),
+            },
+            "language": {
+                "type": ["string", "null"],
+                "enum": ["en", "fr", None],
+                "description": _LANGUAGE_DESCRIPTION,
             },
         },
         "required": ["title"],

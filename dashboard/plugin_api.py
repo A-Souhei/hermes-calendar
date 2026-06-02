@@ -267,6 +267,7 @@ def event_detail(event_id: str):
         "recurrence_human": _human_recurrence(ev.get("recurrence")),
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
+        "language": ev.get("language"),
         "meeting": ev.get("meeting"),
         "location": ev.get("location"),
         "tags": ev.get("tags") or [],

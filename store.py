@@ -54,6 +54,7 @@ def init_db() -> None:
                 meeting         TEXT,
                 location        TEXT,
                 tags            TEXT,
+                language        TEXT,
                 created_utc     TEXT,
                 updated_utc     TEXT
             );
@@ -94,6 +95,12 @@ def init_db() -> None:
             );
         """)
         conn.commit()
+        # Idempotent migration: add language column to existing DBs that
+        # were created before this column was introduced.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "language" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN language TEXT")
+            conn.commit()
 
 
 def _now_iso() -> str:
@@ -130,8 +137,8 @@ def add_event(d: Dict[str, Any]) -> str:
             INSERT INTO events
                 (id, title, description, start_utc, tz, all_day,
                  recurrence, alert_lead_seconds, alert_channel,
-                 meeting, location, tags, created_utc, updated_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 meeting, location, tags, language, created_utc, updated_utc)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 event_id,
@@ -146,6 +153,7 @@ def add_event(d: Dict[str, Any]) -> str:
                 json.dumps(d["meeting"]) if d.get("meeting") is not None else None,
                 d.get("location"),
                 json.dumps(d["tags"]) if d.get("tags") is not None else None,
+                d.get("language"),
                 now,
                 now,
             ),

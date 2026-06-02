@@ -25,12 +25,18 @@ _thread: threading.Thread | None = None
 _lock = threading.Lock()
 
 
+_VALID_LANGUAGES = ("en", "fr")
+
+
 def _load_config() -> dict:
+    env_lang = os.environ.get("CALENDAR_DEFAULT_LANG", "").strip().lower()
+    default_language = env_lang if env_lang in _VALID_LANGUAGES else "en"
     defaults = {
         "default_lead_seconds": 3600,
         "daily_alert_hour": 9,
         "check_interval_seconds": 60,
         "boot_catchup_seconds": 7200,
+        "default_language": default_language,
     }
     cfg_path = os.path.join(
         os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
@@ -43,12 +49,36 @@ def _load_config() -> dict:
             defaults.update({k: v for k, v in file_cfg.items() if v is not None})
     except Exception:
         pass
+    # Validate the language value that may have come from the JSON file.
+    if defaults.get("default_language") not in _VALID_LANGUAGES:
+        defaults["default_language"] = "en"
     return defaults
 
 
+_EN_WEEKDAYS = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+]
+_FR_WEEKDAYS = [
+    "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+]
+_EN_MONTHS = [
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+_FR_MONTHS = [
+    "", "janvier", "février", "mars", "avril", "mai", "juin",
+    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+]
+
+
 def _build_message(event: dict, occ_utc: datetime) -> str:
-    """Compose the reminder notification body."""
+    """Compose the reminder notification body, localized to the event's language."""
     from zoneinfo import ZoneInfo
+
+    # Resolve effective language: event-level → config default → 'en'
+    lang = (event.get("language") or _load_config().get("default_language") or "en")
+    if lang not in _VALID_LANGUAGES:
+        lang = "en"
 
     tz_name = event.get("tz") or recurrence.DEFAULT_TZ
     try:
@@ -57,30 +87,57 @@ def _build_message(event: dict, occ_utc: datetime) -> str:
         event_tz = ZoneInfo(recurrence.DEFAULT_TZ)
 
     occ_local = occ_utc.astimezone(event_tz)
+    wd = occ_local.weekday()   # 0=Mon … 6=Sun
+    dd = f"{occ_local.day:02d}"
+    mm = occ_local.month
+    yyyy = occ_local.year
+    hhmm = f"{occ_local.hour:02d}:{occ_local.minute:02d}"
+    tz_abbr = occ_local.strftime("%Z")
+
     lines: list[str] = []
 
-    if event.get("all_day"):
-        time_str = occ_local.strftime("%A, %B %d %Y")
-    else:
-        time_str = occ_local.strftime("%A, %B %d %Y at %H:%M %Z")
-
-    lines.append(f"⏰ Reminder: {event['title']}")
-    lines.append(time_str)
-
-    if event.get("description"):
-        lines.append(event["description"])
-
-    meeting = event.get("meeting")
-    if isinstance(meeting, dict) and meeting.get("room_url"):
-        app = meeting.get("room_app", "")
-        room_url = meeting["room_url"]
-        if app:
-            lines.append(f"Join via {app}: {room_url}")
+    if lang == "fr":
+        weekday_name = _FR_WEEKDAYS[wd]
+        month_name = _FR_MONTHS[mm]
+        if event.get("all_day"):
+            time_str = f"{weekday_name} {dd} {month_name} {yyyy}"
         else:
-            lines.append(f"Join: {room_url}")
-
-    if event.get("location"):
-        lines.append(f"Location: {event['location']}")
+            time_str = f"{weekday_name} {dd} {month_name} {yyyy} à {hhmm} {tz_abbr}"
+        lines.append(f"⏰ Rappel : {event['title']}")
+        lines.append(time_str)
+        if event.get("description"):
+            lines.append(event["description"])
+        meeting = event.get("meeting")
+        if isinstance(meeting, dict) and meeting.get("room_url"):
+            app = meeting.get("room_app", "")
+            room_url = meeting["room_url"]
+            if app:
+                lines.append(f"Rejoindre via {app} : {room_url}")
+            else:
+                lines.append(f"Rejoindre : {room_url}")
+        if event.get("location"):
+            lines.append(f"Lieu : {event['location']}")
+    else:
+        weekday_name = _EN_WEEKDAYS[wd]
+        month_name = _EN_MONTHS[mm]
+        if event.get("all_day"):
+            time_str = f"{weekday_name}, {month_name} {dd} {yyyy}"
+        else:
+            time_str = f"{weekday_name}, {month_name} {dd} {yyyy} at {hhmm} {tz_abbr}"
+        lines.append(f"⏰ Reminder: {event['title']}")
+        lines.append(time_str)
+        if event.get("description"):
+            lines.append(event["description"])
+        meeting = event.get("meeting")
+        if isinstance(meeting, dict) and meeting.get("room_url"):
+            app = meeting.get("room_app", "")
+            room_url = meeting["room_url"]
+            if app:
+                lines.append(f"Join via {app}: {room_url}")
+            else:
+                lines.append(f"Join: {room_url}")
+        if event.get("location"):
+            lines.append(f"Location: {event['location']}")
 
     return "\n".join(lines)
 
