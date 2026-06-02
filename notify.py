@@ -28,8 +28,10 @@ import os
 import smtplib
 import urllib.error
 import urllib.request
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,7 @@ def fire(
     title: str,
     message: str,
     target: Optional[str] = None,
+    attachments: Optional[List[Tuple[str, bytes, str]]] = None,
 ) -> dict:
     """Send a reminder.
 
@@ -117,6 +120,11 @@ def fire(
       "email"                  — via SMTP to `target` (must be allowlisted)
       "none"                   — no-op
     ("chat" is delivered by the scheduler's stdout, not here.)
+
+    attachments (email only): optional list of (filename, data_bytes,
+    mime_subtype) tuples, e.g. ("planning-report.pdf", b"...", "pdf"). When
+    present the email is sent as a multipart message; otherwise a plain text
+    email is sent (unchanged behavior).
     Returns {"ok": bool, "status": int|None, "error": str|None}
     """
     if channel == "none":
@@ -139,7 +147,17 @@ def fire(
         if target.lower() not in allowed_email_recipients():
             return {"ok": False, "status": None, "error": "recipient not allowlisted"}
         try:
-            mime = MIMEText(message, _charset="utf-8")
+            if attachments:
+                mime = MIMEMultipart()
+                mime.attach(MIMEText(message, _charset="utf-8"))
+                for fname, data, subtype in attachments:
+                    part = MIMEApplication(data, _subtype=subtype)
+                    part.add_header(
+                        "Content-Disposition", "attachment", filename=fname
+                    )
+                    mime.attach(part)
+            else:
+                mime = MIMEText(message, _charset="utf-8")
             mime["From"] = addr
             mime["To"] = target
             mime["Subject"] = title

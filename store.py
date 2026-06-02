@@ -57,6 +57,23 @@ def init_db() -> None:
                 language        TEXT,
                 owner           TEXT,
                 notify_email    TEXT,
+                planning_id     TEXT,
+                created_utc     TEXT,
+                updated_utc     TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS plannings (
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                period_label    TEXT,
+                period_start_utc TEXT NOT NULL,
+                period_end_utc  TEXT NOT NULL,
+                owner           TEXT,
+                language        TEXT,
+                tz              TEXT,
+                description     TEXT,
+                report_sent     INTEGER DEFAULT 0,
+                report_sent_utc TEXT,
                 created_utc     TEXT,
                 updated_utc     TEXT
             );
@@ -116,6 +133,13 @@ def init_db() -> None:
         if "notify_email" not in cols:
             conn.execute("ALTER TABLE events ADD COLUMN notify_email TEXT")
             conn.commit()
+        if "planning_id" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN planning_id TEXT")
+            conn.commit()
+        pcols = {row[1] for row in conn.execute("PRAGMA table_info(plannings)").fetchall()}
+        if pcols and "tz" not in pcols:
+            conn.execute("ALTER TABLE plannings ADD COLUMN tz TEXT")
+            conn.commit()
 
 
 def _now_iso() -> str:
@@ -153,8 +177,8 @@ def add_event(d: Dict[str, Any]) -> str:
                 (id, title, description, start_utc, tz, all_day,
                  recurrence, alert_lead_seconds, alert_channel,
                  meeting, location, tags, language, owner, notify_email,
-                 created_utc, updated_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 planning_id, created_utc, updated_utc)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 event_id,
@@ -172,6 +196,7 @@ def add_event(d: Dict[str, Any]) -> str:
                 d.get("language"),
                 d.get("owner"),
                 d.get("notify_email"),
+                d.get("planning_id"),
                 now,
                 now,
             ),
@@ -233,6 +258,141 @@ def list_events() -> List[Dict[str, Any]]:
         conn = _get_conn()
         rows = conn.execute("SELECT * FROM events ORDER BY start_utc").fetchall()
     return [_row_to_event(r) for r in rows]
+
+
+def list_planning_events(planning_id: str) -> List[Dict[str, Any]]:
+    """Return all events tagged with the given planning_id, ordered by start."""
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM events WHERE planning_id = ? ORDER BY start_utc",
+            (planning_id,),
+        ).fetchall()
+    return [_row_to_event(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Plannings (named, period-bounded sets of events)
+# ---------------------------------------------------------------------------
+
+def add_planning(d: Dict[str, Any]) -> str:
+    """Insert a new planning; returns its generated id (uuid4 hex)."""
+    planning_id = uuid.uuid4().hex
+    now = _now_iso()
+    with _lock:
+        conn = _get_conn()
+        conn.execute(
+            """
+            INSERT INTO plannings
+                (id, name, period_label, period_start_utc, period_end_utc,
+                 owner, language, tz, description, report_sent, report_sent_utc,
+                 created_utc, updated_utc)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                planning_id,
+                d["name"],
+                d.get("period_label"),
+                d["period_start_utc"],
+                d["period_end_utc"],
+                d.get("owner"),
+                d.get("language"),
+                d.get("tz"),
+                d.get("description"),
+                int(bool(d.get("report_sent", 0))),
+                d.get("report_sent_utc"),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    return planning_id
+
+
+def get_planning(planning_id: str) -> Optional[Dict[str, Any]]:
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT * FROM plannings WHERE id = ?", (planning_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_planning_by_name(name: str) -> Optional[Dict[str, Any]]:
+    """Case-insensitive lookup by name; returns the most recent if duplicates."""
+    key = str(name).strip().lower()
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT * FROM plannings WHERE LOWER(name) = ? "
+            "ORDER BY created_utc DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_plannings() -> List[Dict[str, Any]]:
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM plannings ORDER BY period_start_utc"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_planning(planning_id: str, fields: Dict[str, Any]) -> bool:
+    """Update only the provided keys. Bumps updated_utc. Returns False if no row matched."""
+    if not fields:
+        return False
+    serialized = dict(fields)
+    if "report_sent" in serialized:
+        serialized["report_sent"] = int(bool(serialized["report_sent"]))
+    serialized["updated_utc"] = _now_iso()
+    set_clause = ", ".join(f"{k} = ?" for k in serialized)
+    values = list(serialized.values()) + [planning_id]
+    with _lock:
+        conn = _get_conn()
+        cursor = conn.execute(
+            f"UPDATE plannings SET {set_clause} WHERE id = ?", values
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def set_report_sent(planning_id: str) -> None:
+    """Mark a planning's end-of-period report as sent (dedup guard)."""
+    now = _now_iso()
+    with _lock:
+        conn = _get_conn()
+        conn.execute(
+            "UPDATE plannings SET report_sent = 1, report_sent_utc = ?, "
+            "updated_utc = ? WHERE id = ?",
+            (now, now, planning_id),
+        )
+        conn.commit()
+
+
+def remove_planning(planning_id: str, remove_events: bool = False) -> bool:
+    """Delete the planning row. If remove_events: delete each of its events
+    (cascading their statuses/reports/exceptions via remove_event); else
+    detach the events by clearing their planning_id. Returns True if the
+    planning row was deleted."""
+    if remove_events:
+        for ev in list_planning_events(planning_id):
+            remove_event(ev["id"])
+    else:
+        with _lock:
+            conn = _get_conn()
+            conn.execute(
+                "UPDATE events SET planning_id = NULL WHERE planning_id = ?",
+                (planning_id,),
+            )
+            conn.commit()
+    with _lock:
+        conn = _get_conn()
+        cursor = conn.execute("DELETE FROM plannings WHERE id = ?", (planning_id,))
+        conn.commit()
+    return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
