@@ -317,10 +317,10 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
 
     owner_raw = args.get("owner")
-    owner = str(owner_raw).strip() or None if owner_raw is not None else None
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
     notify_email_raw = args.get("notify_email")
     notify_email = (
-        str(notify_email_raw).strip().lower() or None
+        (str(notify_email_raw).strip().lower() or None)
         if notify_email_raw is not None else None
     )
 
@@ -1136,10 +1136,10 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
         timer_language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
 
     owner_raw = args.get("owner")
-    timer_owner = str(owner_raw).strip() or None if owner_raw is not None else None
+    timer_owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
     notify_email_raw = args.get("notify_email")
     timer_notify_email = (
-        str(notify_email_raw).strip().lower() or None
+        (str(notify_email_raw).strip().lower() or None)
         if notify_email_raw is not None else None
     )
 

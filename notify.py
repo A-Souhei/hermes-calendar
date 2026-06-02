@@ -110,9 +110,13 @@ def fire(
     message: str,
     target: Optional[str] = None,
 ) -> dict:
-    """Send a reminder via HA.
+    """Send a reminder.
 
-    channel: "ha_notify" | "ha_speak" | "none"
+    channel:
+      "ha_notify" / "ha_speak" — via Home Assistant (cfg target or `target`)
+      "email"                  — via SMTP to `target` (must be allowlisted)
+      "none"                   — no-op
+    ("chat" is delivered by the scheduler's stdout, not here.)
     Returns {"ok": bool, "status": int|None, "error": str|None}
     """
     if channel == "none":
@@ -120,7 +124,10 @@ def fire(
 
     if channel == "email":
         host = os.environ.get("EMAIL_SMTP_HOST")
-        port = int(os.environ.get("EMAIL_SMTP_PORT") or 587)
+        try:
+            port = int(os.environ.get("EMAIL_SMTP_PORT") or 587)
+        except (TypeError, ValueError):
+            return {"ok": False, "status": None, "error": "invalid EMAIL_SMTP_PORT"}
         addr = os.environ.get("EMAIL_ADDRESS")
         pw = os.environ.get("EMAIL_PASSWORD")
         if not (addr and pw and host):
