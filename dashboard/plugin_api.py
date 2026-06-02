@@ -160,13 +160,14 @@ def _occurrences_in_range(start_utc: datetime, end_utc: datetime) -> List[Dict[s
             report_keys = {r["occurrence_utc"] for r in store.list_reports(ev["id"])}
         except Exception:
             report_keys = set()
+        # Batch statuses once per event (avoids an N+1 get_status per occurrence).
+        try:
+            status_map = {s["occurrence_utc"]: s for s in store.list_statuses(ev["id"])}
+        except Exception:
+            status_map = {}
         for occ in occs:
             occ_iso = occ.isoformat()
-            status_row = None
-            try:
-                status_row = store.get_status(ev["id"], occ_iso)
-            except Exception:
-                pass
+            status_row = status_map.get(occ_iso)
             out.append({
                 "id": ev["id"],
                 "title": ev["title"],

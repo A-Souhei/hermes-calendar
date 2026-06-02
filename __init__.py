@@ -993,6 +993,18 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
     if not title:
         return tool_error("title is required")
 
+    # Validate duration BEFORE creating the event so a bad value doesn't leave
+    # an orphaned event behind, and the caller gets clear feedback.
+    duration_raw = args.get("duration")
+    duration_seconds: Optional[int] = None
+    if duration_raw is not None:
+        duration_seconds = _parse_lead(duration_raw)
+        if duration_seconds is None:
+            return tool_error(
+                f"Couldn't understand duration {duration_raw!r} — use e.g. '2 hours', "
+                "'90 min', '1h30m', or omit it for an open-ended timer."
+            )
+
     tz_name = args.get("tz") or recurrence_mod.DEFAULT_TZ
     now = datetime.now(timezone.utc)
 
@@ -1019,11 +1031,6 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
         return tool_error(f"Failed to create timer event: {e}")
 
     occ_iso = now.isoformat()
-    duration_seconds: Optional[int] = None
-
-    duration_raw = args.get("duration")
-    if duration_raw is not None:
-        duration_seconds = _parse_lead(duration_raw)
 
     if duration_seconds is not None:
         ended_utc = (now + timedelta(seconds=duration_seconds)).isoformat()
