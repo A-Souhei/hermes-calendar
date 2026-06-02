@@ -26,7 +26,7 @@
 .cal-cell {
   min-height: 104px;
   border: 1px solid var(--color-border);
-  border-radius: 8px;
+  border-radius: 0;
   padding: 4px;
   display: flex;
   flex-direction: column;
@@ -252,3 +252,132 @@
   color: var(--color-card-foreground);
 }
 .cal-plan-card:hover { background: var(--color-muted); }
+
+/* ---- Hero header band ---------------------------------------------------- */
+
+.cal-hero {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--color-primary) 18%, var(--color-card)),
+    var(--color-card)
+  );
+  border-bottom: 1px solid var(--color-border);
+  padding: 20px 24px;
+}
+
+.cal-hero-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.cal-hero-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cal-hero-title {
+  font-size: 1.6rem;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  color: var(--color-foreground);
+  margin: 0;
+}
+
+.cal-hero-sub {
+  font-size: 0.85rem;
+  color: var(--color-muted-foreground);
+  margin: 0;
+}
+
+.cal-hero-tabs {
+  flex-shrink: 0;
+}
+
+/* ---- Section micro-labels ------------------------------------------------ */
+
+.cal-section-label {
+  font-size: 0.66rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-muted-foreground);
+}
+
+/* ---- At-a-glance stat cards ---------------------------------------------- */
+
+.cal-statrow {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.cal-stat {
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-card);
+  color: var(--color-card-foreground);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cal-stat-label {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-muted-foreground);
+}
+
+.cal-stat-value {
+  font-size: 1.4rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* ---- "Next up" chips ----------------------------------------------------- */
+
+.cal-nextup {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cal-nextup-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: inherit;
+  font-size: 0.74rem;
+  line-height: 1.2;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-card);
+  color: var(--color-card-foreground);
+  cursor: pointer;
+  max-width: 100%;
+}
+.cal-nextup-chip:hover {
+  border-color: var(--color-primary);
+  background: var(--color-muted);
+}
+
+.cal-nextup-when {
+  font-weight: 600;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+
+.cal-nextup-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+}

@@ -196,7 +196,7 @@ _VALID_CHANNELS = set(_CHANNEL_ENUM)
 _CHANNEL_DESCRIPTION = (
     "Delivery channel for reminders (default: ha_notify). "
     "'ha_notify' = phone push; 'ha_speak' = spoken TTS on the phone; "
-    "'both' = push + speak; 'chat' = a text from Calypso in this chat; "
+    "'both' = push + speak; 'chat' = a chat message in this conversation; "
     "'email' = emailed reminder to the asker's registered address (set via "
     "calendar_set_user_email) or an explicit notify_email; only sends to "
     "addresses in the allowlist, and sends nothing if no address is known; "

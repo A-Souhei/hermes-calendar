@@ -133,6 +133,20 @@
     return { events, loading, error, reload: load };
   }
 
+  // Upcoming occurrences (used for the "Next up" chips). Tolerant of failure:
+  // resolves to an empty list rather than surfacing an error.
+  function useUpcoming(days) {
+    const [items, setItems] = useState([]);
+    useEffect(function () {
+      let alive = true;
+      SDK.fetchJSON(API + "/upcoming?days=" + encodeURIComponent(days))
+        .then(function (data) { if (alive) setItems((data && data.events) || []); })
+        .catch(function () { if (alive) setItems([]); });
+      return function () { alive = false; };
+    }, [days]);
+    return items;
+  }
+
   function fmtTime(iso, tz) {
     try {
       const d = new Date(iso);
@@ -474,11 +488,22 @@
                     : h("div", { className: "text-sm opacity-60" }, "No reports yet.")
                 ),
 
-                h("div", { className: "text-xs opacity-40 pt-2 border-t" }, "Read-only — edits are made by talking to Calypso.")
+                h("div", { className: "text-xs opacity-40 pt-2 border-t" }, "Read-only — edits are made by talking to the assistant.")
               )
             : null
         )
       )
+    );
+  }
+
+  // --- stat cards -----------------------------------------------------------
+
+  function StatCard(props) {
+    return h(
+      "div",
+      { className: "cal-stat" },
+      h("div", { className: "cal-stat-label" }, props.label),
+      h("div", { className: "cal-stat-value" }, props.value)
     );
   }
 
@@ -489,6 +514,7 @@
     const [openId, setOpenId] = useState(null);
     const [openDay, setOpenDay] = useState(null);
     const { events, loading, error, reload } = useEvents(anchor);
+    const upcoming = useUpcoming(30);
 
     const byDate = useMemo(function () {
       const m = {};
@@ -520,19 +546,42 @@
 
     const monthLabel = anchor.toLocaleString(undefined, { month: "long", year: "numeric" });
 
+    // At-a-glance stats over the currently-loaded month occurrences.
+    const stats = useMemo(function () {
+      var s = { total: 0, confirmed: 0, missed: 0, upcoming: 0, active: 0 };
+      (events || []).forEach(function (ev) {
+        s.total++;
+        if (ev.status === "confirmed") s.confirmed++;
+        if (ev.status === "active") s.active++;
+        var eff = effStatus(ev);
+        if (eff === "missed") s.missed++;
+        if (eff === "floating") s.upcoming++;
+      });
+      return s;
+    }, [events]);
+
+    // First few future occurrences for the "Next up" chips.
+    const nextUp = useMemo(function () {
+      var nowMs = Date.now();
+      return (upcoming || [])
+        .filter(function (ev) {
+          var t = new Date(ev.occurrence_utc || ev.occurrence_local || 0).getTime();
+          return !isNaN(t) && t >= nowMs;
+        })
+        .sort(function (a, b) {
+          return new Date(a.occurrence_utc || a.occurrence_local || 0) - new Date(b.occurrence_utc || b.occurrence_local || 0);
+        })
+        .slice(0, 6);
+    }, [upcoming]);
+
     return h(
       "div",
       { className: "p-4 sm:p-6 space-y-4" },
-      // header
+      // month nav
       h(
         "div",
         { className: "flex items-center justify-between gap-3 flex-wrap" },
-        h(
-          "div",
-          { className: "flex items-center gap-2" },
-          h("h1", { className: "text-xl font-semibold" }, "📅 Calendar"),
-          h("span", { className: "text-sm opacity-50" }, monthLabel)
-        ),
+        h("span", { className: "text-sm font-medium opacity-70" }, monthLabel),
         h(
           "div",
           { className: "flex items-center gap-2" },
@@ -542,6 +591,49 @@
           h(Button, { variant: "ghost", size: "sm", onClick: reload, title: "Refresh" }, "⟳")
         )
       ),
+
+      // at-a-glance stat cards
+      h(
+        "div",
+        { className: "cal-statrow" },
+        h(StatCard, { label: "Events", value: stats.total }),
+        h(StatCard, { label: "Confirmed", value: stats.confirmed }),
+        h(StatCard, { label: "Missed", value: stats.missed }),
+        h(StatCard, { label: "Upcoming", value: stats.upcoming }),
+        h(StatCard, { label: "Active", value: stats.active })
+      ),
+
+      // next up chips
+      nextUp.length
+        ? h(
+            "div",
+            { className: "space-y-1" },
+            h("div", { className: "cal-section-label" }, "Next up"),
+            h(
+              "div",
+              { className: "cal-nextup" },
+              nextUp.map(function (ev, i) {
+                var glyph = statusGlyph(effStatus(ev));
+                var derived = isDerivedMiss(ev);
+                var when = fmtDateTime(ev.occurrence_local || ev.occurrence_utc, ev.tz, ev.all_day)
+                  .replace(/^\w+,?\s*/, "");
+                return h(
+                  "button",
+                  {
+                    key: ev.id + "@" + ev.occurrence_utc + i,
+                    className: "cal-nextup-chip",
+                    title: ev.title + " · " + fmtDateTime(ev.occurrence_local || ev.occurrence_utc, ev.tz, ev.all_day) + (ev.planning ? " · plan: " + ev.planning : ""),
+                    onClick: function () { setOpenId(ev.id); },
+                  },
+                  glyph ? h("span", { className: cn("cal-status-glyph", derived && "cal-status-derived") }, glyph) : null,
+                  ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null,
+                  h("span", { className: "cal-nextup-when" }, when),
+                  h("span", { className: "cal-nextup-title" }, ev.title)
+                );
+              })
+            )
+          )
+        : null,
 
       error ? h("div", { className: "text-sm text-red-600" }, "⚠ " + error) : null,
 
@@ -744,7 +836,7 @@
                   h("div", { className: "text-xs opacity-40" }, "Reports are emailed to the owner; this is a preview.")
                 ),
 
-                h("div", { className: "text-xs opacity-40 pt-2 border-t" }, "Read-only — edits are made by talking to Calypso.")
+                h("div", { className: "text-xs opacity-40 pt-2 border-t" }, "Read-only — edits are made by talking to the assistant.")
               )
             : null
         )
@@ -799,13 +891,23 @@
     }, [sorted, now]);
     const shown = filter === "all" ? sorted : sorted.filter(function (p) { return planningStatus(p, now) === filter; });
 
+    // At-a-glance stats over loaded plannings.
+    const avgCompletion = useMemo(function () {
+      var withPct = sorted.filter(function (p) {
+        var ov = p.overall || {};
+        return ov.completion_pct != null;
+      });
+      if (!withPct.length) return "—";
+      var sum = withPct.reduce(function (acc, p) { return acc + (Number((p.overall || {}).completion_pct) || 0); }, 0);
+      return Math.round(sum / withPct.length) + "%";
+    }, [sorted]);
+
     return h(
       "div",
       { className: "p-4 sm:p-6 space-y-4" },
       h(
         "div",
-        { className: "flex items-center justify-between gap-3 flex-wrap" },
-        h("h1", { className: "text-xl font-semibold" }, "🗜️ Plannings"),
+        { className: "flex items-center justify-end gap-3 flex-wrap" },
         h(Button, { variant: "ghost", size: "sm", onClick: load, title: "Refresh" }, "⟳")
       ),
 
@@ -831,8 +933,19 @@
           )
         : null,
 
+      // at-a-glance stat cards
+      !loading && sorted.length
+        ? h(
+            "div",
+            { className: "cal-statrow" },
+            h(StatCard, { label: "Plannings", value: counts.all }),
+            h(StatCard, { label: "Active", value: counts.active }),
+            h(StatCard, { label: "Avg completion", value: avgCompletion })
+          )
+        : null,
+
       !loading && !error && sorted.length === 0
-        ? h("div", { className: "text-sm opacity-60" }, "No plannings yet — ask Calypso to create one.")
+        ? h("div", { className: "text-sm opacity-60" }, "No plannings yet — ask the assistant to create one.")
         : null,
       !loading && sorted.length && shown.length === 0
         ? h("div", { className: "text-sm opacity-60" }, "No " + filter + " plannings.")
@@ -885,31 +998,62 @@
 
   // --- app wrapper (tab toggle) --------------------------------------------
 
+  function CalendarHero(props) {
+    const view = props.view;
+    const setView = props.setView;
+    const isPlan = view === "plannings";
+    return h(
+      "div",
+      { className: "cal-hero" },
+      h(
+        "div",
+        { className: "cal-hero-main" },
+        h(
+          "div",
+          { className: "cal-hero-text" },
+          h(
+            "h1",
+            { className: "cal-hero-title" },
+            isPlan ? "🗜️ Plannings" : "📅 Calendar"
+          ),
+          h(
+            "p",
+            { className: "cal-hero-sub" },
+            isPlan
+              ? "Objectives & completion for a period."
+              : "Your events, reminders, status & timers."
+          )
+        ),
+        h(
+          "div",
+          { className: "cal-tabs cal-hero-tabs" },
+          h(
+            "button",
+            {
+              className: cn("cal-tab", view === "calendar" && "cal-tab-active"),
+              onClick: function () { setView("calendar"); },
+            },
+            "📅 Calendar"
+          ),
+          h(
+            "button",
+            {
+              className: cn("cal-tab", view === "plannings" && "cal-tab-active"),
+              onClick: function () { setView("plannings"); },
+            },
+            "🗜️ Plannings"
+          )
+        )
+      )
+    );
+  }
+
   function CalendarApp() {
     const [view, setView] = useState("calendar");
     return h(
       "div",
       null,
-      h(
-        "div",
-        { className: "cal-tabs p-4 sm:p-6 pb-0" },
-        h(
-          "button",
-          {
-            className: cn("cal-tab", view === "calendar" && "cal-tab-active"),
-            onClick: function () { setView("calendar"); },
-          },
-          "📅 Calendar"
-        ),
-        h(
-          "button",
-          {
-            className: cn("cal-tab", view === "plannings" && "cal-tab-active"),
-            onClick: function () { setView("plannings"); },
-          },
-          "🗜️ Plannings"
-        )
-      ),
+      h(CalendarHero, { view: view, setView: setView }),
       view === "plannings" ? h(PlanningsView, null) : h(CalendarView, null)
     );
   }

@@ -9,7 +9,7 @@ Reuses the same config pattern as ha_notify_plugin:
 Delivery channels:
   ha_notify — push notification (title + message body)
   ha_speak  — TTS spoken on phone
-  chat      — a text from Calypso in the chat (delivered out-of-band: the
+  chat      — a chat message in the conversation (delivered out-of-band: the
               every-minute cron tick prints it to stdout, which the
               `--no-agent` cron posts into the chat; NOT sent via fire())
   email     — an emailed reminder sent via SMTP (Gmail creds in env); only
