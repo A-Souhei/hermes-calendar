@@ -234,7 +234,12 @@ def _until_local_date(until_iso: str, tz_name: Optional[str]) -> str:
     not the UTC date."""
     try:
         from zoneinfo import ZoneInfo
-        dt = datetime.fromisoformat(until_iso)
+        s = str(until_iso).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:          # date-only / no offset -> treat as UTC
+            dt = dt.replace(tzinfo=timezone.utc)
         if tz_name:
             dt = dt.astimezone(ZoneInfo(tz_name))
         return dt.strftime("%Y-%m-%d")
