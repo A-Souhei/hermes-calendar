@@ -752,11 +752,22 @@
     );
   }
 
+  // Classify a planning by its period relative to now.
+  function planningStatus(p, now) {
+    var s = p.period_start_utc ? new Date(p.period_start_utc).getTime() : null;
+    var e = p.period_end_utc ? new Date(p.period_end_utc).getTime() : null;
+    if (e != null && now >= e) return "past";
+    if (s != null && now < s) return "upcoming";
+    return "active";
+  }
+  var PLAN_FILTERS = [["all", "All"], ["active", "Active"], ["upcoming", "Upcoming"], ["past", "Past"]];
+
   function PlanningsView() {
     const [plannings, setPlannings] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [openId, setOpenId] = useState(null);
+    const [filter, setFilter] = useState("all");
 
     const load = useCallback(function () {
       setLoading(true);
@@ -774,6 +785,20 @@
 
     useEffect(load, [load]);
 
+    const now = Date.now();
+    // newest-first by period start
+    const sorted = useMemo(function () {
+      return (plannings || []).slice().sort(function (a, b) {
+        return new Date(b.period_start_utc || 0) - new Date(a.period_start_utc || 0);
+      });
+    }, [plannings]);
+    const counts = useMemo(function () {
+      var c = { all: sorted.length, active: 0, upcoming: 0, past: 0 };
+      sorted.forEach(function (p) { c[planningStatus(p, now)]++; });
+      return c;
+    }, [sorted, now]);
+    const shown = filter === "all" ? sorted : sorted.filter(function (p) { return planningStatus(p, now) === filter; });
+
     return h(
       "div",
       { className: "p-4 sm:p-6 space-y-4" },
@@ -787,16 +812,39 @@
       error ? h("div", { className: "text-sm text-red-600" }, "⚠ " + error) : null,
       loading ? h("div", { className: "text-sm opacity-60" }, "Loading…") : null,
 
-      !loading && !error && plannings.length === 0
-        ? h("div", { className: "text-sm opacity-60" }, "No plannings yet — ask Calypso to create one.")
+      // filter bar (newest-first; counts per bucket)
+      !loading && sorted.length
+        ? h(
+            "div",
+            { className: "cal-tabs" },
+            PLAN_FILTERS.map(function (f) {
+              return h(
+                "button",
+                {
+                  key: f[0],
+                  className: cn("cal-tab", filter === f[0] && "cal-tab-active"),
+                  onClick: function () { setFilter(f[0]); },
+                },
+                f[1] + " (" + (counts[f[0]] || 0) + ")"
+              );
+            })
+          )
         : null,
 
-      !loading && plannings.length
+      !loading && !error && sorted.length === 0
+        ? h("div", { className: "text-sm opacity-60" }, "No plannings yet — ask Calypso to create one.")
+        : null,
+      !loading && sorted.length && shown.length === 0
+        ? h("div", { className: "text-sm opacity-60" }, "No " + filter + " plannings.")
+        : null,
+
+      !loading && shown.length
         ? h(
             "div",
             { className: "space-y-3" },
-            plannings.map(function (p) {
+            shown.map(function (p) {
               var ov = p.overall || {};
+              var stt = planningStatus(p, now);
               return h(
                 "div",
                 {
@@ -813,7 +861,12 @@
                     h("div", { className: "font-semibold text-sm" }, p.name),
                     p.period_label ? h("div", { className: "text-xs opacity-60" }, p.period_label) : null
                   ),
-                  h(Badge, { variant: p.report_sent ? "secondary" : "outline" }, p.report_sent ? "report sent" : "pending")
+                  h(
+                    "div",
+                    { className: "flex items-center gap-1 flex-shrink-0" },
+                    h(Badge, { variant: "outline" }, stt),
+                    h(Badge, { variant: p.report_sent ? "secondary" : "outline" }, p.report_sent ? "report sent" : "pending")
+                  )
                 ),
                 h("div", { className: "mt-2" }, h(ProgressBar, { pct: ov.completion_pct })),
                 h(
