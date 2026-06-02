@@ -107,7 +107,18 @@ def _event_tz(ev: Dict[str, Any]) -> ZoneInfo:
         return ZoneInfo(recurrence.DEFAULT_TZ)
 
 
-def _human_recurrence(rec: Optional[Dict]) -> Optional[str]:
+def _until_local_date(until_iso: str, tz_name: Optional[str]) -> str:
+    """`until` (stored UTC) as a date string in the event's local tz."""
+    try:
+        dt = datetime.fromisoformat(until_iso)
+        if tz_name:
+            dt = dt.astimezone(ZoneInfo(tz_name))
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return str(until_iso)[:10]
+
+
+def _human_recurrence(rec: Optional[Dict], tz_name: Optional[str] = None) -> Optional[str]:
     """Human-readable recurrence label (kept in sync with the plugin)."""
     if not rec:
         return None
@@ -122,7 +133,7 @@ def _human_recurrence(rec: Optional[Dict]) -> Optional[str]:
     if bwd:
         label += " on " + ", ".join(day_names[d] for d in bwd if 0 <= d <= 6)
     if rec.get("until"):
-        label += f" until {rec['until'][:10]}"
+        label += f" until {_until_local_date(rec['until'], tz_name)}"
     if rec.get("count"):
         label += f" ({rec['count']} times)"
     return label
@@ -207,7 +218,7 @@ def _occurrences_in_range(start_utc: datetime, end_utc: datetime) -> List[Dict[s
                 "tz": ev.get("tz") or recurrence.DEFAULT_TZ,
                 "all_day": bool(ev.get("all_day")),
                 "recurring": ev.get("recurrence") is not None,
-                "recurrence_human": _human_recurrence(ev.get("recurrence")),
+                "recurrence_human": _human_recurrence(ev.get("recurrence"), ev.get("tz")),
                 "alert_channel": ev.get("alert_channel"),
                 "location": ev.get("location"),
                 "tags": ev.get("tags") or [],
@@ -296,7 +307,7 @@ def event_detail(event_id: str):
         "tz": ev.get("tz") or recurrence.DEFAULT_TZ,
         "all_day": bool(ev.get("all_day")),
         "recurrence": ev.get("recurrence"),
-        "recurrence_human": _human_recurrence(ev.get("recurrence")),
+        "recurrence_human": _human_recurrence(ev.get("recurrence"), ev.get("tz")),
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
         "language": ev.get("language"),
@@ -387,7 +398,7 @@ def planning_detail(planning_id: str):
                 "title": ev["title"],
                 "start_utc": ev.get("start_utc"),
                 "recurrence": ev.get("recurrence"),
-                "recurrence_human": _human_recurrence(ev.get("recurrence")),
+                "recurrence_human": _human_recurrence(ev.get("recurrence"), ev.get("tz")),
                 "all_day": bool(ev.get("all_day")),
             })
     except Exception:

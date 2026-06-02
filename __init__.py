@@ -228,7 +228,21 @@ _LANGUAGE_DESCRIPTION = (
 )
 
 
-def _human_recurrence(rec: Optional[Dict]) -> Optional[str]:
+def _until_local_date(until_iso: str, tz_name: Optional[str]) -> str:
+    """The recurrence `until` (stored UTC) as a date string in the event's
+    local timezone — so the badge shows the date the user actually meant,
+    not the UTC date."""
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(until_iso)
+        if tz_name:
+            dt = dt.astimezone(ZoneInfo(tz_name))
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return str(until_iso)[:10]
+
+
+def _human_recurrence(rec: Optional[Dict], tz_name: Optional[str] = None) -> Optional[str]:
     if not rec:
         return None
     freq = rec.get("freq", "weekly")
@@ -244,7 +258,7 @@ def _human_recurrence(rec: Optional[Dict]) -> Optional[str]:
     if bwd:
         label += " on " + ", ".join(day_names[d] for d in bwd if 0 <= d <= 6)
     if rec.get("until"):
-        label += f" until {rec['until'][:10]}"
+        label += f" until {_until_local_date(rec['until'], tz_name)}"
     if rec.get("count"):
         label += f" ({rec['count']} times)"
     return label
@@ -281,7 +295,7 @@ def _event_summary(ev: Dict) -> Dict:
         "start_utc": ev["start_utc"],
         "tz": ev.get("tz"),
         "all_day": ev.get("all_day", False),
-        "recurrence": _human_recurrence(ev.get("recurrence")),
+        "recurrence": _human_recurrence(ev.get("recurrence"), ev.get("tz")),
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
         "language": ev.get("language"),
@@ -675,7 +689,7 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
         "tz": ev.get("tz"),
         "all_day": ev.get("all_day", False),
         "recurrence": ev.get("recurrence"),
-        "recurrence_human": _human_recurrence(ev.get("recurrence")),
+        "recurrence_human": _human_recurrence(ev.get("recurrence"), ev.get("tz")),
         "alert_lead_seconds": ev.get("alert_lead_seconds"),
         "alert_channel": ev.get("alert_channel"),
         "language": ev.get("language"),
@@ -1596,7 +1610,7 @@ def _handle_calendar_get_planning(args: Dict[str, Any], **kw) -> str:
             "id": ev["id"],
             "title": ev["title"],
             "start_utc": ev.get("start_utc"),
-            "recurrence_human": _human_recurrence(ev.get("recurrence")),
+            "recurrence_human": _human_recurrence(ev.get("recurrence"), ev.get("tz")),
         })
 
     return tool_result({
