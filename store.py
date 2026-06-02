@@ -78,6 +78,20 @@ def init_db() -> None:
                 updated_utc     TEXT,
                 PRIMARY KEY (event_id, occurrence_utc)
             );
+
+            CREATE TABLE IF NOT EXISTS occurrence_status (
+                event_id         TEXT NOT NULL,
+                occurrence_utc   TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                started_utc      TEXT,
+                ended_utc        TEXT,
+                duration_seconds INTEGER,
+                note             TEXT,
+                source           TEXT,
+                created_utc      TEXT,
+                updated_utc      TEXT,
+                PRIMARY KEY (event_id, occurrence_utc)
+            );
         """)
         conn.commit()
 
@@ -176,13 +190,14 @@ def update_event(event_id: str, fields: Dict[str, Any]) -> bool:
 
 
 def remove_event(event_id: str) -> bool:
-    """Delete the event and its associated exceptions and fired alerts."""
+    """Delete the event and its associated exceptions, fired alerts, reports, and statuses."""
     with _lock:
         conn = _get_conn()
         cursor = conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
         conn.execute("DELETE FROM exceptions WHERE event_id = ?", (event_id,))
         conn.execute("DELETE FROM fired_alerts WHERE event_id = ?", (event_id,))
         conn.execute("DELETE FROM reports WHERE event_id = ?", (event_id,))
+        conn.execute("DELETE FROM occurrence_status WHERE event_id = ?", (event_id,))
         conn.commit()
     return cursor.rowcount > 0
 
@@ -292,6 +307,115 @@ def list_reports(event_id: str) -> List[Dict[str, Any]]:
             (event_id,),
         ).fetchall()
     return [_row_to_report(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Occurrence status (per-occurrence lifecycle: floating / active / confirmed / missed)
+# ---------------------------------------------------------------------------
+
+def set_status(
+    event_id: str,
+    occurrence_utc: str,
+    status: str,
+    *,
+    started_utc: Optional[str] = None,
+    ended_utc: Optional[str] = None,
+    duration_seconds: Optional[int] = None,
+    note: Optional[str] = None,
+    source: Optional[str] = None,
+) -> None:
+    """Upsert the status row for one occurrence.
+
+    Partial-update semantics: only fields whose argument is not None are
+    overwritten — existing started/ended/duration/note/source are preserved
+    when None is passed, so callers can update a single field safely.
+    created_utc is preserved on conflict; updated_utc is always bumped.
+    """
+    now = _now_iso()
+    with _lock:
+        conn = _get_conn()
+        existing = conn.execute(
+            "SELECT * FROM occurrence_status WHERE event_id = ? AND occurrence_utc = ?",
+            (event_id, occurrence_utc),
+        ).fetchone()
+        if existing:
+            created = existing["created_utc"] or now
+            merged_started = started_utc if started_utc is not None else existing["started_utc"]
+            merged_ended = ended_utc if ended_utc is not None else existing["ended_utc"]
+            merged_duration = duration_seconds if duration_seconds is not None else existing["duration_seconds"]
+            merged_note = note if note is not None else existing["note"]
+            merged_source = source if source is not None else existing["source"]
+        else:
+            created = now
+            merged_started = started_utc
+            merged_ended = ended_utc
+            merged_duration = duration_seconds
+            merged_note = note
+            merged_source = source
+        conn.execute(
+            """INSERT INTO occurrence_status
+                (event_id, occurrence_utc, status, started_utc, ended_utc,
+                 duration_seconds, note, source, created_utc, updated_utc)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(event_id, occurrence_utc) DO UPDATE SET
+                 status           = excluded.status,
+                 started_utc      = excluded.started_utc,
+                 ended_utc        = excluded.ended_utc,
+                 duration_seconds = excluded.duration_seconds,
+                 note             = excluded.note,
+                 source           = excluded.source,
+                 updated_utc      = excluded.updated_utc""",
+            (
+                event_id, occurrence_utc, status,
+                merged_started, merged_ended, merged_duration,
+                merged_note, merged_source, created, now,
+            ),
+        )
+        conn.commit()
+
+
+def get_status(event_id: str, occurrence_utc: str) -> Optional[Dict[str, Any]]:
+    """Return the status row for one occurrence, or None (meaning 'floating')."""
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT * FROM occurrence_status WHERE event_id = ? AND occurrence_utc = ?",
+            (event_id, occurrence_utc),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_statuses(event_id: str) -> List[Dict[str, Any]]:
+    """Return all status rows for an event, ordered by occurrence_utc."""
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM occurrence_status WHERE event_id = ? ORDER BY occurrence_utc",
+            (event_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_status(event_id: str, occurrence_utc: str) -> bool:
+    """Delete the status row (resets the occurrence to 'floating'). Returns True if a row was deleted."""
+    with _lock:
+        conn = _get_conn()
+        cursor = conn.execute(
+            "DELETE FROM occurrence_status WHERE event_id = ? AND occurrence_utc = ?",
+            (event_id, occurrence_utc),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def list_active() -> List[Dict[str, Any]]:
+    """Return all occurrence_status rows where status='active', across all events."""
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM occurrence_status WHERE status = 'active' ORDER BY started_utc",
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # Run on import

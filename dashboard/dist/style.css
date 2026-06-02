@@ -147,3 +147,44 @@
 }
 .cal-kv dt { color: var(--color-muted-foreground); }
 .cal-kv dd { margin: 0; }
+
+/* ---- Status badges -------------------------------------------------------- */
+
+.cal-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  line-height: 1.4;
+}
+
+.cal-status-confirmed {
+  background: color-mix(in srgb, var(--color-success, var(--color-primary)) 18%, transparent);
+  color: var(--color-success, var(--color-primary));
+  border: 1px solid color-mix(in srgb, var(--color-success, var(--color-primary)) 35%, transparent);
+}
+
+.cal-status-active {
+  background: color-mix(in srgb, var(--color-primary) 15%, transparent);
+  color: var(--color-primary);
+  border: 1px solid color-mix(in srgb, var(--color-primary) 30%, transparent);
+}
+
+.cal-status-missed {
+  background: color-mix(in srgb, var(--color-destructive) 15%, transparent);
+  color: var(--color-destructive);
+  border: 1px solid color-mix(in srgb, var(--color-destructive) 30%, transparent);
+}
+
+/* Small glyph prefix on grid chips */
+.cal-status-glyph {
+  font-size: 0.65rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+/* Derived "missed" (past + still floating) — muted so it reads as
+   unconfirmed rather than an explicit miss. */
+.cal-status-derived { opacity: 0.45; }
