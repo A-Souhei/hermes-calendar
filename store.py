@@ -253,10 +253,16 @@ def remove_event(event_id: str) -> bool:
     return cursor.rowcount > 0
 
 
-def list_events() -> List[Dict[str, Any]]:
+def list_events(owner: Optional[str] = None) -> List[Dict[str, Any]]:
     with _lock:
         conn = _get_conn()
-        rows = conn.execute("SELECT * FROM events ORDER BY start_utc").fetchall()
+        if owner is not None:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE owner = ? ORDER BY start_utc",
+                (owner,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM events ORDER BY start_utc").fetchall()
     return [_row_to_event(r) for r in rows]
 
 
@@ -318,11 +324,25 @@ def get_planning(planning_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def get_planning_by_name(name: str) -> Optional[Dict[str, Any]]:
-    """Case-insensitive lookup by name; returns the most recent if duplicates."""
+def get_planning_by_name(name: str, owner: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Case-insensitive lookup by name.
+
+    When owner is given, returns that owner's matching planning first (most
+    recent). Falls back to any matching planning if the owner has none by that
+    name, so cross-user lookups by exact id still work. Returns None if no
+    match at all.
+    """
     key = str(name).strip().lower()
     with _lock:
         conn = _get_conn()
+        if owner is not None:
+            row = conn.execute(
+                "SELECT * FROM plannings WHERE LOWER(name) = ? AND owner = ? "
+                "ORDER BY created_utc DESC LIMIT 1",
+                (key, owner),
+            ).fetchone()
+            if row is not None:
+                return dict(row)
         row = conn.execute(
             "SELECT * FROM plannings WHERE LOWER(name) = ? "
             "ORDER BY created_utc DESC LIMIT 1",
@@ -331,12 +351,18 @@ def get_planning_by_name(name: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def list_plannings() -> List[Dict[str, Any]]:
+def list_plannings(owner: Optional[str] = None) -> List[Dict[str, Any]]:
     with _lock:
         conn = _get_conn()
-        rows = conn.execute(
-            "SELECT * FROM plannings ORDER BY period_start_utc"
-        ).fetchall()
+        if owner is not None:
+            rows = conn.execute(
+                "SELECT * FROM plannings WHERE owner = ? ORDER BY period_start_utc",
+                (owner,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM plannings ORDER BY period_start_utc"
+            ).fetchall()
     return [dict(r) for r in rows]
 
 

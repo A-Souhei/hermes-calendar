@@ -185,10 +185,14 @@ def _effective_status(stored: str, occ: datetime, now: datetime) -> str:
     return "missed" if occ < now else "floating"
 
 
-def _occurrences_in_range(start_utc: datetime, end_utc: datetime) -> List[Dict[str, Any]]:
+def _occurrences_in_range(
+    start_utc: datetime,
+    end_utc: datetime,
+    owner: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     now = datetime.now(timezone.utc)
-    for ev in store.list_events():
+    for ev in store.list_events(owner=owner):
         ev_local = dict(ev)
         try:
             ev_local["_exceptions"] = store.get_exceptions(ev["id"])
@@ -241,21 +245,42 @@ def _occurrences_in_range(start_utc: datetime, end_utc: datetime) -> List[Dict[s
 
 # --- routes (all GET, read-only) --------------------------------------------
 
+@router.get("/users")
+def list_users():
+    """Distinct owner values across events and plannings (for the user-filter UI)."""
+    try:
+        conn = store._get_conn()
+        with store._lock:
+            rows = conn.execute(
+                "SELECT DISTINCT owner FROM events WHERE owner IS NOT NULL AND owner != '' "
+                "UNION "
+                "SELECT DISTINCT owner FROM plannings WHERE owner IS NOT NULL AND owner != '' "
+                "ORDER BY owner"
+            ).fetchall()
+        return {"users": [r[0] for r in rows]}
+    except Exception:
+        return {"users": []}
+
+
 @router.get("/events")
 def list_events(
     frm: Optional[str] = Query(None, alias="from"),
     to: Optional[str] = Query(None),
+    owner: Optional[str] = Query(None),
 ):
     """Expanded occurrences in [from, to) (default: current month)."""
     start, end = _parse_range(frm, to)
-    return {"events": _occurrences_in_range(start, end)}
+    return {"events": _occurrences_in_range(start, end, owner=owner or None)}
 
 
 @router.get("/upcoming")
-def upcoming(days: int = Query(14, ge=1, le=366)):
+def upcoming(
+    days: int = Query(14, ge=1, le=366),
+    owner: Optional[str] = Query(None),
+):
     """Expanded occurrences from now through the next ``days`` days."""
     now = datetime.now(timezone.utc)
-    return {"events": _occurrences_in_range(now, now + timedelta(days=days))}
+    return {"events": _occurrences_in_range(now, now + timedelta(days=days), owner=owner or None)}
 
 
 @router.get("/event/{event_id}")
@@ -365,11 +390,11 @@ def list_timers():
 
 
 @router.get("/plannings")
-def list_plannings():
+def list_plannings(owner: Optional[str] = Query(None)):
     """All plannings, each with overall completion stats."""
     out = []
     try:
-        plannings = store.list_plannings()
+        plannings = store.list_plannings(owner=owner or None)
     except Exception:
         plannings = []
     for p in plannings:

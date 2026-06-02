@@ -269,14 +269,18 @@ def _human_recurrence(rec: Optional[Dict], tz_name: Optional[str] = None) -> Opt
     return label
 
 
-def _resolve_planning(id_or_name: Any) -> Optional[Dict[str, Any]]:
-    """Resolve a planning by id first, then case-insensitive name. None if not found."""
+def _resolve_planning(id_or_name: Any, owner: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Resolve a planning by id first, then case-insensitive name.
+
+    When owner is provided the name lookup prefers that owner's planning so
+    two users can have plannings with the same name without colliding.
+    """
     key = str(id_or_name or "").strip()
     if not key:
         return None
     p = store.get_planning(key)
     if p is None:
-        p = store.get_planning_by_name(key)
+        p = store.get_planning_by_name(key, owner=owner)
     return p
 
 
@@ -376,7 +380,7 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
     planning_id: Optional[str] = None
     planning_raw = args.get("planning")
     if planning_raw is not None and str(planning_raw).strip():
-        planning = _resolve_planning(planning_raw)
+        planning = _resolve_planning(planning_raw, owner=owner)
         if planning is None:
             return tool_error(f"Planning not found: {planning_raw!r}")
         planning_id = planning["id"]
@@ -594,9 +598,10 @@ def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
         return tool_error("'from' must be before 'to'")
 
     query = str(args.get("query") or "").strip().lower()
+    owner_filter = (str(args["owner"]).strip() or None) if args.get("owner") else None
 
     try:
-        events = store.list_events()
+        events = store.list_events(owner=owner_filter)
     except Exception as e:
         return tool_error(f"Failed to list events: {e}")
 
@@ -928,7 +933,9 @@ CALENDAR_LIST_EVENTS_SCHEMA = {
     "description": (
         "List calendar events expanded into individual occurrences within a date range. "
         "Recurring events appear once per occurrence in the range. "
-        "Defaults to now … now+30 days."
+        "Defaults to now … now+30 days. "
+        "ALWAYS pass 'owner' to scope results to the person asking — omit only when "
+        "an admin explicitly wants to see every user's events at once."
     ),
     "parameters": {
         "type": "object",
@@ -944,6 +951,14 @@ CALENDAR_LIST_EVENTS_SCHEMA = {
             "query": {
                 "type": "string",
                 "description": "Substring filter applied to title, description, and tags.",
+            },
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Filter events by owner. Pass the identifier of the person asking "
+                    "(same value used as 'owner' when events were created) to show only "
+                    "their calendar. Omit to return all users' events."
+                ),
             },
         },
     },
@@ -1581,8 +1596,9 @@ def _handle_calendar_create_planning(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_list_plannings(args: Dict[str, Any], **kw) -> str:
+    owner_filter = (str(args["owner"]).strip() or None) if args.get("owner") else None
     try:
-        plannings = store.list_plannings()
+        plannings = store.list_plannings(owner=owner_filter)
     except Exception as e:
         return tool_error(f"Failed to list plannings: {e}")
     out = []
@@ -1600,7 +1616,8 @@ def _handle_calendar_list_plannings(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_get_planning(args: Dict[str, Any], **kw) -> str:
-    p = _resolve_planning(args.get("id_or_name"))
+    owner_ctx = (str(args["owner"]).strip() or None) if args.get("owner") else None
+    p = _resolve_planning(args.get("id_or_name"), owner=owner_ctx)
     if p is None:
         return tool_error(f"Planning not found: {args.get('id_or_name')!r}")
     try:
@@ -1636,7 +1653,8 @@ def _planning_report_filename(planning: Dict[str, Any]) -> str:
 
 
 def _handle_calendar_planning_report(args: Dict[str, Any], **kw) -> str:
-    p = _resolve_planning(args.get("id_or_name"))
+    owner_ctx = (str(args["owner"]).strip() or None) if args.get("owner") else None
+    p = _resolve_planning(args.get("id_or_name"), owner=owner_ctx)
     if p is None:
         return tool_error(f"Planning not found: {args.get('id_or_name')!r}")
 
@@ -1690,7 +1708,8 @@ def _handle_calendar_planning_report(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_remove_planning(args: Dict[str, Any], **kw) -> str:
-    p = _resolve_planning(args.get("id_or_name"))
+    owner_ctx = (str(args["owner"]).strip() or None) if args.get("owner") else None
+    p = _resolve_planning(args.get("id_or_name"), owner=owner_ctx)
     if p is None:
         return tool_error(f"Planning not found: {args.get('id_or_name')!r}")
     remove_events = bool(args.get("remove_events", False))
@@ -1776,10 +1795,23 @@ CALENDAR_CREATE_PLANNING_SCHEMA = {
 CALENDAR_LIST_PLANNINGS_SCHEMA = {
     "name": "calendar_list_plannings",
     "description": (
-        "List all plannings with a quick completion snapshot for each "
-        "(confirmed/total occurrences and completion percentage). Takes no arguments."
+        "List plannings with a quick completion snapshot for each "
+        "(confirmed/total occurrences and completion percentage). "
+        "ALWAYS pass 'owner' to scope results to the person asking — omit only when "
+        "an admin explicitly wants to see all users' plannings at once."
     ),
-    "parameters": {"type": "object", "properties": {}},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Filter plannings by owner. Pass the identifier of the person asking "
+                    "to show only their plannings. Omit to return all users' plannings."
+                ),
+            },
+        },
+    },
 }
 
 CALENDAR_GET_PLANNING_SCHEMA = {
@@ -1793,6 +1825,7 @@ CALENDAR_GET_PLANNING_SCHEMA = {
         "type": "object",
         "properties": {
             "id_or_name": {"type": "string", "description": "Planning id or name (case-insensitive)."},
+            "owner": {"type": "string", "description": "Owner identifier — used to disambiguate when two users have a planning with the same name."},
         },
         "required": ["id_or_name"],
     },
@@ -1815,6 +1848,7 @@ CALENDAR_PLANNING_REPORT_SCHEMA = {
                 "type": "boolean",
                 "description": "If true, email the report to the planning owner. Default false.",
             },
+            "owner": {"type": "string", "description": "Owner identifier — used to disambiguate when two users have a planning with the same name."},
         },
         "required": ["id_or_name"],
     },
@@ -1836,6 +1870,7 @@ CALENDAR_REMOVE_PLANNING_SCHEMA = {
                 "type": "boolean",
                 "description": "If true, also delete the planning's events. Default false (detach only).",
             },
+            "owner": {"type": "string", "description": "Owner identifier — used to disambiguate when two users have a planning with the same name."},
         },
         "required": ["id_or_name"],
     },
