@@ -71,14 +71,26 @@ _FR_MONTHS = [
 ]
 
 
+def _resolve_lang(event: dict) -> str:
+    """Effective reminder language: event-level → config default → 'en'."""
+    lang = (event.get("language") or _load_config().get("default_language") or "en")
+    return lang if lang in _VALID_LANGUAGES else "en"
+
+
+def _chat_footer(lang: str) -> str:
+    """Localized management hint appended to the CHAT (Telegram) reminder only —
+    never to the phone push / TTS (so the voice doesn't read it)."""
+    if lang == "fr":
+        return "— Pour modifier ou annuler cet événement, écris-moi (ex. « annule cet événement »)."
+    return "— To change or cancel this event, just message me (e.g. \"cancel this event\")."
+
+
 def _build_message(event: dict, occ_utc: datetime) -> str:
     """Compose the reminder notification body, localized to the event's language."""
     from zoneinfo import ZoneInfo
 
     # Resolve effective language: event-level → config default → 'en'
-    lang = (event.get("language") or _load_config().get("default_language") or "en")
-    if lang not in _VALID_LANGUAGES:
-        lang = "en"
+    lang = _resolve_lang(event)
 
     tz_name = event.get("tz") or recurrence.DEFAULT_TZ
     try:
@@ -164,7 +176,7 @@ def _process_due(since_utc, now_utc, default_lead, daily_hour):
                     msg = _build_message(ev, occ_utc)
                     for channel in notify.resolve_channels(ev.get("alert_channel")):
                         if channel == "chat":
-                            chat_msgs.append(msg)
+                            chat_msgs.append(msg + "\n\n" + _chat_footer(_resolve_lang(ev)))
                             fired += 1
                             logger.info("calendar: queued chat reminder event=%s occ=%s",
                                         ev["id"], occ_iso)
