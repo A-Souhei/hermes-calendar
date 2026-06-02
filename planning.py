@@ -65,14 +65,16 @@ def planning_stats(planning: Dict[str, Any]) -> Dict[str, Any]:
             occs = recurrence.occurrences(ev_local, period_start, period_end)
         except Exception:
             occs = []
+        # Batch statuses once per event (avoid an N+1 get_status per occurrence).
+        try:
+            status_map = {s["occurrence_utc"]: s["status"] for s in store.list_statuses(ev["id"])}
+        except Exception:
+            status_map = {}
         total = 0
         confirmed = 0
         for occ in occs:
-            occ_iso = occ.isoformat()
             total += 1
-            status_row = store.get_status(ev["id"], occ_iso)
-            status = status_row["status"] if status_row else "floating"
-            if status == "confirmed":
+            if status_map.get(occ.isoformat()) == "confirmed":
                 confirmed += 1
         failed = total - confirmed
         objectives.append({
@@ -299,15 +301,16 @@ def report_subject(planning: Dict[str, Any]) -> str:
 
 
 def report_due_utc(planning: Dict[str, Any]) -> datetime:
-    """09:00 (in DEFAULT_TZ) on the calendar date of period_end_utc.
+    """09:00 (in the planning's tz) on the calendar date of period_end_utc.
 
     period_end is EXCLUSIVE (00:00 of the day after the last day), so its
     calendar date IS the morning after the period — exactly when the report is
     due. Returned as a tz-aware UTC datetime."""
     from zoneinfo import ZoneInfo
 
+    tz_name = planning.get("tz") or recurrence.DEFAULT_TZ
     try:
-        tz = ZoneInfo(recurrence.DEFAULT_TZ)
+        tz = ZoneInfo(tz_name)
     except Exception:
         tz = timezone.utc
     period_end = recurrence._parse_utc(planning["period_end_utc"])

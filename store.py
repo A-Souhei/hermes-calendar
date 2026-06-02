@@ -70,6 +70,7 @@ def init_db() -> None:
                 period_end_utc  TEXT NOT NULL,
                 owner           TEXT,
                 language        TEXT,
+                tz              TEXT,
                 description     TEXT,
                 report_sent     INTEGER DEFAULT 0,
                 report_sent_utc TEXT,
@@ -134,6 +135,10 @@ def init_db() -> None:
             conn.commit()
         if "planning_id" not in cols:
             conn.execute("ALTER TABLE events ADD COLUMN planning_id TEXT")
+            conn.commit()
+        pcols = {row[1] for row in conn.execute("PRAGMA table_info(plannings)").fetchall()}
+        if pcols and "tz" not in pcols:
+            conn.execute("ALTER TABLE plannings ADD COLUMN tz TEXT")
             conn.commit()
 
 
@@ -280,9 +285,9 @@ def add_planning(d: Dict[str, Any]) -> str:
             """
             INSERT INTO plannings
                 (id, name, period_label, period_start_utc, period_end_utc,
-                 owner, language, description, report_sent, report_sent_utc,
+                 owner, language, tz, description, report_sent, report_sent_utc,
                  created_utc, updated_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 planning_id,
@@ -292,6 +297,7 @@ def add_planning(d: Dict[str, Any]) -> str:
                 d["period_end_utc"],
                 d.get("owner"),
                 d.get("language"),
+                d.get("tz"),
                 d.get("description"),
                 int(bool(d.get("report_sent", 0))),
                 d.get("report_sent_utc"),

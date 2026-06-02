@@ -90,6 +90,7 @@ def _planning_summary(p: Dict[str, Any]) -> Dict[str, Any]:
         "period_end_utc": p.get("period_end_utc"),
         "owner": p.get("owner"),
         "language": p.get("language"),
+        "tz": p.get("tz"),
         "description": p.get("description"),
         "report_sent": bool(p.get("report_sent")),
         "report_sent_utc": p.get("report_sent_utc"),

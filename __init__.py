@@ -28,9 +28,6 @@ from . import scheduler
 from . import store
 from tools.registry import tool_error, tool_result
 
-# Glyph used by the dashboard (later stage) to mark planning-tagged events.
-PLANNING_GLYPH = "📋"
-
 logger = logging.getLogger(__name__)
 
 
@@ -1551,6 +1548,7 @@ def _handle_calendar_create_planning(args: Dict[str, Any], **kw) -> str:
         "period_end_utc": end_utc,
         "owner": owner,
         "language": language,
+        "tz": tz_name,
         "description": args.get("description"),
     }
     try:
