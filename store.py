@@ -822,60 +822,46 @@ def list_jobs(
     owner: str,
     start_iso: Optional[str] = None,
     end_iso: Optional[str] = None,
+    category: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Distinct jobs for an owner with aggregated stats, sorted by last_active_utc desc.
 
     Considers confirmed timer rows with a non-empty job. Optionally bounded to
     [start_iso, end_iso) when both bounds are given (same lexicographic
-    comparison as summarize_jobs — values are all UTC+00:00).
+    comparison as summarize_jobs — values are all UTC+00:00), and optionally
+    filtered to a single category (case-insensitive).
 
     Each entry: {job, category, count, total_seconds, last_active_utc}.
     """
+    # Optional bounds/category are applied via `? IS NULL OR ...` so a single
+    # query covers every combination (same pattern as summarize_jobs).
     use_window = (start_iso is not None and end_iso is not None)
+    win_lo = start_iso if use_window else None
+    win_hi = end_iso if use_window else None
     with _lock:
         conn = _get_conn()
-        if use_window:
-            rows = conn.execute(
-                """
-                SELECT
-                    e.job        AS job,
-                    e.category   AS category,
-                    COUNT(*)     AS count,
-                    SUM(os.duration_seconds)      AS total_seconds,
-                    MAX(COALESCE(os.started_utc, os.occurrence_utc)) AS last_active_utc
-                FROM occurrence_status os
-                JOIN events e ON e.id = os.event_id
-                WHERE os.status = 'confirmed'
-                  AND os.duration_seconds IS NOT NULL
-                  AND e.job IS NOT NULL AND e.job != ''
-                  AND e.owner COLLATE NOCASE = ?
-                  AND COALESCE(os.started_utc, os.occurrence_utc) >= ?
-                  AND COALESCE(os.started_utc, os.occurrence_utc) <  ?
-                GROUP BY e.job, e.category
-                ORDER BY last_active_utc DESC
-                """,
-                (owner, start_iso, end_iso),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT
-                    e.job        AS job,
-                    e.category   AS category,
-                    COUNT(*)     AS count,
-                    SUM(os.duration_seconds)      AS total_seconds,
-                    MAX(COALESCE(os.started_utc, os.occurrence_utc)) AS last_active_utc
-                FROM occurrence_status os
-                JOIN events e ON e.id = os.event_id
-                WHERE os.status = 'confirmed'
-                  AND os.duration_seconds IS NOT NULL
-                  AND e.job IS NOT NULL AND e.job != ''
-                  AND e.owner COLLATE NOCASE = ?
-                GROUP BY e.job, e.category
-                ORDER BY last_active_utc DESC
-                """,
-                (owner,),
-            ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT
+                e.job        AS job,
+                e.category   AS category,
+                COUNT(*)     AS count,
+                SUM(os.duration_seconds)      AS total_seconds,
+                MAX(COALESCE(os.started_utc, os.occurrence_utc)) AS last_active_utc
+            FROM occurrence_status os
+            JOIN events e ON e.id = os.event_id
+            WHERE os.status = 'confirmed'
+              AND os.duration_seconds IS NOT NULL
+              AND e.job IS NOT NULL AND e.job != ''
+              AND e.owner COLLATE NOCASE = ?
+              AND (? IS NULL OR COALESCE(os.started_utc, os.occurrence_utc) >= ?)
+              AND (? IS NULL OR COALESCE(os.started_utc, os.occurrence_utc) <  ?)
+              AND (? IS NULL OR e.category COLLATE NOCASE = ?)
+            GROUP BY e.job, e.category
+            ORDER BY last_active_utc DESC
+            """,
+            (owner, win_lo, win_lo, win_hi, win_hi, category, category),
+        ).fetchall()
     return [
         {
             "job": r["job"],

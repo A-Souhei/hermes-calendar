@@ -870,7 +870,7 @@ CALENDAR_ADD_EVENT_SCHEMA = {
             "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
             "planning": {"type": ["string", "null"], "description": _PLANNING_PARAM_DESCRIPTION},
             "category": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": (
                     "Optional free-text category to group this event for reports, "
                     "e.g. 'work', 'personal', 'client-acme'."
@@ -932,10 +932,10 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
             "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
             "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
             "category": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": (
-                    "Optional free-text category to group this event for reports, "
-                    "e.g. 'work', 'personal', 'client-acme'."
+                    "Free-text category to group this event for reports, "
+                    "e.g. 'work', 'personal', 'client-acme'. Pass null to clear it."
                 ),
             },
         },
@@ -2212,8 +2212,11 @@ def _handle_calendar_list_jobs(args: Dict[str, Any], **kw) -> str:
         start_iso = from_dt.astimezone(timezone.utc).isoformat()
         end_iso = to_dt.astimezone(timezone.utc).isoformat()
 
+    category_raw = args.get("category")
+    category = (str(category_raw).strip() or None) if category_raw is not None else None
+
     try:
-        jobs = store.list_jobs(owner, start_iso=start_iso, end_iso=end_iso)
+        jobs = store.list_jobs(owner, start_iso=start_iso, end_iso=end_iso, category=category)
     except Exception as e:
         logger.exception("calendar_list_jobs store error")
         return tool_error(f"Failed to list jobs: {e}")
