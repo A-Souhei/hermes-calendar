@@ -279,12 +279,15 @@ def list_users():
         registered = users.list_user_names()
     except Exception:
         registered = []
-    # Case-insensitive union, keeping one representative casing, sorted.
+    # Case-insensitive union, keeping one representative casing, sorted. Store
+    # the STRIPPED name (not the raw value) so a registry entry with stray
+    # leading/trailing whitespace round-trips cleanly as an `owner` filter value.
     seen: Dict[str, str] = {}
     for n in list(registered) + list(owners):
-        key = (n or "").strip().lower()
+        name = (n or "").strip()
+        key = name.lower()
         if key and key not in seen:
-            seen[key] = n
+            seen[key] = name
     return {"users": sorted(seen.values(), key=lambda s: s.lower())}
 
 
