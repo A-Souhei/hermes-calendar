@@ -1009,7 +1009,7 @@ CALENDAR_LIST_EVENTS_SCHEMA = {
     "description": (
         "List calendar events expanded into individual occurrences within a date range. "
         "Recurring events appear once per occurrence in the range. "
-        "Defaults to now … now+30 days. "
+        "Defaults to the start of today … now+30 days (so events earlier today are included). "
         "ALWAYS pass 'owner' to scope results to the person asking — omit only when "
         "an admin explicitly wants to see every user's events at once."
     ),
@@ -1018,7 +1018,7 @@ CALENDAR_LIST_EVENTS_SCHEMA = {
         "properties": {
             "from": {
                 "type": "string",
-                "description": "Range start (ISO datetime, default: now).",
+                "description": "Range start (ISO datetime, default: the start of today in the local timezone).",
             },
             "to": {
                 "type": "string",
