@@ -45,6 +45,7 @@ _registry_data = {
         {"name": "u_cat",     "email": "cat@example.com",     "language": "en"},
         {"name": "u_reg",     "email": "reg@example.com",     "language": "en"},
         {"name": "u_plan",    "email": "plan@example.com",    "language": "en"},
+        {"name": "u_noemail"},  # registered but no email (for the planning gate test)
     ]
 }
 with open(_registry_path, "w", encoding="utf-8") as _f:
@@ -219,6 +220,27 @@ def test_registry_blocks_unknown_owner():
         "start": "2026-06-10T14:00:00+03:00",
     }))
     assert r_ok["ok"], f"Expected success for registered owner, got: {r_ok}"
+
+
+def test_create_planning_registry_gate():
+    """calendar_create_planning refuses unregistered owners; a registered owner
+    with no email is rejected with the email-specific message (not the registry
+    one); a registered owner with an email succeeds."""
+    base = {"name": "Q3 objectives", "period_start": "2026-07-01", "period_end": "2026-10-01"}
+
+    # unregistered -> registry refusal
+    r_bad = json.loads(cal._handle_calendar_create_planning({**base, "owner": "ghost_user_xyz"}))
+    assert not r_bad["ok"] and "calendar-users.json" in r_bad["error"]
+
+    # registered but no email -> email-specific rejection, NOT the registry message
+    r_noemail = json.loads(cal._handle_calendar_create_planning({**base, "owner": "u_noemail"}))
+    assert not r_noemail["ok"]
+    assert "email" in r_noemail["error"].lower()
+    assert "calendar-users.json" not in r_noemail["error"]
+
+    # registered with an email (via the registry fallback) -> succeeds
+    r_ok = json.loads(cal._handle_calendar_create_planning({**base, "owner": "u_plan"}))
+    assert r_ok["ok"], f"Expected success, got: {r_ok}"
 
 
 def test_get_user_email_registry_fallback():

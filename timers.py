@@ -51,7 +51,10 @@ def stop_active_row(row: Dict[str, Any], note: Optional[str] = None) -> Dict[str
     measured: Optional[int] = None
     if started_iso:
         try:
-            started_dt = datetime.fromisoformat(started_iso)
+            # Normalize a trailing 'Z' — datetime.fromisoformat() rejects it on
+            # older Pythons, which would silently drop the duration measurement.
+            iso = started_iso[:-1] + "+00:00" if started_iso.endswith("Z") else started_iso
+            started_dt = datetime.fromisoformat(iso)
             if started_dt.tzinfo is None:
                 started_dt = started_dt.replace(tzinfo=timezone.utc)
             measured = max(0, round((now - started_dt).total_seconds()))

@@ -14,12 +14,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Cache: (path, mtime) -> list[dict]
+# Cache: (path, mtime) -> list[dict]. Guarded by _cache_lock because the host
+# is multi-threaded (concurrent tool calls / FastAPI requests) — unsynchronized
+# reads/writes (and the stale-key purge) could otherwise raise
+# "dictionary changed size during iteration" or return inconsistent results.
 _cache: Dict[tuple, List[Dict]] = {}
+_cache_lock = threading.Lock()
 
 _VALID_LANGUAGES = ("en", "fr")
 
@@ -61,8 +66,9 @@ def load_users() -> List[Dict]:
         return []
 
     cache_key = (path, mtime)
-    if cache_key in _cache:
-        return _cache[cache_key]
+    with _cache_lock:
+        if cache_key in _cache:
+            return _cache[cache_key]
 
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -100,12 +106,14 @@ def load_users() -> List[Dict]:
             result.append({"name": name, "email": email, "language": language})
         # else: skip unrecognized entry shapes
 
-    # Purge any stale cache entries for this path to avoid unbounded growth.
-    stale = [k for k in _cache if k[0] == path and k != cache_key]
-    for k in stale:
-        del _cache[k]
-
-    _cache[cache_key] = result
+    # Purge any stale cache entries for this path (older mtimes) to avoid
+    # unbounded growth, then write back — all under the lock so a concurrent
+    # reader/writer can't observe a half-mutated dict or change its size mid-iteration.
+    with _cache_lock:
+        stale = [k for k in _cache if k[0] == path and k != cache_key]
+        for k in stale:
+            del _cache[k]
+        _cache[cache_key] = result
     return result
 
 

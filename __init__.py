@@ -1719,8 +1719,8 @@ def _handle_calendar_create_planning(args: Dict[str, Any], **kw) -> str:
     owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
     if not owner:
         return tool_error(
-            "Planning needs an email for the owner. Associate one first with "
-            "calendar_set_user_email (reports are emailed)."
+            "owner is required — every planning must belong to a user (set 'owner' "
+            "to the asker, typically)."
         )
     if not users_mod.is_registered(owner):
         return tool_error(_unregistered_owner_error(owner))
