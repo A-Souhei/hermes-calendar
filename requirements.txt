@@ -1,0 +1,17 @@
+# Runtime dependencies for the hermes-calendar plugin.
+#
+# The Hermes host venv already provides python-dateutil (and FastAPI/Pydantic for
+# the dashboard), so this file is mainly for standalone installs, CI, and to make
+# the hard requirement explicit — `__init__.py` imports dateutil at module load,
+# so the plugin will not import without it.
+
+python-dateutil>=2.8        # required: human/ISO datetime parsing (events, list ranges)
+
+# Optional — PDF attachments for planning / job-summary email reports. Pulls in
+# system libraries (cairo/pango); the plugin degrades to text-only when absent,
+# so it is left commented. Install explicitly if you want PDFs:
+#   pip install "weasyprint>=60"
+# weasyprint>=60
+
+# Provided by the Hermes dashboard host (do NOT pin here) — listed for reference:
+#   fastapi, pydantic   (dashboard/plugin_api.py; it also stubs FastAPI if absent)
