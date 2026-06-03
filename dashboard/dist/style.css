@@ -82,13 +82,17 @@
 .cal-chip-recurring { border-left: 3px solid var(--color-primary); }
 .cal-chip-once { border-left: 3px solid var(--color-success, var(--color-primary)); }
 
-/* Job / time-tracking events stand out with a blue accent + blue title text,
-   so logged work reads distinctly from calendar appointments. Placed after the
+/* Regular (non-job) calendar appointments read in green; the left accent still
+   distinguishes recurring vs one-time. Job events override this to blue below
+   (`.cal-chip-job .cal-chip-title` is more specific, so it wins regardless of
+   source order). */
+.cal-chip-title { overflow: hidden; text-overflow: ellipsis; color: #16a34a; }
+
+/* Job / time-tracking events stand out with a blue accent + bold blue title,
+   so logged work reads distinctly from the green appointments. Placed after the
    recurring/once rules so its left-accent wins for a job event. */
 .cal-chip-job { border-left: 3px solid #3b82f6; }
 .cal-chip-job .cal-chip-title { color: #3b82f6; font-weight: 600; }
-
-.cal-chip-title { overflow: hidden; text-overflow: ellipsis; }
 
 .cal-more {
   font-size: 0.68rem;

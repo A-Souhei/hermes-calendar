@@ -120,9 +120,10 @@ silently creating a near-duplicate.
 
 ### Dashboard
 
-Job/timer events render with a **blue accent and blue title** in the read-only
-Calendar tab, distinguishing logged work from regular appointments. The event's
-`job` and `category` appear in the chip tooltip.
+Job/timer events render with a **blue accent and bold blue title** in the
+read-only Calendar tab, while regular appointments read in **green** —
+distinguishing logged work from calendar events at a glance. The event's `job`
+and `category` appear in the chip tooltip.
 
 ## Storage
 
