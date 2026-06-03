@@ -299,6 +299,42 @@
   flex-shrink: 0;
 }
 
+/* ---- User filter select -------------------------------------------------- */
+
+.cal-user-select {
+  appearance: none;
+  background-color: var(--color-card);
+  color: var(--color-card-foreground);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 0.82rem;
+  padding: 4px 28px 4px 10px;
+  height: 32px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  transition: border-color 0.15s;
+}
+
+.cal-user-select:hover {
+  border-color: var(--color-primary);
+}
+
+.cal-user-select:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-primary) 20%, transparent);
+}
+
+/* Native dropdown options: force readable popover colors. Browsers render the
+   open option list with their own defaults and ignore the select's color,
+   which left the option text an unreadable (yellowish) tone on a white list. */
+.cal-user-select option {
+  background-color: var(--color-popover);
+  color: var(--color-popover-foreground);
+}
+
 /* ---- Section micro-labels ------------------------------------------------ */
 
 .cal-section-label {

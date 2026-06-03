@@ -253,10 +253,16 @@ def remove_event(event_id: str) -> bool:
     return cursor.rowcount > 0
 
 
-def list_events() -> List[Dict[str, Any]]:
+def list_events(owner: Optional[str] = None) -> List[Dict[str, Any]]:
     with _lock:
         conn = _get_conn()
-        rows = conn.execute("SELECT * FROM events ORDER BY start_utc").fetchall()
+        if owner is not None:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE owner = ? ORDER BY start_utc",
+                (owner,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM events ORDER BY start_utc").fetchall()
     return [_row_to_event(r) for r in rows]
 
 
@@ -318,26 +324,63 @@ def get_planning(planning_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def get_planning_by_name(name: str) -> Optional[Dict[str, Any]]:
-    """Case-insensitive lookup by name; returns the most recent if duplicates."""
+def get_planning_by_name(name: str, owner: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Case-insensitive lookup by name.
+
+    When owner is given, the match is STRICTLY scoped to that owner — no
+    cross-owner fallback — so one user can never resolve another user's
+    planning by name (which would let report/remove act on the wrong one).
+    Cross-user lookups by exact id are handled separately by the id lookup that
+    callers try first. Returns the most recent match, or None.
+    """
     key = str(name).strip().lower()
     with _lock:
         conn = _get_conn()
-        row = conn.execute(
-            "SELECT * FROM plannings WHERE LOWER(name) = ? "
-            "ORDER BY created_utc DESC LIMIT 1",
-            (key,),
-        ).fetchone()
+        if owner is not None:
+            row = conn.execute(
+                "SELECT * FROM plannings WHERE LOWER(name) = ? AND owner = ? "
+                "ORDER BY created_utc DESC LIMIT 1",
+                (key, owner),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM plannings WHERE LOWER(name) = ? "
+                "ORDER BY created_utc DESC LIMIT 1",
+                (key,),
+            ).fetchone()
     return dict(row) if row else None
 
 
-def list_plannings() -> List[Dict[str, Any]]:
+def list_plannings(owner: Optional[str] = None) -> List[Dict[str, Any]]:
+    with _lock:
+        conn = _get_conn()
+        if owner is not None:
+            rows = conn.execute(
+                "SELECT * FROM plannings WHERE owner = ? ORDER BY period_start_utc",
+                (owner,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM plannings ORDER BY period_start_utc"
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_owners() -> List[str]:
+    """Distinct, non-empty owners across events and plannings, sorted.
+
+    Public helper for callers (e.g. the dashboard user-filter) that need the
+    set of users without reaching into this module's connection/lock internals.
+    """
     with _lock:
         conn = _get_conn()
         rows = conn.execute(
-            "SELECT * FROM plannings ORDER BY period_start_utc"
+            "SELECT DISTINCT owner FROM events WHERE owner IS NOT NULL AND owner != '' "
+            "UNION "
+            "SELECT DISTINCT owner FROM plannings WHERE owner IS NOT NULL AND owner != '' "
+            "ORDER BY owner"
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [r[0] for r in rows]
 
 
 def update_planning(planning_id: str, fields: Dict[str, Any]) -> bool:

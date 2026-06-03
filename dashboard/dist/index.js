@@ -105,7 +105,17 @@
 
   // --- data layer -----------------------------------------------------------
 
-  function useEvents(anchor) {
+  function useUsers() {
+    const [users, setUsers] = useState([]);
+    useEffect(function () {
+      SDK.fetchJSON(API + "/users")
+        .then(function (data) { setUsers((data && data.users) || []); })
+        .catch(function () { setUsers([]); });
+    }, []);
+    return users;
+  }
+
+  function useEvents(anchor, owner) {
     const [events, setEvents] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -118,7 +128,9 @@
       const to = isoDate(addDays(start, 43)) + "T00:00:00";
       setLoading(true);
       setError(null);
-      SDK.fetchJSON(API + "/events?from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to))
+      var url = API + "/events?from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to);
+      if (owner) url += "&owner=" + encodeURIComponent(owner);
+      SDK.fetchJSON(url)
         .then(function (data) {
           setEvents((data && data.events) || []);
           setLoading(false);
@@ -127,7 +139,7 @@
           setError((err && err.message) || "Failed to load events");
           setLoading(false);
         });
-    }, [anchor]);
+    }, [anchor, owner]);
 
     useEffect(load, [load]);
     return { events, loading, error, reload: load };
@@ -135,15 +147,17 @@
 
   // Upcoming occurrences (used for the "Next up" chips). Tolerant of failure:
   // resolves to an empty list rather than surfacing an error.
-  function useUpcoming(days) {
+  function useUpcoming(days, owner) {
     const [items, setItems] = useState([]);
     useEffect(function () {
       let alive = true;
-      SDK.fetchJSON(API + "/upcoming?days=" + encodeURIComponent(days))
+      var url = API + "/upcoming?days=" + encodeURIComponent(days);
+      if (owner) url += "&owner=" + encodeURIComponent(owner);
+      SDK.fetchJSON(url)
         .then(function (data) { if (alive) setItems((data && data.events) || []); })
         .catch(function () { if (alive) setItems([]); });
       return function () { alive = false; };
-    }, [days]);
+    }, [days, owner]);
     return items;
   }
 
@@ -509,12 +523,13 @@
 
   // --- month-grid calendar view --------------------------------------------
 
-  function CalendarView() {
+  function CalendarView(props) {
+    const owner = props.owner || null;
     const [anchor, setAnchor] = useState(function () { return monthAnchor(new Date()); });
     const [openId, setOpenId] = useState(null);
     const [openDay, setOpenDay] = useState(null);
-    const { events, loading, error, reload } = useEvents(anchor);
-    const upcoming = useUpcoming(30);
+    const { events, loading, error, reload } = useEvents(anchor, owner);
+    const upcoming = useUpcoming(30, owner);
 
     const byDate = useMemo(function () {
       const m = {};
@@ -854,7 +869,8 @@
   }
   var PLAN_FILTERS = [["all", "All"], ["active", "Active"], ["upcoming", "Upcoming"], ["past", "Past"]];
 
-  function PlanningsView() {
+  function PlanningsView(props) {
+    const owner = props.owner || null;
     const [plannings, setPlannings] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -864,7 +880,9 @@
     const load = useCallback(function () {
       setLoading(true);
       setError(null);
-      SDK.fetchJSON(API + "/plannings")
+      var url = API + "/plannings";
+      if (owner) url += "?owner=" + encodeURIComponent(owner);
+      SDK.fetchJSON(url)
         .then(function (data) {
           setPlannings((data && data.plannings) || []);
           setLoading(false);
@@ -873,7 +891,7 @@
           setError((err && err.message) || "Failed to load plannings");
           setLoading(false);
         });
-    }, []);
+    }, [owner]);
 
     useEffect(load, [load]);
 
@@ -1001,6 +1019,9 @@
   function CalendarHero(props) {
     const view = props.view;
     const setView = props.setView;
+    const users = props.users || [];
+    const selectedOwner = props.selectedOwner;
+    const setSelectedOwner = props.setSelectedOwner;
     const isPlan = view === "plannings";
     return h(
       "div",
@@ -1026,22 +1047,41 @@
         ),
         h(
           "div",
-          { className: "cal-tabs cal-hero-tabs" },
+          { className: "flex items-center gap-3 flex-wrap" },
+          users.length > 0
+            ? h(
+                "select",
+                {
+                  className: "cal-user-select",
+                  value: selectedOwner || "",
+                  onChange: function (e) { setSelectedOwner(e.target.value || null); },
+                  title: "Filter by user",
+                },
+                h("option", { value: "" }, "All users"),
+                users.map(function (u) {
+                  return h("option", { key: u, value: u }, u);
+                })
+              )
+            : null,
           h(
-            "button",
-            {
-              className: cn("cal-tab", view === "calendar" && "cal-tab-active"),
-              onClick: function () { setView("calendar"); },
-            },
-            "📅 Calendar"
-          ),
-          h(
-            "button",
-            {
-              className: cn("cal-tab", view === "plannings" && "cal-tab-active"),
-              onClick: function () { setView("plannings"); },
-            },
-            "🗜️ Plannings"
+            "div",
+            { className: "cal-tabs cal-hero-tabs" },
+            h(
+              "button",
+              {
+                className: cn("cal-tab", view === "calendar" && "cal-tab-active"),
+                onClick: function () { setView("calendar"); },
+              },
+              "📅 Calendar"
+            ),
+            h(
+              "button",
+              {
+                className: cn("cal-tab", view === "plannings" && "cal-tab-active"),
+                onClick: function () { setView("plannings"); },
+              },
+              "🗜️ Plannings"
+            )
           )
         )
       )
@@ -1050,11 +1090,21 @@
 
   function CalendarApp() {
     const [view, setView] = useState("calendar");
+    const [selectedOwner, setSelectedOwner] = useState(null);
+    const users = useUsers();
     return h(
       "div",
       null,
-      h(CalendarHero, { view: view, setView: setView }),
-      view === "plannings" ? h(PlanningsView, null) : h(CalendarView, null)
+      h(CalendarHero, {
+        view: view,
+        setView: setView,
+        users: users,
+        selectedOwner: selectedOwner,
+        setSelectedOwner: setSelectedOwner,
+      }),
+      view === "plannings"
+        ? h(PlanningsView, { owner: selectedOwner })
+        : h(CalendarView, { owner: selectedOwner })
     );
   }
 
