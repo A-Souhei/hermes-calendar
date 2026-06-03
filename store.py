@@ -58,6 +58,8 @@ def init_db() -> None:
                 owner           TEXT,
                 notify_email    TEXT,
                 planning_id     TEXT,
+                job             TEXT,
+                category        TEXT,
                 created_utc     TEXT,
                 updated_utc     TEXT
             );
@@ -136,6 +138,12 @@ def init_db() -> None:
         if "planning_id" not in cols:
             conn.execute("ALTER TABLE events ADD COLUMN planning_id TEXT")
             conn.commit()
+        if "job" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN job TEXT")
+            conn.commit()
+        if "category" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN category TEXT")
+            conn.commit()
         pcols = {row[1] for row in conn.execute("PRAGMA table_info(plannings)").fetchall()}
         if pcols and "tz" not in pcols:
             conn.execute("ALTER TABLE plannings ADD COLUMN tz TEXT")
@@ -177,8 +185,8 @@ def add_event(d: Dict[str, Any]) -> str:
                 (id, title, description, start_utc, tz, all_day,
                  recurrence, alert_lead_seconds, alert_channel,
                  meeting, location, tags, language, owner, notify_email,
-                 planning_id, created_utc, updated_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 planning_id, job, category, created_utc, updated_utc)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 event_id,
@@ -197,6 +205,8 @@ def add_event(d: Dict[str, Any]) -> str:
                 d.get("owner"),
                 d.get("notify_email"),
                 d.get("planning_id"),
+                d.get("job"),
+                d.get("category"),
                 now,
                 now,
             ),
@@ -701,14 +711,188 @@ def clear_status(event_id: str, occurrence_utc: str) -> bool:
     return cursor.rowcount > 0
 
 
-def list_active() -> List[Dict[str, Any]]:
-    """Return all occurrence_status rows where status='active', across all events."""
+def list_active(owner: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return occurrence_status rows where status='active'.
+
+    When owner is given, only active rows whose event belongs to that owner
+    (case-insensitive) are returned. Default owner=None returns all users.
+    """
     with _lock:
         conn = _get_conn()
         rows = conn.execute(
-            "SELECT * FROM occurrence_status WHERE status = 'active' ORDER BY started_utc",
+            """
+            SELECT os.* FROM occurrence_status os
+            JOIN events e ON e.id = os.event_id
+            WHERE os.status = 'active'
+              AND (? IS NULL OR e.owner COLLATE NOCASE = ?)
+            ORDER BY os.started_utc
+            """,
+            (owner, owner),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def summarize_jobs(
+    owner: str,
+    start_iso: str,
+    end_iso: str,
+    category: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Aggregate confirmed timer work in [start_iso, end_iso) for owner.
+
+    Rows qualify when: status='confirmed', duration_seconds IS NOT NULL, the
+    event has a non-empty job, owner matches (case-insensitive), and the
+    effective timestamp COALESCE(started_utc, occurrence_utc) falls in
+    [start_iso, end_iso). If category is given it is also matched
+    case-insensitively.
+
+    ISO-8601 UTC strings are stored with +00:00 offset (via _now_iso()), so
+    lexicographic comparison is correct for range filtering.
+
+    Returns::
+
+        {
+            "jobs":       [{"job": str, "category": str|None,
+                            "total_seconds": int, "count": int}, ...],
+            "categories": [{"category": str|None,
+                            "total_seconds": int, "count": int}, ...],
+            "total_seconds": int,
+            "count": int,
+        }
+    """
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            """
+            SELECT
+                e.job       AS job,
+                e.category  AS category,
+                SUM(os.duration_seconds) AS total_seconds,
+                COUNT(*)                 AS count
+            FROM occurrence_status os
+            JOIN events e ON e.id = os.event_id
+            WHERE os.status = 'confirmed'
+              AND os.duration_seconds IS NOT NULL
+              AND e.job IS NOT NULL AND e.job != ''
+              AND e.owner COLLATE NOCASE = ?
+              AND COALESCE(os.started_utc, os.occurrence_utc) >= ?
+              AND COALESCE(os.started_utc, os.occurrence_utc) <  ?
+              AND (? IS NULL OR e.category COLLATE NOCASE = ?)
+            GROUP BY e.job, e.category
+            ORDER BY total_seconds DESC
+            """,
+            (owner, start_iso, end_iso, category, category),
+        ).fetchall()
+
+    jobs = [
+        {
+            "job": r["job"],
+            "category": r["category"],
+            "total_seconds": r["total_seconds"] or 0,
+            "count": r["count"],
+        }
+        for r in rows
+    ]
+
+    # Aggregate by category (None is a valid bucket).
+    cat_map: Dict[Any, Dict[str, int]] = {}
+    for j in jobs:
+        cat = j["category"]
+        if cat not in cat_map:
+            cat_map[cat] = {"total_seconds": 0, "count": 0}
+        cat_map[cat]["total_seconds"] += j["total_seconds"]
+        cat_map[cat]["count"] += j["count"]
+    categories = [
+        {"category": cat, "total_seconds": v["total_seconds"], "count": v["count"]}
+        for cat, v in sorted(cat_map.items(), key=lambda x: -x[1]["total_seconds"])
+    ]
+
+    total_seconds = sum(j["total_seconds"] for j in jobs)
+    count = sum(j["count"] for j in jobs)
+
+    return {
+        "jobs": jobs,
+        "categories": categories,
+        "total_seconds": total_seconds,
+        "count": count,
+    }
+
+
+def list_jobs(
+    owner: str,
+    start_iso: Optional[str] = None,
+    end_iso: Optional[str] = None,
+    category: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Distinct jobs for an owner with aggregated stats, sorted by last_active_utc desc.
+
+    Considers confirmed timer rows with a non-empty job. Optionally bounded to
+    [start_iso, end_iso) when both bounds are given (same lexicographic
+    comparison as summarize_jobs — values are all UTC+00:00), and optionally
+    filtered to a single category (case-insensitive).
+
+    Each entry: {job, category, count, total_seconds, last_active_utc}.
+    """
+    # Optional bounds/category are applied via `? IS NULL OR ...` so a single
+    # query covers every combination (same pattern as summarize_jobs).
+    use_window = (start_iso is not None and end_iso is not None)
+    win_lo = start_iso if use_window else None
+    win_hi = end_iso if use_window else None
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            """
+            SELECT
+                e.job        AS job,
+                e.category   AS category,
+                COUNT(*)     AS count,
+                SUM(os.duration_seconds)      AS total_seconds,
+                MAX(COALESCE(os.started_utc, os.occurrence_utc)) AS last_active_utc
+            FROM occurrence_status os
+            JOIN events e ON e.id = os.event_id
+            WHERE os.status = 'confirmed'
+              AND os.duration_seconds IS NOT NULL
+              AND e.job IS NOT NULL AND e.job != ''
+              AND e.owner COLLATE NOCASE = ?
+              AND (? IS NULL OR COALESCE(os.started_utc, os.occurrence_utc) >= ?)
+              AND (? IS NULL OR COALESCE(os.started_utc, os.occurrence_utc) <  ?)
+              AND (? IS NULL OR e.category COLLATE NOCASE = ?)
+            GROUP BY e.job, e.category
+            ORDER BY last_active_utc DESC
+            """,
+            (owner, win_lo, win_lo, win_hi, win_hi, category, category),
+        ).fetchall()
+    return [
+        {
+            "job": r["job"],
+            "category": r["category"],
+            "count": r["count"],
+            "total_seconds": r["total_seconds"] or 0,
+            "last_active_utc": r["last_active_utc"],
+        }
+        for r in rows
+    ]
+
+
+def find_job_event(owner: str, job: str) -> Optional[Dict[str, Any]]:
+    """Return the most recent event for an owner carrying the given job
+    (both matched case-insensitively), or None.
+
+    Used by calendar_resume_job to recover the exact stored spelling of a job
+    and its category/title so a resumed session aggregates with prior ones.
+    """
+    key = str(job).strip().lower()
+    if not key:
+        return None
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT * FROM events "
+            "WHERE owner COLLATE NOCASE = ? AND LOWER(job) = ? "
+            "ORDER BY start_utc DESC LIMIT 1",
+            (owner, key),
+        ).fetchone()
+    return _row_to_event(row) if row else None
 
 
 # Run on import

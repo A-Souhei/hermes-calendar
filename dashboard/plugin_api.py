@@ -232,6 +232,8 @@ def _occurrences_in_range(
                 "location": ev.get("location"),
                 "tags": ev.get("tags") or [],
                 "planning": planning_name,
+                "job": ev.get("job"),
+                "category": ev.get("category"),
                 "has_report": occ_iso in report_keys,
                 "status": status_row["status"] if status_row else "floating",
                 "effective_status": _effective_status(
@@ -336,6 +338,8 @@ def event_detail(event_id: str):
         "owner": ev.get("owner"),
         "notify_email": ev.get("notify_email"),
         "planning": _planning_name_for(ev),
+        "job": ev.get("job"),
+        "category": ev.get("category"),
         "meeting": ev.get("meeting"),
         "location": ev.get("location"),
         "tags": ev.get("tags") or [],

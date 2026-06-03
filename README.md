@@ -73,6 +73,57 @@ hermes cron create "0 7 * * *" --name calendar-digest --no-agent \
 **On-demand tool:** `calendar_digest` builds (and optionally emails) the digest
 for a given owner from within the agent conversation.
 
+## Realtime jobs & time tracking
+
+### One timer per user
+
+Only one timer can run at a time per user. Starting a new timer with
+`calendar_start_timer` while one is already running **auto-stops** the previous
+one (marks it confirmed, records the measured duration) and starts the new one.
+The result includes a `warning` and `switched_from` list describing what was
+stopped.
+
+### Job and category attributes
+
+- `job` — applies to **timer events only** (`calendar_start_timer`). A free-text
+  work-stream identifier, e.g. `"client-acme"`, `"thesis-writing"`. Use the same
+  string across sessions to accumulate time.
+- `category` — applies to **all events** (`calendar_start_timer`,
+  `calendar_add_event`, `calendar_update_event`). Optional free-text grouping,
+  e.g. `"work"`, `"personal"`.
+
+### Resuming a job
+
+`calendar_start_timer` always creates a **new** event, so "resuming" a job means
+logging a fresh session tagged with the same `job` string — all sessions sharing
+that string aggregate in reports. Use **`calendar_resume_job`** to do this safely:
+it looks up the most recent session of a named job, reuses its **exact** stored
+`job` name and `category` (so a typo can't fork the job), and starts a new
+session (auto-stopping any running timer). If the name doesn't match an existing
+job it returns the list of known jobs and asks for the exact one rather than
+silently creating a near-duplicate.
+
+### New tools
+
+| Tool | Description |
+|---|---|
+| `calendar_resume_job` | Start a fresh session of an existing job, reusing its exact name + category so sessions aggregate. |
+| `calendar_list_jobs` | List distinct jobs for an owner with total time and session counts. |
+| `calendar_job_summary` | Aggregate tracked time by job/category for a period; optionally email a styled report (HTML + PDF). |
+
+**Example phrasings:**
+- "Start a timer for client-acme now" → `calendar_start_timer` with `job="client-acme"`
+- "Resume the thesis-writing job" → `calendar_resume_job` with `job="thesis-writing"`
+- "Stop my timer" → `calendar_stop_timer`
+- "How many hours did I spend on thesis-writing this month?" → `calendar_job_summary` with `period="monthly"`
+- "Email me my job report for this week" → `calendar_job_summary` with `period="weekly"` and `email=true`
+
+### Dashboard
+
+Job/timer events render with a **blue accent and blue title** in the read-only
+Calendar tab, distinguishing logged work from regular appointments. The event's
+`job` and `category` appear in the chip tooltip.
+
 ## Storage
 
 SQLite at `$HERMES_HOME/calendar.db` (default `~/.hermes/calendar.db`), WAL mode.
