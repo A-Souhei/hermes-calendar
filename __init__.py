@@ -622,18 +622,39 @@ def _handle_calendar_remove_event(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
+    from zoneinfo import ZoneInfo
     now_utc = datetime.now(timezone.utc)
+    try:
+        _default_tz = ZoneInfo(recurrence_mod.DEFAULT_TZ)
+    except Exception:
+        _default_tz = timezone.utc
 
     from_raw = args.get("from")
     to_raw = args.get("to")
 
-    range_start = _parse_start(from_raw) if from_raw else now_utc
-    if range_start is None:
-        return tool_error(f"Could not parse 'from': {from_raw!r}")
+    # NOTE: _parse_start requires (raw, tz_name); the bounds are then normalized
+    # to UTC for recurrence expansion. (A missing tz_name previously crashed every
+    # explicit from/to query.)
+    if from_raw:
+        parsed = _parse_start(from_raw, recurrence_mod.DEFAULT_TZ)
+        if parsed is None:
+            return tool_error(f"Could not parse 'from': {from_raw!r}")
+        range_start = parsed.astimezone(timezone.utc)
+    else:
+        # Default to the START OF TODAY (local) — not "now" — so events earlier
+        # today are still listed (you usually want to see/manage today's events).
+        range_start = (
+            datetime.now(_default_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+            .astimezone(timezone.utc)
+        )
 
-    range_end = _parse_start(to_raw) if to_raw else now_utc + timedelta(days=30)
-    if range_end is None:
-        return tool_error(f"Could not parse 'to': {to_raw!r}")
+    if to_raw:
+        parsed = _parse_start(to_raw, recurrence_mod.DEFAULT_TZ)
+        if parsed is None:
+            return tool_error(f"Could not parse 'to': {to_raw!r}")
+        range_end = parsed.astimezone(timezone.utc)
+    else:
+        range_end = now_utc + timedelta(days=30)
 
     if range_start > range_end:
         return tool_error("'from' must be before 'to'")

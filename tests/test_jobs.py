@@ -243,6 +243,30 @@ def test_create_planning_registry_gate():
     assert r_ok["ok"], f"Expected success, got: {r_ok}"
 
 
+def test_list_events_explicit_range_and_today_default():
+    """Regression: explicit from/to must not crash (it passed _parse_start the
+    wrong arity), and the default window must include events earlier *today*."""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    earlier = (now - timedelta(hours=3)).isoformat()
+    add = res(cal._handle_calendar_add_event({
+        "owner": "u_reg", "title": "Earlier today ev", "start": earlier,
+        "alert_channel": "none",
+    }))
+    assert add["created"]
+
+    # explicit from/to (previously raised TypeError -> tool_error)
+    day0 = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    day1 = (now + timedelta(days=1)).isoformat()
+    r1 = res(cal._handle_calendar_list_events(
+        {"owner": "u_reg", "from": day0, "to": day1, "query": "Earlier"}))
+    assert any(e["title"] == "Earlier today ev" for e in r1["events"])
+
+    # default window (no from/to) must still include the earlier-today event
+    r2 = res(cal._handle_calendar_list_events({"owner": "u_reg", "query": "Earlier"}))
+    assert any(e["title"] == "Earlier today ev" for e in r2["events"])
+
+
 def test_get_user_email_registry_fallback():
     """An owner with only a registry email (no user_emails row) resolves via store.get_user_email."""
     # "Toavina" is registered with email "t@example.com" in the registry.
