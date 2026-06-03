@@ -60,7 +60,12 @@ def build_owner_digest(
     day_start_utc = day_start_local.astimezone(timezone.utc)
     day_end_utc = (day_start_local + timedelta(days=1)).astimezone(timezone.utc)
 
-    date_str = day_start_local.strftime("%A, %-d %B %Y")
+    # Build the date label without platform-specific strftime extensions
+    # (e.g. %-d is unsupported on Windows) — interpolate the numeric day.
+    date_str = (
+        f"{day_start_local.strftime('%A')}, {day_start_local.day} "
+        f"{day_start_local.strftime('%B %Y')}"
+    )
 
     events = store.list_events(owner=owner)
 
@@ -127,9 +132,10 @@ def build_owner_digest(
                 except Exception:
                     ev_tz = event_tz
                 nxt_local = nxt.astimezone(ev_tz)
+                _when = "All day" if ev.get("all_day") else nxt_local.strftime("%H:%M")
                 best_item = {
                     "occurrence_utc": nxt.isoformat(),
-                    "local_dt_str": nxt_local.strftime("%-d %b · %H:%M") if not ev.get("all_day") else nxt_local.strftime("%-d %b · All day"),
+                    "local_dt_str": f"{nxt_local.day} {nxt_local.strftime('%b')} · {_when}",
                     "weekday": nxt_local.strftime("%A"),
                     "title": ev["title"],
                     "all_day": bool(ev.get("all_day")),
@@ -179,7 +185,7 @@ def render_markdown(digest: Dict[str, Any]) -> str:
             time_part = "All day" if item["all_day"] else (item["local_time"] or "")
             status = item["status"]
             status_label = ""
-            if status not in ("floating", "upcoming"):
+            if status != "floating":
                 status_label = f" — {status}"
             loc = f" @ {item['location']}" if item.get("location") else ""
             lines.append(f"- {time_part} · {item['title']}{status_label}{loc}")

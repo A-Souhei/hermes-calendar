@@ -69,7 +69,7 @@ def main() -> int:
 
     store = mod.store
     notify = mod.notify
-    digest_mod = mod.digest
+    digest_mod = mod.digest_mod
 
     owners = store.list_owners()
     stdout_parts: list[str] = []
