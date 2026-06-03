@@ -268,11 +268,24 @@ def _occurrences_in_range(
 
 @router.get("/users")
 def list_users():
-    """Distinct owner values across events and plannings (for the user-filter UI)."""
+    """Users for the filter UI: the pre-registered users from calendar-users.json
+    UNIONED with any owners that actually have events/plannings — so a registered
+    user appears in the dropdown even before they have any events."""
     try:
-        return {"users": store.list_owners()}
+        owners = store.list_owners()
     except Exception:
-        return {"users": []}
+        owners = []
+    try:
+        registered = users.list_user_names()
+    except Exception:
+        registered = []
+    # Case-insensitive union, keeping one representative casing, sorted.
+    seen: Dict[str, str] = {}
+    for n in list(registered) + list(owners):
+        key = (n or "").strip().lower()
+        if key and key not in seen:
+            seen[key] = n
+    return {"users": sorted(seen.values(), key=lambda s: s.lower())}
 
 
 @router.get("/categories")

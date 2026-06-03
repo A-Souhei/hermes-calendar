@@ -25,15 +25,10 @@
 
   const API = "/api/plugins/calendar";
   const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-  const MAX_CHIPS = 3;
 
   // --- status helpers -------------------------------------------------------
 
   var STATUS_GLYPH = { confirmed: "✓", active: "●", missed: "✗" };
-
-  function statusGlyph(status) {
-    return STATUS_GLYPH[status] || null;
-  }
 
   // Effective display status (backend-derived): a past, still-floating
   // occurrence reads as "missed" while staying floating underneath.
@@ -43,6 +38,18 @@
   // True when "missed" is only inferred from the past date, not explicitly set.
   function isDerivedMiss(ev) {
     return effStatus(ev) === "missed" && (ev.status === "floating" || !ev.status);
+  }
+  // A coloured status pill for an event (confirmed / running / missed / upcoming).
+  function statusBadge(ev) {
+    var eff = effStatus(ev); // confirmed | missed | active | floating
+    var derived = isDerivedMiss(ev);
+    var label = eff === "floating" ? "upcoming" : (eff === "active" ? "running" : eff);
+    var glyph = STATUS_GLYPH[eff] || "";
+    return h(
+      "span",
+      { className: cn("cal-status", "cal-status-" + eff, derived && "cal-status-derived") },
+      (glyph ? glyph + " " : "") + label
+    );
   }
 
   function fmtDuration(seconds) {
@@ -192,22 +199,6 @@
     return { events, loading, error, reload: load };
   }
 
-  // Upcoming occurrences (used for the "Next up" chips). Tolerant of failure:
-  // resolves to an empty list rather than surfacing an error.
-  function useUpcoming(days, owner) {
-    const [items, setItems] = useState([]);
-    useEffect(function () {
-      let alive = true;
-      var url = API + "/upcoming?days=" + encodeURIComponent(days);
-      if (owner) url += "&owner=" + encodeURIComponent(owner);
-      SDK.fetchJSON(url)
-        .then(function (data) { if (alive) setItems((data && data.events) || []); })
-        .catch(function () { if (alive) setItems([]); });
-      return function () { alive = false; };
-    }, [days, owner]);
-    return items;
-  }
-
   function fmtTime(iso, tz) {
     try {
       const d = new Date(iso);
@@ -217,116 +208,6 @@
     } catch (e) {
       return "";
     }
-  }
-
-  // --- chips & cells --------------------------------------------------------
-
-  function EventChip(props) {
-    const ev = props.event;
-    const eff = effStatus(ev);
-    const derived = isDerivedMiss(ev);
-    const glyph = statusGlyph(eff);
-    const prefix = (glyph ? h("span", { className: cn("cal-status-glyph", derived && "cal-status-derived") }, glyph) : null);
-    const planGlyph = ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null;
-    return h(
-      "button",
-      {
-        className: cn("cal-chip", ev.recurring ? "cal-chip-recurring" : "cal-chip-once", ev.job && "cal-chip-job"),
-        title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (eff !== "floating" ? " · " + (derived ? "missed (unconfirmed)" : eff) : "") + (ev.planning ? " · plan: " + ev.planning : "") + (ev.job ? " · job: " + ev.job + (ev.category ? " (" + ev.category + ")" : "") : ""),
-        onClick: function () { props.onOpen(ev.id); },
-      },
-      prefix,
-      planGlyph,
-      h("span", { className: "cal-chip-title" }, (ev.has_report ? "📝 " : "") + ev.title),
-      ev.duration_seconds != null
-        ? h("span", { className: "cal-chip-dur" }, fmtDuration(ev.duration_seconds))
-        : null
-    );
-  }
-
-  function DayCell(props) {
-    const { date, inMonth, isToday, events, onOpen, onOpenDay } = props;
-    const shown = events.slice(0, MAX_CHIPS);
-    const extra = events.length - shown.length;
-    const dayNum = h(
-      "button",
-      {
-        className: "cal-daynum",
-        title: events.length ? "View all events on this day" : undefined,
-        onClick: function () { if (events.length) onOpenDay(date, events); },
-      },
-      String(date.getDate())
-    );
-    return h(
-      "div",
-      { className: cn("cal-cell", !inMonth && "cal-cell-muted", isToday && "cal-cell-today") },
-      dayNum,
-      shown.map(function (ev, i) {
-        return h(EventChip, { key: ev.id + "@" + ev.occurrence_utc + i, event: ev, onOpen: onOpen });
-      }),
-      extra > 0
-        ? h(
-            "button",
-            { className: "cal-more", onClick: function () { onOpenDay(date, events); } },
-            "+" + extra + " more"
-          )
-        : null
-    );
-  }
-
-  // Day view — lists ALL events for one day; each row opens the detail modal.
-  function DayModal(props) {
-    const date = props.date;
-    const events = props.events || [];
-    const label = date.toLocaleDateString(undefined, {
-      weekday: "long", year: "numeric", month: "long", day: "numeric",
-    });
-    return h(
-      "div",
-      {
-        className: "fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-8 bg-black/60 cal-overlay",
-        onClick: function (e) { if (e.target === e.currentTarget) props.onClose(); },
-      },
-      h(
-        "div",
-        { className: "cal-modal w-full max-w-md shadow-xl" },
-        h(
-          "div",
-          { className: "cal-modal-body p-5 space-y-3" },
-          h(
-            "div",
-            { className: "cal-modal-head flex items-start justify-between gap-3" },
-            h("h2", { className: "text-base font-semibold leading-tight" }, label),
-            h(Button, { variant: "ghost", size: "sm", onClick: props.onClose }, "✕")
-          ),
-          events.length === 0
-            ? h("div", { className: "text-sm opacity-60" }, "No events.")
-            : h(
-                "div",
-                { className: "space-y-1" },
-                events.map(function (ev, i) {
-                  const derived = isDerivedMiss(ev);
-                  const glyph = statusGlyph(effStatus(ev));
-                  const timeStr = ev.all_day ? "All day" : fmtTime(ev.occurrence_local, ev.tz);
-                  const dur = ev.duration_seconds != null ? fmtDuration(ev.duration_seconds) : null;
-                  const durStr = dur ? " · " + dur : "";
-                  return h(
-                    "button",
-                    {
-                      key: ev.id + "@" + ev.occurrence_utc + i,
-                      className: cn("cal-chip cal-dayrow", ev.recurring ? "cal-chip-recurring" : "cal-chip-once", ev.job && "cal-chip-job"),
-                      title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (ev.planning ? " · plan: " + ev.planning : "") + (ev.job ? " · job: " + ev.job + (ev.category ? " (" + ev.category + ")" : "") : ""),
-                      onClick: function () { props.onOpenEvent(ev.id); },
-                    },
-                    glyph ? h("span", { className: cn("cal-status-glyph", derived && "cal-status-derived") }, glyph) : null,
-                    ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null,
-                    h("span", { className: "cal-chip-title" }, (ev.has_report ? "📝 " : "") + timeStr + " · " + ev.title + durStr)
-                  );
-                })
-              )
-        )
-      )
-    );
   }
 
   // --- detail modal ---------------------------------------------------------
@@ -709,17 +590,122 @@
     );
   }
 
-  // --- month-grid calendar view --------------------------------------------
+  // --- compact month picker -------------------------------------------------
+  // Small calendar: day numbers only. Today keeps its filled marker; days with
+  // events are signalled by a dot + accent number text (never overrides today).
+  function SmallCalendar(props) {
+    const cells = props.cells || [];
+    const selectedKey = props.selectedKey;
+    return h(
+      "div",
+      { className: cn("sc", props.loading && "opacity-50") },
+      h(
+        "div",
+        { className: "sc-weekrow" },
+        WEEKDAYS.map(function (d) {
+          return h("div", { key: d, className: "sc-weekday" }, d.charAt(0));
+        })
+      ),
+      h(
+        "div",
+        { className: "sc-grid" },
+        cells.map(function (c) {
+          var hasEvents = c.events && c.events.length > 0;
+          return h(
+            "button",
+            {
+              key: c.key,
+              className: cn(
+                "sc-day",
+                !c.inMonth && "sc-day-out",
+                hasEvents && "sc-day-has",
+                c.key === selectedKey && "sc-day-selected",
+                c.isToday && "sc-day-today"
+              ),
+              title: hasEvents
+                ? c.events.length + " event" + (c.events.length > 1 ? "s" : "")
+                : undefined,
+              onClick: function () { props.onSelectDate(c.date); },
+            },
+            h("span", { className: "sc-day-num" }, String(c.date.getDate()))
+          );
+        })
+      )
+    );
+  }
+
+  // --- agenda panel (events for the selected day) ---------------------------
+  function AgendaPanel(props) {
+    const date = props.date;
+    const events = props.events || [];
+    const dateLabel = date.toLocaleDateString(undefined, {
+      weekday: "long", month: "long", day: "numeric", year: "numeric",
+    });
+    return h(
+      "div",
+      { className: "agenda" },
+      h(
+        "div",
+        { className: "agenda-head" },
+        h("div", { className: "agenda-title" }, dateLabel),
+        h(
+          "div",
+          { className: "agenda-count" },
+          events.length ? events.length + " event" + (events.length > 1 ? "s" : "") : "No events"
+        )
+      ),
+      events.length
+        ? h(
+            "div",
+            { className: "agenda-list" },
+            events.map(function (ev, i) {
+              var timeStr = ev.all_day ? "All day" : fmtTime(ev.occurrence_local || ev.occurrence_utc, ev.tz);
+              var dur = ev.duration_seconds != null ? fmtDuration(ev.duration_seconds) : null;
+              return h(
+                "button",
+                {
+                  key: ev.id + "@" + ev.occurrence_utc + i,
+                  className: cn("agenda-row", ev.job && "agenda-row-job"),
+                  onClick: function () { props.onOpen(ev.id); },
+                },
+                h("span", { className: "agenda-time" }, timeStr),
+                h(
+                  "span",
+                  { className: "agenda-body" },
+                  h(
+                    "span",
+                    { className: "agenda-titleline" },
+                    ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null,
+                    h("span", { className: "agenda-evtitle" }, (ev.has_report ? "📝 " : "") + ev.title),
+                    dur ? h("span", { className: "agenda-dur" }, dur) : null
+                  ),
+                  // status + category + job + location badges (for every event)
+                  h(
+                    "span",
+                    { className: "agenda-sub" },
+                    statusBadge(ev),
+                    ev.category ? h("span", { className: "agenda-cat" }, ev.category) : null,
+                    ev.job ? h("span", { className: "agenda-job" }, "▸ " + ev.job) : null,
+                    ev.location ? h("span", { className: "agenda-loc" }, "📍 " + ev.location) : null
+                  )
+                )
+              );
+            })
+          )
+        : h("div", { className: "agenda-empty" }, "Nothing scheduled for this day.")
+    );
+  }
+
+  // --- month calendar view --------------------------------------------------
 
   function CalendarView(props) {
     const owner = props.owner || null;
     const category = props.category || null;
     const timers = useTimers(owner);
     const [anchor, setAnchor] = useState(function () { return monthAnchor(new Date()); });
+    const [selectedDay, setSelectedDay] = useState(function () { return new Date(); });
     const [openId, setOpenId] = useState(null);
-    const [openDay, setOpenDay] = useState(null);
     const { events, loading, error, reload } = useEvents(anchor, owner, category);
-    const upcoming = useUpcoming(30, owner);
 
     const byDate = useMemo(function () {
       const m = {};
@@ -765,19 +751,26 @@
       return s;
     }, [events]);
 
-    // First few future occurrences for the "Next up" chips.
-    const nextUp = useMemo(function () {
-      var nowMs = Date.now();
-      return (upcoming || [])
-        .filter(function (ev) {
-          var t = new Date(ev.occurrence_utc || ev.occurrence_local || 0).getTime();
-          return !isNaN(t) && t >= nowMs;
-        })
-        .sort(function (a, b) {
-          return new Date(a.occurrence_utc || a.occurrence_local || 0) - new Date(b.occurrence_utc || b.occurrence_local || 0);
-        })
-        .slice(0, 6);
-    }, [upcoming]);
+    // Events for the selected day, sorted by time (drives the agenda panel).
+    const selectedKey = isoDate(selectedDay);
+    const selectedEvents = useMemo(function () {
+      return (byDate[selectedKey] || []).slice().sort(function (a, b) {
+        return new Date(a.occurrence_utc || a.occurrence_local || 0) -
+               new Date(b.occurrence_utc || b.occurrence_local || 0);
+      });
+    }, [byDate, selectedKey]);
+
+    // Month nav also moves the selection so the agenda follows the visible month.
+    function goMonth(delta) {
+      var d = new Date(anchor.getFullYear(), anchor.getMonth() + delta, 1);
+      setAnchor(d);
+      setSelectedDay(d);
+    }
+    function goToday() {
+      var now = new Date();
+      setAnchor(monthAnchor(now));
+      setSelectedDay(now);
+    }
 
     return h(
       "div",
@@ -790,9 +783,9 @@
         h(
           "div",
           { className: "flex items-center gap-2" },
-          h(Button, { variant: "outline", size: "sm", onClick: function () { setAnchor(new Date(anchor.getFullYear(), anchor.getMonth() - 1, 1)); } }, "◀"),
-          h(Button, { variant: "outline", size: "sm", onClick: function () { setAnchor(monthAnchor(new Date())); } }, "Today"),
-          h(Button, { variant: "outline", size: "sm", onClick: function () { setAnchor(new Date(anchor.getFullYear(), anchor.getMonth() + 1, 1)); } }, "▶"),
+          h(Button, { variant: "outline", size: "sm", onClick: function () { goMonth(-1); } }, "◀"),
+          h(Button, { variant: "outline", size: "sm", onClick: goToday }, "Today"),
+          h(Button, { variant: "outline", size: "sm", onClick: function () { goMonth(1); } }, "▶"),
           h(Button, { variant: "ghost", size: "sm", onClick: reload, title: "Refresh" }, "⟳")
         )
       ),
@@ -811,89 +804,40 @@
         h(StatCard, { label: "Active", value: stats.active })
       ),
 
-      // next up chips
-      nextUp.length
-        ? h(
-            "div",
-            { className: "space-y-1" },
-            h("div", { className: "cal-section-label" }, "Next up"),
-            h(
-              "div",
-              { className: "cal-nextup" },
-              nextUp.map(function (ev, i) {
-                var glyph = statusGlyph(effStatus(ev));
-                var derived = isDerivedMiss(ev);
-                var when = fmtDateTime(ev.occurrence_local || ev.occurrence_utc, ev.tz, ev.all_day)
-                  .replace(/^\w+,?\s*/, "");
-                return h(
-                  "button",
-                  {
-                    key: ev.id + "@" + ev.occurrence_utc + i,
-                    className: "cal-nextup-chip",
-                    title: ev.title + " · " + fmtDateTime(ev.occurrence_local || ev.occurrence_utc, ev.tz, ev.all_day) + (ev.planning ? " · plan: " + ev.planning : ""),
-                    onClick: function () { setOpenId(ev.id); },
-                  },
-                  glyph ? h("span", { className: cn("cal-status-glyph", derived && "cal-status-derived") }, glyph) : null,
-                  ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null,
-                  h("span", { className: "cal-nextup-when" }, when),
-                  h("span", { className: "cal-nextup-title" }, ev.title)
-                );
-              })
-            )
-          )
-        : null,
-
       error ? h("div", { className: "text-sm text-red-600" }, "⚠ " + error) : null,
 
+      // split: small calendar (left) + agenda for the selected day (right)
       h(
-        Card,
-        null,
+        "div",
+        { className: "cal-split" },
         h(
-          CardContent,
-          { className: "p-3" },
-          // weekday header
+          Card,
+          null,
           h(
-            "div",
-            { className: "cal-grid" },
-            WEEKDAYS.map(function (d) { return h("div", { key: d, className: "cal-weekday" }, d); })
-          ),
-          // day grid
+            CardContent,
+            { className: "p-3" },
+            h(SmallCalendar, {
+              cells: cells,
+              selectedKey: selectedKey,
+              loading: loading,
+              onSelectDate: function (d) { setSelectedDay(d); },
+            })
+          )
+        ),
+        h(
+          Card,
+          null,
           h(
-            "div",
-            { className: cn("cal-grid", loading && "opacity-50") },
-            cells.map(function (c) {
-              return h(DayCell, {
-                key: c.key,
-                date: c.date,
-                inMonth: c.inMonth,
-                isToday: c.isToday,
-                events: c.events,
-                onOpen: setOpenId,
-                onOpenDay: function (date, evs) { setOpenDay({ date: date, events: evs }); },
-              });
+            CardContent,
+            { className: "p-0" },
+            h(AgendaPanel, {
+              date: selectedDay,
+              events: selectedEvents,
+              onOpen: setOpenId,
             })
           )
         )
       ),
-
-      // legend
-      h(
-        "div",
-        { className: "flex items-center gap-4 flex-wrap text-xs opacity-60" },
-        h("span", null, h("span", { className: "cal-chip cal-chip-once", style: { padding: "1px 6px" } }, "one-time")),
-        h("span", null, h("span", { className: "cal-chip cal-chip-recurring", style: { padding: "1px 6px" } }, "recurring")),
-        h("span", null, "📝 has report"),
-        h("span", null, h("span", { className: "cal-status-glyph" }, "✓"), " confirmed"),
-        h("span", null, h("span", { className: "cal-status-glyph" }, "●"), " active timer"),
-        h("span", null, h("span", { className: "cal-status-glyph" }, "✗"), " missed")
-      ),
-
-      openDay ? h(DayModal, {
-        date: openDay.date,
-        events: openDay.events,
-        onOpenEvent: function (id) { setOpenDay(null); setOpenId(id); },
-        onClose: function () { setOpenDay(null); },
-      }) : null,
 
       openId ? h(DetailModal, {
         eventId: openId,
