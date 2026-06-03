@@ -184,8 +184,8 @@
     return h(
       "button",
       {
-        className: cn("cal-chip", ev.recurring ? "cal-chip-recurring" : "cal-chip-once"),
-        title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (eff !== "floating" ? " · " + (derived ? "missed (unconfirmed)" : eff) : "") + (ev.planning ? " · plan: " + ev.planning : ""),
+        className: cn("cal-chip", ev.recurring ? "cal-chip-recurring" : "cal-chip-once", ev.job && "cal-chip-job"),
+        title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (eff !== "floating" ? " · " + (derived ? "missed (unconfirmed)" : eff) : "") + (ev.planning ? " · plan: " + ev.planning : "") + (ev.job ? " · job: " + ev.job + (ev.category ? " (" + ev.category + ")" : "") : ""),
         onClick: function () { props.onOpen(ev.id); },
       },
       prefix,
@@ -264,8 +264,8 @@
                     "button",
                     {
                       key: ev.id + "@" + ev.occurrence_utc + i,
-                      className: cn("cal-chip cal-dayrow", ev.recurring ? "cal-chip-recurring" : "cal-chip-once"),
-                      title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (ev.planning ? " · plan: " + ev.planning : ""),
+                      className: cn("cal-chip cal-dayrow", ev.recurring ? "cal-chip-recurring" : "cal-chip-once", ev.job && "cal-chip-job"),
+                      title: ev.title + (ev.recurrence_human ? " · " + ev.recurrence_human : "") + (ev.planning ? " · plan: " + ev.planning : "") + (ev.job ? " · job: " + ev.job + (ev.category ? " (" + ev.category + ")" : "") : ""),
                       onClick: function () { props.onOpenEvent(ev.id); },
                     },
                     glyph ? h("span", { className: cn("cal-status-glyph", derived && "cal-status-derived") }, glyph) : null,

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from dateutil import parser as dtparser
 
 from . import digest as digest_mod
+from . import job_report as job_report_mod
 from . import notify
 from . import planning as planning_mod
 from . import recurrence as recurrence_mod
@@ -317,6 +318,8 @@ def _event_summary(ev: Dict) -> Dict:
         "owner": ev.get("owner"),
         "notify_email": ev.get("notify_email"),
         "planning": _planning_name_for(ev),
+        "job": ev.get("job"),
+        "category": ev.get("category"),
     }
 
 
@@ -403,6 +406,9 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
             "to the person this event is for (typically the asker)."
         )
 
+    category_raw = args.get("category")
+    category = (str(category_raw).strip() or None) if category_raw is not None else None
+
     d = {
         "title": title,
         "description": args.get("description"),
@@ -419,6 +425,7 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         "owner": owner,
         "notify_email": notify_email,
         "planning_id": planning_id,
+        "category": category,
     }
     try:
         event_id = store.add_event(d)
@@ -543,6 +550,10 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
         fields["notify_email"] = (
             (str(ne_raw).strip().lower() or None) if ne_raw is not None else None
         )
+
+    if "category" in args:
+        cat_raw = args["category"]
+        fields["category"] = (str(cat_raw).strip() or None) if cat_raw is not None else None
 
     if not fields:
         return tool_error("No updatable fields provided")
@@ -858,6 +869,13 @@ CALENDAR_ADD_EVENT_SCHEMA = {
             "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
             "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
             "planning": {"type": ["string", "null"], "description": _PLANNING_PARAM_DESCRIPTION},
+            "category": {
+                "type": "string",
+                "description": (
+                    "Optional free-text category to group this event for reports, "
+                    "e.g. 'work', 'personal', 'client-acme'."
+                ),
+            },
         },
         "required": ["title", "start", "owner"],
     },
@@ -913,6 +931,13 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
             },
             "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
             "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
+            "category": {
+                "type": "string",
+                "description": (
+                    "Optional free-text category to group this event for reports, "
+                    "e.g. 'work', 'personal', 'client-acme'."
+                ),
+            },
         },
         "required": ["id"],
     },
@@ -1217,10 +1242,13 @@ def _handle_calendar_set_status(args: Dict[str, Any], **kw) -> str:
     return tool_result({"id": event_id, "occurrence_utc": occ, "status": status})
 
 
-def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
+def _start_timer_impl(args: Dict[str, Any]) -> tuple:
+    """Core of calendar_start_timer. Returns (ok, payload): (True, result_dict)
+    on success or (False, error_message) on failure. Shared by
+    calendar_start_timer and calendar_resume_job."""
     title = str(args.get("title") or "").strip()
     if not title:
-        return tool_error("title is required")
+        return (False, "title is required")
 
     # Validate duration BEFORE creating the event so a bad value doesn't leave
     # an orphaned event behind, and the caller gets clear feedback.
@@ -1229,7 +1257,7 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
     if duration_raw is not None:
         duration_seconds = _parse_lead(duration_raw)
         if duration_seconds is None:
-            return tool_error(
+            return (False,
                 f"Couldn't understand duration {duration_raw!r} — use e.g. '2 hours', "
                 "'90 min', '1h30m', or omit it for an open-ended timer."
             )
@@ -1249,7 +1277,7 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
     owner_raw = args.get("owner")
     timer_owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
     if not timer_owner:
-        return tool_error(
+        return (False,
             "owner is required — every event (including timers) must belong to a "
             "user. Set 'owner' to the person this timer is for (typically the asker)."
         )
@@ -1258,6 +1286,23 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
         (str(notify_email_raw).strip().lower() or None)
         if notify_email_raw is not None else None
     )
+
+    job_raw = args.get("job")
+    timer_job = (str(job_raw).strip() or None) if job_raw is not None else None
+
+    category_raw = args.get("category")
+    timer_category = (str(category_raw).strip() or None) if category_raw is not None else None
+
+    # Auto-switch: stop any running timers for THIS owner before starting the new one.
+    existing_actives = store.list_active(owner=timer_owner)
+    switched_from: List[Dict[str, Any]] = []
+    for active_row in existing_actives:
+        stopped = _stop_active_row(active_row)
+        switched_from.append({
+            "id": stopped["id"],
+            "title": stopped["title"],
+            "duration_seconds": stopped["duration_seconds"],
+        })
 
     event_data = {
         "title": title,
@@ -1274,12 +1319,14 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
         "language": timer_language,
         "owner": timer_owner,
         "notify_email": timer_notify_email,
+        "job": timer_job,
+        "category": timer_category,
     }
     try:
         event_id = store.add_event(event_data)
     except Exception as e:
         logger.exception("calendar_start_timer store error")
-        return tool_error(f"Failed to create timer event: {e}")
+        return (False, f"Failed to create timer event: {e}")
 
     occ_iso = now.isoformat()
 
@@ -1309,33 +1356,87 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
     }
     if duration_seconds is not None:
         result["duration_seconds"] = duration_seconds
-    return tool_result(result)
+    if switched_from:
+        result["switched_from"] = switched_from
+        # Build human warning: list stopped jobs/titles
+        def _fmt_switched(s: Dict) -> str:
+            d = s.get("duration_seconds")
+            t = s.get("title") or s.get("id")
+            if d is not None:
+                m = max(0, round(d / 60))
+                return f"'{t}' ({m}m)"
+            return f"'{t}'"
+        stopped_labels = ", ".join(_fmt_switched(s) for s in switched_from)
+        result["warning"] = f"Stopped running job {stopped_labels} and started '{title}'."
+    return (True, result)
 
 
-def _handle_calendar_stop_timer(args: Dict[str, Any], **kw) -> str:
-    given_id = str(args.get("id") or "").strip() or None
-    note = args.get("note")
+def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
+    ok, payload = _start_timer_impl(args)
+    return tool_result(payload) if ok else tool_error(payload)
 
-    actives = store.list_active()
 
-    if given_id:
-        row = next((r for r in actives if r["event_id"] == given_id), None)
-        if row is None:
-            return tool_error(f"No running timer found for event: {given_id}")
-    else:
-        if len(actives) == 0:
-            return tool_error("No running timer. Start one with calendar_start_timer.")
-        if len(actives) > 1:
-            lines = []
-            for r in actives:
-                ev = store.get_event(r["event_id"])
-                title = ev["title"] if ev else r["event_id"]
-                lines.append(f"  • {r['event_id']} — {title!r} (started {r.get('started_utc', '?')})")
+def _handle_calendar_resume_job(args: Dict[str, Any], **kw) -> str:
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error("owner is required — the user this job belongs to.")
+    job_raw = args.get("job")
+    job = (str(job_raw).strip() or None) if job_raw is not None else None
+    if not job:
+        return tool_error("job is required — the name of the job to resume.")
+
+    match = store.find_job_event(owner, job)
+    if match is None:
+        # No match: ask for the exact name and surface the existing jobs so the
+        # agent (or user) can pick the right spelling rather than silently
+        # creating a near-duplicate job that won't aggregate.
+        try:
+            existing = store.list_jobs(owner)
+        except Exception:
+            existing = []
+        names = sorted({j["job"] for j in existing if j.get("job")})
+        if names:
+            listed = ", ".join(repr(n) for n in names)
             return tool_error(
-                "Multiple active timers — pass 'id' to specify which to stop:\n" + "\n".join(lines)
+                f"No job named {job!r} found for {owner}. Existing jobs: {listed}. "
+                "Ask the user which one to resume, then call again with the exact name."
             )
-        row = actives[0]
+        return tool_error(
+            f"No tracked job named {job!r} for {owner}, and this user has no jobs yet. "
+            "Use calendar_start_timer to begin a brand-new job."
+        )
 
+    # Reuse the EXACT stored job spelling + its category/title so the resumed
+    # session aggregates with the prior ones. Explicit args still override.
+    start_args: Dict[str, Any] = {
+        "owner": owner,
+        "job": match.get("job") or job,
+        "title": args.get("title") or match.get("title") or match.get("job"),
+        "category": args.get("category") if args.get("category") is not None else match.get("category"),
+    }
+    if args.get("duration") is not None:
+        start_args["duration"] = args["duration"]
+    if args.get("description") is not None:
+        start_args["description"] = args["description"]
+
+    ok, payload = _start_timer_impl(start_args)
+    if not ok:
+        return tool_error(payload)
+    payload["resumed"] = True
+    payload["resumed_from"] = {
+        "job": match.get("job"),
+        "category": match.get("category"),
+        "last_session_utc": match.get("start_utc"),
+    }
+    return tool_result(payload)
+
+
+def _stop_active_row(row: Dict[str, Any], note: Optional[str] = None) -> Dict[str, Any]:
+    """Stop one active timer row: confirm it, record measured duration.
+
+    Returns a dict with id, title, started_utc, ended_utc, duration_seconds.
+    """
     event_id = row["event_id"]
     occ_iso = row["occurrence_utc"]
     started_iso = row.get("started_utc")
@@ -1361,15 +1462,50 @@ def _handle_calendar_stop_timer(args: Dict[str, Any], **kw) -> str:
 
     ev = store.get_event(event_id)
     title = ev["title"] if ev else event_id
-
-    result: Dict[str, Any] = {
+    return {
         "id": event_id,
         "title": title,
         "started_utc": started_iso,
         "ended_utc": now.isoformat(),
+        "duration_seconds": measured,
     }
-    if measured is not None:
-        result["duration_seconds"] = measured
+
+
+def _handle_calendar_stop_timer(args: Dict[str, Any], **kw) -> str:
+    given_id = str(args.get("id") or "").strip() or None
+    note = args.get("note")
+    owner_raw = args.get("owner")
+    scope_owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+
+    actives = store.list_active(owner=scope_owner)
+
+    if given_id:
+        row = next((r for r in actives if r["event_id"] == given_id), None)
+        if row is None:
+            return tool_error(f"No running timer found for event: {given_id}")
+    else:
+        if len(actives) == 0:
+            return tool_error("No running timer. Start one with calendar_start_timer.")
+        if len(actives) > 1:
+            lines = []
+            for r in actives:
+                ev = store.get_event(r["event_id"])
+                title = ev["title"] if ev else r["event_id"]
+                lines.append(f"  • {r['event_id']} — {title!r} (started {r.get('started_utc', '?')})")
+            return tool_error(
+                "Multiple active timers — pass 'id' to specify which to stop:\n" + "\n".join(lines)
+            )
+        row = actives[0]
+
+    stopped = _stop_active_row(row, note=note)
+    result: Dict[str, Any] = {
+        "id": stopped["id"],
+        "title": stopped["title"],
+        "started_utc": stopped["started_utc"],
+        "ended_utc": stopped["ended_utc"],
+    }
+    if stopped["duration_seconds"] is not None:
+        result["duration_seconds"] = stopped["duration_seconds"]
     return tool_result(result)
 
 
@@ -1424,7 +1560,11 @@ CALENDAR_START_TIMER_SCHEMA = {
         "If you provide a 'duration' (e.g. '2 hours', '90 min') the block is fully fixed and "
         "marked confirmed immediately. If you omit duration the timer runs open-ended — stop it "
         "later with calendar_stop_timer to record the measured elapsed time. "
-        "No reminder is set (alert_channel=none) since you're already doing the task."
+        "No reminder is set (alert_channel=none) since you're already doing the task. "
+        "IMPORTANT: only ONE timer can run at a time per user. Starting a new timer when one is "
+        "already running AUTO-STOPS the running one (records its measured duration) and starts the "
+        "new one. The result will include a 'warning' and 'switched_from' list when this happens. "
+        "Use 'job' to tag this timer to a named work-stream for time-tracking reports."
     ),
     "parameters": {
         "type": "object",
@@ -1435,6 +1575,21 @@ CALENDAR_START_TIMER_SCHEMA = {
                 "description": (
                     "Optional fixed duration, e.g. '2 hours', '90 min', '45 minutes', '1 hour 30 min'. "
                     "If omitted the timer is open-ended and must be stopped with calendar_stop_timer."
+                ),
+            },
+            "job": {
+                "type": "string",
+                "description": (
+                    "The job/work-stream this timer logs time against — used for time-tracking reports, "
+                    "e.g. 'client-acme', 'thesis-writing'. Free text; reuse the same string to "
+                    "accumulate time across sessions."
+                ),
+            },
+            "category": {
+                "type": "string",
+                "description": (
+                    "Optional free-text category to group this work for reports, "
+                    "e.g. 'work', 'personal', 'client-acme'."
                 ),
             },
             "description": {"type": "string", "description": "Optional notes about what is being worked on."},
@@ -1471,7 +1626,8 @@ CALENDAR_STOP_TIMER_SCHEMA = {
         "If there are multiple active timers, pass 'id' to specify which one to stop "
         "(the tool will list the choices if you omit id and multiple are running). "
         "The timer's occurrence is marked 'confirmed' and the duration in seconds is stored. "
-        "An optional 'note' (what was accomplished, blockers, etc.) is saved alongside."
+        "An optional 'note' (what was accomplished, blockers, etc.) is saved alongside. "
+        "Pass 'owner' to scope the active-timer lookup to a specific user."
     ),
     "parameters": {
         "type": "object",
@@ -1487,7 +1643,63 @@ CALENDAR_STOP_TIMER_SCHEMA = {
                 "type": "string",
                 "description": "Optional note about what was accomplished or why the timer is stopping.",
             },
+            "owner": {
+                "type": "string",
+                "description": (
+                    _OWNER_DESCRIPTION
+                    + " When provided, only this user's active timers are considered as the "
+                    "'current running timer'. Omit to consider all users' timers globally."
+                ),
+            },
         },
+    },
+}
+
+CALENDAR_RESUME_JOB_SCHEMA = {
+    "name": "calendar_resume_job",
+    "description": (
+        "Resume tracking time on an EXISTING job — starts a fresh timer session that reuses the "
+        "job's exact stored name and category, so the new session aggregates with the previous "
+        "ones in reports (rather than creating a near-duplicate job). Use this whenever the user "
+        "wants to continue/resume a job they worked on before ('resume client-acme', 'start the "
+        "thesis work again', 'continue yesterday's refactor'). Like calendar_start_timer this "
+        "auto-stops the user's currently running timer (the result reports it via 'warning'/"
+        "'switched_from'). If the given job name does not match an existing job for the user, the "
+        "tool returns the list of existing jobs and asks you to confirm the exact name with the "
+        "user — do NOT invent a new job here; use calendar_start_timer for genuinely new jobs. "
+        "Provide an optional 'duration' for a fixed block, otherwise the session is open-ended "
+        "and stopped later with calendar_stop_timer."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "job": {
+                "type": "string",
+                "description": (
+                    "The name of the job to resume. Matched case-insensitively against the "
+                    "user's existing jobs; the exact stored spelling is reused so sessions "
+                    "aggregate. If unsure of the exact name, call calendar_list_jobs first."
+                ),
+            },
+            "duration": {
+                "type": "string",
+                "description": (
+                    "Optional fixed duration, e.g. '2 hours', '90 min'. Omit for an open-ended "
+                    "session stopped later with calendar_stop_timer."
+                ),
+            },
+            "title": {
+                "type": "string",
+                "description": "Optional title for this session. Defaults to the prior session's title.",
+            },
+            "category": {
+                "type": "string",
+                "description": "Optional category override. Defaults to the job's existing category.",
+            },
+            "description": {"type": "string", "description": "Optional notes about this session."},
+        },
+        "required": ["owner", "job"],
     },
 }
 
@@ -1978,6 +2190,292 @@ CALENDAR_DIGEST_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Job tracking tools
+# ---------------------------------------------------------------------------
+
+def _handle_calendar_list_jobs(args: Dict[str, Any], **kw) -> str:
+    owner = str(args.get("owner") or "").strip()
+    if not owner:
+        return tool_error("owner is required")
+
+    from_raw = args.get("from")
+    to_raw = args.get("to")
+    start_iso: Optional[str] = None
+    end_iso: Optional[str] = None
+    if from_raw and to_raw:
+        from_dt = _parse_start(from_raw, recurrence_mod.DEFAULT_TZ)
+        to_dt = _parse_start(to_raw, recurrence_mod.DEFAULT_TZ)
+        if from_dt is None:
+            return tool_error(f"Could not parse 'from': {from_raw!r}")
+        if to_dt is None:
+            return tool_error(f"Could not parse 'to': {to_raw!r}")
+        start_iso = from_dt.astimezone(timezone.utc).isoformat()
+        end_iso = to_dt.astimezone(timezone.utc).isoformat()
+
+    try:
+        jobs = store.list_jobs(owner, start_iso=start_iso, end_iso=end_iso)
+    except Exception as e:
+        logger.exception("calendar_list_jobs store error")
+        return tool_error(f"Failed to list jobs: {e}")
+
+    return tool_result({"owner": owner, "count": len(jobs), "jobs": jobs})
+
+
+def _resolve_period_window(
+    period: Optional[str],
+    date_raw: Optional[str],
+    tz_name: str,
+) -> Optional[tuple]:
+    """Compute (start_utc_iso, end_utc_iso) for a named period anchored on date_raw (or now).
+
+    Returns None on failure. period must be one of daily/weekly/monthly/yearly.
+    """
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        try:
+            tz = ZoneInfo(recurrence_mod.DEFAULT_TZ)
+        except Exception:
+            tz = timezone.utc
+
+    if date_raw:
+        anchor_dt = _parse_start(date_raw, tz_name)
+        if anchor_dt is None:
+            return None
+        anchor_local = anchor_dt.astimezone(tz)
+    else:
+        anchor_local = datetime.now(tz)
+
+    d = anchor_local
+    if period == "daily":
+        start_local = d.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_local = start_local + timedelta(days=1)
+    elif period == "weekly":
+        # Week starts on Monday.
+        start_local = (d - timedelta(days=d.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        end_local = start_local + timedelta(weeks=1)
+    elif period == "monthly":
+        import calendar as _cal
+        start_local = d.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # First day of the month + (days in month) = first day of next month.
+        last_day = _cal.monthrange(d.year, d.month)[1]
+        end_local = start_local + timedelta(days=last_day)
+    elif period == "yearly":
+        start_local = d.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_local = start_local.replace(year=d.year + 1)
+    else:
+        return None
+
+    start_utc = start_local.astimezone(timezone.utc).isoformat()
+    end_utc = end_local.astimezone(timezone.utc).isoformat()
+    return start_utc, end_utc
+
+
+def _handle_calendar_job_summary(args: Dict[str, Any], **kw) -> str:
+    owner = str(args.get("owner") or "").strip()
+    if not owner:
+        return tool_error("owner is required")
+
+    # Resolve timezone for the owner (use tz arg or default).
+    tz_name = str(args.get("tz") or recurrence_mod.DEFAULT_TZ)
+    category_raw = args.get("category")
+    category = (str(category_raw).strip() or None) if category_raw is not None else None
+    lang_raw = args.get("language")
+    lang = str(lang_raw).strip().lower() if lang_raw else "en"
+    if lang not in ("en", "fr"):
+        lang = "en"
+
+    # Resolve the time window.
+    period = str(args.get("period") or "").strip().lower() or None
+    date_raw = args.get("date")
+    from_raw = args.get("from")
+    to_raw = args.get("to")
+    period_label: Optional[str] = None
+    start_utc: Optional[str] = None
+    end_utc: Optional[str] = None
+
+    if period:
+        result_window = _resolve_period_window(period, date_raw, tz_name)
+        if result_window is None:
+            return tool_error(
+                f"Could not compute window for period={period!r}. "
+                "Use one of: daily, weekly, monthly, yearly."
+            )
+        start_utc, end_utc = result_window
+        period_label = period.capitalize()
+        if date_raw:
+            period_label += f" ({date_raw[:10]})"
+    elif from_raw and to_raw:
+        from_dt = _parse_start(from_raw, tz_name)
+        to_dt = _parse_start(to_raw, tz_name)
+        if from_dt is None:
+            return tool_error(f"Could not parse 'from': {from_raw!r}")
+        if to_dt is None:
+            return tool_error(f"Could not parse 'to': {to_raw!r}")
+        start_utc = from_dt.astimezone(timezone.utc).isoformat()
+        end_utc = to_dt.astimezone(timezone.utc).isoformat()
+        period_label = f"{start_utc[:10]} – {end_utc[:10]}"
+    else:
+        return tool_error(
+            "Provide either 'period' (daily/weekly/monthly/yearly) "
+            "or both 'from' and 'to' datetime strings."
+        )
+
+    try:
+        summary = job_report_mod.build_job_summary(
+            owner, start_utc, end_utc, tz_name,
+            category=category, period_label=period_label,
+        )
+    except Exception as e:
+        logger.exception("calendar_job_summary build error")
+        return tool_error(f"Failed to build job summary: {e}")
+
+    report_text = job_report_mod.render_text(summary)
+
+    result: Dict[str, Any] = {
+        "owner": owner,
+        "period_label": period_label,
+        "start_utc": start_utc,
+        "end_utc": end_utc,
+        "total_seconds": summary["total_seconds"],
+        "count": summary["count"],
+        "jobs": summary["jobs"],
+        "categories": summary["categories"],
+        "report_text": report_text,
+    }
+
+    do_email = bool(args.get("email", False))
+    if do_email:
+        owner_email = store.get_user_email(owner)
+        if not owner_email:
+            result["emailed"] = False
+            result["email_error"] = "no registered email for this owner"
+        else:
+            allowed = notify.allowed_email_recipients()
+            if owner_email.lower() not in allowed:
+                result["emailed"] = False
+                result["email_error"] = "owner email not allowlisted"
+            else:
+                html_doc = job_report_mod.render_html(summary)
+                pdf = job_report_mod.render_pdf(summary, lang=lang)
+                subject = job_report_mod.report_subject(summary, lang=lang)
+                attachments = None
+                if pdf:
+                    import re as _re
+                    safe_owner = _re.sub(r"[^A-Za-z0-9]+", "-", owner).strip("-").lower() or "owner"
+                    fname = f"job-summary-{safe_owner}.pdf"
+                    attachments = [(fname, pdf, "pdf")]
+                fire_result = notify.fire(
+                    "email",
+                    subject,
+                    report_text,
+                    target=owner_email,
+                    attachments=attachments,
+                    html=html_doc,
+                )
+                result["emailed"] = fire_result.get("ok", False)
+                result["pdf_attached"] = bool(pdf and fire_result.get("ok"))
+                result["email_error"] = fire_result.get("error")
+
+    return tool_result(result)
+
+
+CALENDAR_LIST_JOBS_SCHEMA = {
+    "name": "calendar_list_jobs",
+    "description": (
+        "List distinct tracked jobs for an owner, each with total time, session count, "
+        "category, and last-active timestamp. Useful to see which work-streams exist before "
+        "asking for a detailed summary. Optionally bounded to a time window when both 'from' "
+        "and 'to' are given."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "from": {
+                "type": "string",
+                "description": "Window start (ISO datetime). Both 'from' and 'to' must be given to apply a window.",
+            },
+            "to": {
+                "type": "string",
+                "description": "Window end (ISO datetime). Both 'from' and 'to' must be given to apply a window.",
+            },
+            "category": {
+                "type": "string",
+                "description": "Filter to a specific category (case-insensitive). Omit for all categories.",
+            },
+        },
+        "required": ["owner"],
+    },
+}
+
+CALENDAR_JOB_SUMMARY_SCHEMA = {
+    "name": "calendar_job_summary",
+    "description": (
+        "Compute a time-tracking summary: how much total time was logged per job and per category "
+        "in a given period. Use this when the user asks 'how many hours did I spend on X this "
+        "week/month', 'show me my time by category for June', 'what did I work on this week', etc. "
+        "Supply EITHER 'period' (daily/weekly/monthly/yearly, anchored on 'date' or now) OR explicit "
+        "'from'/'to' datetime bounds. Optionally filter by 'category'. Set email=true to send a styled "
+        "HTML report (with PDF if weasyprint is available) to the owner's registered email address."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "period": {
+                "type": "string",
+                "enum": ["daily", "weekly", "monthly", "yearly"],
+                "description": (
+                    "Named period containing the anchor date (or today if 'date' is omitted). "
+                    "'weekly' = Monday-to-Sunday week. Mutually exclusive with 'from'/'to'."
+                ),
+            },
+            "date": {
+                "type": "string",
+                "description": (
+                    "Anchor date for the period, e.g. '2026-06-03'. Defaults to today. "
+                    "Only used when 'period' is given."
+                ),
+            },
+            "from": {
+                "type": "string",
+                "description": "Explicit window start (ISO datetime). Use with 'to'; mutually exclusive with 'period'.",
+            },
+            "to": {
+                "type": "string",
+                "description": "Explicit window end (ISO datetime). Use with 'from'; mutually exclusive with 'period'.",
+            },
+            "category": {
+                "type": "string",
+                "description": "Filter to a specific category (case-insensitive). Omit for all categories.",
+            },
+            "email": {
+                "type": "boolean",
+                "description": "If true, email the report to the owner's registered allowlisted address. Default false.",
+            },
+            "language": {
+                "type": "string",
+                "enum": ["en", "fr"],
+                "description": "Language for the report/email subject. Default 'en'.",
+            },
+            "tz": {
+                "type": "string",
+                "description": (
+                    f"IANA timezone for interpreting 'period' boundaries, e.g. 'Indian/Antananarivo'. "
+                    f"Defaults to {recurrence_mod.DEFAULT_TZ}."
+                ),
+            },
+        },
+        "required": ["owner"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -1993,6 +2491,7 @@ _TOOLS = (
     ("calendar_set_status",   CALENDAR_SET_STATUS_SCHEMA,   _handle_calendar_set_status,   "✅"),
     ("calendar_start_timer",  CALENDAR_START_TIMER_SCHEMA,  _handle_calendar_start_timer,  "⏱️"),
     ("calendar_stop_timer",   CALENDAR_STOP_TIMER_SCHEMA,   _handle_calendar_stop_timer,   "⏹️"),
+    ("calendar_resume_job",   CALENDAR_RESUME_JOB_SCHEMA,   _handle_calendar_resume_job,   "▶️"),
     ("calendar_set_user_email",   CALENDAR_SET_USER_EMAIL_SCHEMA,   _handle_calendar_set_user_email,   "📧"),
     ("calendar_list_user_emails", CALENDAR_LIST_USER_EMAILS_SCHEMA, _handle_calendar_list_user_emails, "📇"),
     ("calendar_create_planning",  CALENDAR_CREATE_PLANNING_SCHEMA,  _handle_calendar_create_planning,  "📋"),
@@ -2001,6 +2500,8 @@ _TOOLS = (
     ("calendar_planning_report",  CALENDAR_PLANNING_REPORT_SCHEMA,  _handle_calendar_planning_report,  "📊"),
     ("calendar_remove_planning",  CALENDAR_REMOVE_PLANNING_SCHEMA,  _handle_calendar_remove_planning,  "🗑️"),
     ("calendar_digest",           CALENDAR_DIGEST_SCHEMA,           _handle_calendar_digest,           "🗞️"),
+    ("calendar_list_jobs",        CALENDAR_LIST_JOBS_SCHEMA,        _handle_calendar_list_jobs,        "🧰"),
+    ("calendar_job_summary",      CALENDAR_JOB_SUMMARY_SCHEMA,      _handle_calendar_job_summary,      "📊"),
 )
 
 
