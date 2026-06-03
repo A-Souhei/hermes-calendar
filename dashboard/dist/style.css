@@ -86,7 +86,17 @@
    distinguishes recurring vs one-time. Job events override this to blue below
    (`.cal-chip-job .cal-chip-title` is more specific, so it wins regardless of
    source order). */
-.cal-chip-title { overflow: hidden; text-overflow: ellipsis; color: #16a34a; }
+.cal-chip-title { overflow: hidden; text-overflow: ellipsis; color: #16a34a; min-width: 0; flex: 1 1 auto; }
+
+/* Logged duration shown on the right of a timer/job chip (mirrors the day
+   modal). Pushed right, muted, doesn't shrink — the title ellipsizes instead. */
+.cal-chip-dur {
+  margin-left: auto;
+  padding-left: 6px;
+  flex-shrink: 0;
+  opacity: 0.65;
+  font-variant-numeric: tabular-nums;
+}
 
 /* Job / time-tracking events stand out with a blue accent + bold blue title,
    so logged work reads distinctly from the green appointments. Placed after the
@@ -426,4 +436,56 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 200px;
+}
+
+/* ---- Resume job success inline message ----------------------------------- */
+
+.cal-resume-ok {
+  color: var(--color-success, var(--color-primary));
+}
+
+/* Live "Running" badge in a running session's detail — ticks each second. */
+.cal-running-live {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #16a34a;
+  border: 1px solid #16a34a;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* "Running now" banner — names the live session(s) with a ticking clock.
+   Explicit vertical margin so it stands free of the stat cards below it
+   (don't rely solely on the parent's space-y utility). */
+.cal-running-banner-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 12px; }
+.cal-running-banner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(22, 163, 74, 0.10);
+  border: 1px solid #16a34a;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.cal-running-banner:hover { filter: brightness(1.12); }
+.cal-running-dot { color: #16a34a; }
+.cal-running-label {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #16a34a;
+  font-weight: 700;
+}
+.cal-running-name { font-weight: 600; }
+.cal-running-clock {
+  color: #16a34a;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  margin-left: 2px;
 }

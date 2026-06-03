@@ -73,6 +73,38 @@ hermes cron create "0 7 * * *" --name calendar-digest --no-agent \
 **On-demand tool:** `calendar_digest` builds (and optionally emails) the digest
 for a given owner from within the agent conversation.
 
+## User registry
+
+All calendar owners must be pre-registered in `~/.hermes/calendar-users.json`
+(or the path set by `$CALENDAR_USERS_FILE`). Creation tools
+(`calendar_add_event`, `calendar_start_timer`, `calendar_resume_job`,
+`calendar_create_planning`) **refuse unregistered owners** with a message
+naming the fix. The agent must never create a user on the fly — add them to the
+file first.
+
+**File format** — either a bare list or a `{"users": [...]}` wrapper; each
+entry is a string (name only) or a rich object:
+
+```json
+{
+  "users": [
+    { "name": "Alice",   "email": "alice@example.com", "language": "en" },
+    { "name": "Bob",     "email": "bob@example.com",   "language": "fr" },
+    { "name": "Charlie" }
+  ]
+}
+```
+
+Fields per entry:
+- `name` (**required**) — the owner identifier used in events.
+- `email` (optional) — also used as the email fallback if no `user_emails` DB
+  row exists for the person. The `user_emails` table (set via
+  `calendar_set_user_email`) always wins when both are present.
+- `language` (optional) — `"en"` or `"fr"`.
+
+Edits are picked up without restart (file mtime is checked on each call). A
+missing file or parse error returns an empty registry (all owners refused).
+
 ## Realtime jobs & time tracking
 
 ### One timer per user
@@ -123,7 +155,18 @@ silently creating a near-duplicate.
 Job/timer events render with a **blue accent and bold blue title** in the
 read-only Calendar tab, while regular appointments read in **green** —
 distinguishing logged work from calendar events at a glance. The event's `job`
-and `category` appear in the chip tooltip.
+and `category` appear in the chip tooltip, and also in the event detail modal.
+
+**Category filter** — a second `<select>` appears in the hero header when there
+are categories for the selected owner. Choosing a category narrows the calendar
+view to events in that category (ANDs with the existing owner filter). "All
+categories" (empty selection) shows everything.
+
+**Resume button** — job events (those with a `job` attribute) show a
+▶ Resume job button in the detail modal. Clicking it calls `POST /jobs/resume`,
+starts a new timer session with the same job + category (auto-stopping any
+currently running timer), and reloads the calendar view. No confirmation needed
+— just a click.
 
 ## Storage
 

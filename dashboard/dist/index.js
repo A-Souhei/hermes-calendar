@@ -67,6 +67,19 @@
     }
   }
 
+  // Live H:MM:SS clock since startedUtc (ticks visibly each second, unlike
+  // fmtDuration which collapses seconds past the first hour).
+  function fmtClock(startedUtc) {
+    if (!startedUtc) return null;
+    try {
+      var sec = Math.max(0, Math.floor((Date.now() - new Date(startedUtc).getTime()) / 1000));
+      var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+      return h + ":" + (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+    } catch (e) {
+      return null;
+    }
+  }
+
   // --- date helpers ---------------------------------------------------------
 
   function pad2(n) { return String(n).padStart(2, "0"); }
@@ -115,7 +128,40 @@
     return users;
   }
 
-  function useEvents(anchor, owner) {
+  function useCategories(owner) {
+    const [categories, setCategories] = useState([]);
+    useEffect(function () {
+      var url = API + "/categories";
+      if (owner) url += "?owner=" + encodeURIComponent(owner);
+      SDK.fetchJSON(url)
+        .then(function (data) { setCategories((data && data.categories) || []); })
+        .catch(function () { setCategories([]); });
+    }, [owner]);
+    return categories;
+  }
+
+  // Currently-running timers (optionally scoped to the selected owner). Polled
+  // every 10s so the banner appears/disappears as sessions start/stop, while
+  // the elapsed time itself ticks client-side from started_utc.
+  function useTimers(owner) {
+    const [timers, setTimers] = useState([]);
+    useEffect(function () {
+      let alive = true;
+      function load() {
+        var url = API + "/timers";
+        if (owner) url += "?owner=" + encodeURIComponent(owner);
+        SDK.fetchJSON(url)
+          .then(function (d) { if (alive) setTimers((d && d.timers) || []); })
+          .catch(function () { if (alive) setTimers([]); });
+      }
+      load();
+      var iv = setInterval(load, 10000);
+      return function () { alive = false; clearInterval(iv); };
+    }, [owner]);
+    return timers;
+  }
+
+  function useEvents(anchor, owner, category) {
     const [events, setEvents] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -130,6 +176,7 @@
       setError(null);
       var url = API + "/events?from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to);
       if (owner) url += "&owner=" + encodeURIComponent(owner);
+      if (category) url += "&category=" + encodeURIComponent(category);
       SDK.fetchJSON(url)
         .then(function (data) {
           setEvents((data && data.events) || []);
@@ -139,7 +186,7 @@
           setError((err && err.message) || "Failed to load events");
           setLoading(false);
         });
-    }, [anchor, owner]);
+    }, [anchor, owner, category]);
 
     useEffect(load, [load]);
     return { events, loading, error, reload: load };
@@ -190,7 +237,10 @@
       },
       prefix,
       planGlyph,
-      h("span", { className: "cal-chip-title" }, (ev.has_report ? "📝 " : "") + ev.title)
+      h("span", { className: "cal-chip-title" }, (ev.has_report ? "📝 " : "") + ev.title),
+      ev.duration_seconds != null
+        ? h("span", { className: "cal-chip-dur" }, fmtDuration(ev.duration_seconds))
+        : null
     );
   }
 
@@ -350,6 +400,15 @@
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [resuming, setResuming] = useState(false);
+    const [stopping, setStopping] = useState(false);
+    const [actionMsg, setActionMsg] = useState(null);
+    const [reloadTick, setReloadTick] = useState(0);
+    const [, setNowTick] = useState(0);
+
+    // Clear any action message only when switching to a different event (not on
+    // a reload, so a "Stopped"/"Started" confirmation survives the refetch).
+    useEffect(function () { setActionMsg(null); }, [id]);
 
     useEffect(function () {
       let alive = true;
@@ -359,10 +418,70 @@
         .then(function (d) { if (alive) { setData(d); setLoading(false); } })
         .catch(function (err) { if (alive) { setError((err && err.message) || "Failed to load"); setLoading(false); } });
       return function () { alive = false; };
-    }, [id]);
+    }, [id, reloadTick]);
+
+    // While a session is running, re-render every second so the elapsed time
+    // shown in the details ticks live. No interval is set up when idle.
+    useEffect(function () {
+      var active = data && data.statuses && data.statuses.some(function (s) {
+        return s.status === "active" && s.started_utc;
+      });
+      if (!active) return undefined;
+      var iv = setInterval(function () { setNowTick(function (t) { return t + 1; }); }, 1000);
+      return function () { clearInterval(iv); };
+    }, [data]);
+
+    function handleResume() {
+      if (!data || !data.job) return;
+      setResuming(true);
+      setActionMsg(null);
+      SDK.fetchJSON(API + "/jobs/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ owner: data.owner, job: data.job }),
+      })
+        .then(function (result) {
+          var msg = "▶ Started a new session";
+          if (result && result.warning) msg += " — " + result.warning;
+          setActionMsg({ ok: true, text: msg });
+          setResuming(false);
+          if (props.onResumed) props.onResumed();
+        })
+        .catch(function (err) {
+          setActionMsg({ ok: false, text: (err && err.message) || "Resume failed" });
+          setResuming(false);
+        });
+    }
+
+    function handleStop() {
+      if (!data || !data.id) return;
+      setStopping(true);
+      setActionMsg(null);
+      SDK.fetchJSON(API + "/jobs/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event_id: data.id }),
+      })
+        .then(function (result) {
+          var d = result && result.duration_seconds;
+          var msg = "■ Stopped" + (d != null ? " — logged " + (fmtDuration(d) || "0s") : "");
+          setActionMsg({ ok: true, text: msg });
+          setStopping(false);
+          setReloadTick(function (t) { return t + 1; });  // refetch: flips this event to confirmed
+          if (props.onResumed) props.onResumed();          // refresh the calendar grid
+        })
+        .catch(function (err) {
+          setActionMsg({ ok: false, text: (err && err.message) || "Stop failed" });
+          setStopping(false);
+        });
+    }
 
     const meeting = data && data.meeting;
     const tags = (data && data.tags) || [];
+    const activeRow = ((data && data.statuses) || []).filter(function (s) {
+      return s.status === "active" && s.started_utc;
+    })[0];
+    const activeStarted = activeRow ? activeRow.started_utc : null;
 
     return h(
       "div",
@@ -385,10 +504,40 @@
               h("h2", { className: "text-lg font-semibold leading-tight" }, data ? data.title : "Loading…"),
               data && data.recurrence_human
                 ? h(Badge, { variant: "secondary" }, "↻ " + data.recurrence_human)
+                : null,
+              activeStarted
+                ? h("span", { className: "cal-running-live" }, "● Running " + (fmtClock(activeStarted) || "0:00:00"))
                 : null
             ),
-            h(Button, { variant: "ghost", size: "sm", onClick: props.onClose }, "✕")
+            h(
+              "div",
+              { className: "flex items-center gap-2" },
+              // A running session shows Stop; a stopped job shows Resume.
+              activeStarted
+                ? h(Button, {
+                    variant: "destructive",
+                    size: "sm",
+                    onClick: handleStop,
+                    disabled: stopping,
+                    title: "Stop the running session and log its duration",
+                  }, stopping ? "…" : "■ Stop")
+                : (data && data.job
+                    ? h(Button, {
+                        variant: "outline",
+                        size: "sm",
+                        onClick: handleResume,
+                        disabled: resuming,
+                        title: "Resume this job (start a new session)",
+                      }, resuming ? "…" : "▶ Resume job")
+                    : null),
+              h(Button, { variant: "ghost", size: "sm", onClick: props.onClose }, "✕")
+            )
           ),
+          actionMsg
+            ? h("div", {
+                className: "text-sm " + (actionMsg.ok ? "cal-resume-ok" : "text-red-600"),
+              }, actionMsg.text)
+            : null,
 
           loading ? h("div", { className: "text-sm opacity-60 py-6" }, "Loading…") : null,
           error ? h("div", { className: "text-sm text-red-600 py-6" }, error) : null,
@@ -403,6 +552,12 @@
                   h(KV, { label: "When", value: fmtDateTime(data.start_utc, data.tz, data.all_day) + (data.all_day ? " (all day)" : "") }),
                   data.planning
                     ? h(KV, { label: "Planning", value: h(Badge, { variant: "secondary" }, "🗜️ " + data.planning) })
+                    : null,
+                  data.job
+                    ? h(KV, { label: "Job", value: data.job })
+                    : null,
+                  data.category
+                    ? h(KV, { label: "Category", value: data.category })
                     : null,
                   h(KV, { label: "Timezone", value: data.tz }),
                   h(KV, { label: "Location", value: data.location }),
@@ -457,7 +612,7 @@
                       h("div", { className: "text-sm font-semibold" }, "Status history (" + data.statuses.length + ")"),
                       data.statuses.map(function (s) {
                         var dur = s.duration_seconds != null ? fmtDuration(s.duration_seconds) : null;
-                        var running = s.status === "active" && s.started_utc ? fmtElapsed(s.started_utc) : null;
+                        var running = s.status === "active" && s.started_utc ? fmtClock(s.started_utc) : null;
                         return h(
                           "div",
                           { key: s.occurrence_utc, className: "rounded-md border p-3 space-y-1 text-sm" },
@@ -521,14 +676,49 @@
     );
   }
 
+  // Live "running now" banner: names the currently-running session(s) with a
+  // ticking elapsed clock. Owns its own 1s tick so only this re-renders.
+  function RunningBanner(props) {
+    const timers = props.timers || [];
+    const [, setTick] = useState(0);
+    useEffect(function () {
+      if (!timers.length) return undefined;
+      var iv = setInterval(function () { setTick(function (t) { return t + 1; }); }, 1000);
+      return function () { clearInterval(iv); };
+    }, [timers.length]);
+    if (!timers.length) return null;
+    return h(
+      "div",
+      { className: "cal-running-banner-row" },
+      timers.map(function (t, i) {
+        var label = t.title + (t.job ? " · " + t.job : "");
+        return h(
+          "button",
+          {
+            key: t.event_id + i,
+            className: "cal-running-banner",
+            title: "Open the running session",
+            onClick: function () { if (props.onOpen) props.onOpen(t.event_id); },
+          },
+          h("span", { className: "cal-running-dot" }, "●"),
+          h("span", { className: "cal-running-label" }, "Running"),
+          h("span", { className: "cal-running-name" }, label),
+          h("span", { className: "cal-running-clock" }, fmtClock(t.started_utc) || "0:00:00")
+        );
+      })
+    );
+  }
+
   // --- month-grid calendar view --------------------------------------------
 
   function CalendarView(props) {
     const owner = props.owner || null;
+    const category = props.category || null;
+    const timers = useTimers(owner);
     const [anchor, setAnchor] = useState(function () { return monthAnchor(new Date()); });
     const [openId, setOpenId] = useState(null);
     const [openDay, setOpenDay] = useState(null);
-    const { events, loading, error, reload } = useEvents(anchor, owner);
+    const { events, loading, error, reload } = useEvents(anchor, owner, category);
     const upcoming = useUpcoming(30, owner);
 
     const byDate = useMemo(function () {
@@ -606,6 +796,9 @@
           h(Button, { variant: "ghost", size: "sm", onClick: reload, title: "Refresh" }, "⟳")
         )
       ),
+
+      // currently-running session(s)
+      h(RunningBanner, { timers: timers, onOpen: setOpenId }),
 
       // at-a-glance stat cards
       h(
@@ -702,7 +895,11 @@
         onClose: function () { setOpenDay(null); },
       }) : null,
 
-      openId ? h(DetailModal, { eventId: openId, onClose: function () { setOpenId(null); } }) : null
+      openId ? h(DetailModal, {
+        eventId: openId,
+        onClose: function () { setOpenId(null); },
+        onResumed: reload,
+      }) : null
     );
   }
 
@@ -1020,8 +1217,11 @@
     const view = props.view;
     const setView = props.setView;
     const users = props.users || [];
+    const categories = props.categories || [];
     const selectedOwner = props.selectedOwner;
     const setSelectedOwner = props.setSelectedOwner;
+    const selectedCategory = props.selectedCategory;
+    const setSelectedCategory = props.setSelectedCategory;
     const isPlan = view === "plannings";
     return h(
       "div",
@@ -1063,6 +1263,21 @@
                 })
               )
             : null,
+          categories.length > 0
+            ? h(
+                "select",
+                {
+                  className: "cal-user-select",
+                  value: selectedCategory || "",
+                  onChange: function (e) { setSelectedCategory(e.target.value || null); },
+                  title: "Filter by category",
+                },
+                h("option", { value: "" }, "All categories"),
+                categories.map(function (c) {
+                  return h("option", { key: c, value: c }, c);
+                })
+              )
+            : null,
           h(
             "div",
             { className: "cal-tabs cal-hero-tabs" },
@@ -1091,7 +1306,9 @@
   function CalendarApp() {
     const [view, setView] = useState("calendar");
     const [selectedOwner, setSelectedOwner] = useState(null);
+    const [selectedCategory, setSelectedCategory] = useState(null);
     const users = useUsers();
+    const categories = useCategories(selectedOwner);
     return h(
       "div",
       null,
@@ -1099,12 +1316,15 @@
         view: view,
         setView: setView,
         users: users,
+        categories: categories,
         selectedOwner: selectedOwner,
         setSelectedOwner: setSelectedOwner,
+        selectedCategory: selectedCategory,
+        setSelectedCategory: setSelectedCategory,
       }),
       view === "plannings"
         ? h(PlanningsView, { owner: selectedOwner })
-        : h(CalendarView, { owner: selectedOwner })
+        : h(CalendarView, { owner: selectedOwner, category: selectedCategory })
     );
   }
 

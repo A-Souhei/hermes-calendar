@@ -376,6 +376,31 @@ def list_plannings(owner: Optional[str] = None) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def list_categories(owner: Optional[str] = None) -> List[str]:
+    """Distinct non-empty categories across events, sorted case-insensitively.
+
+    When ``owner`` is given, only events belonging to that owner (case-
+    insensitive) are considered.
+    """
+    with _lock:
+        conn = _get_conn()
+        if owner is not None:
+            rows = conn.execute(
+                "SELECT DISTINCT category FROM events "
+                "WHERE category IS NOT NULL AND category != '' "
+                "AND owner COLLATE NOCASE = ? "
+                "ORDER BY category COLLATE NOCASE",
+                (owner,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT category FROM events "
+                "WHERE category IS NOT NULL AND category != '' "
+                "ORDER BY category COLLATE NOCASE"
+            ).fetchall()
+    return [r[0] for r in rows]
+
+
 def list_owners() -> List[str]:
     """Distinct, non-empty owners across events and plannings, sorted.
 
@@ -482,14 +507,27 @@ def set_user_email(name: str, email: str) -> None:
 
 
 def get_user_email(name: str) -> Optional[str]:
-    """Return the registered email for a name (lookup by lowercased name), or None."""
+    """Return the registered email for a name (lookup by lowercased name), or None.
+
+    Lookup order:
+    1. ``user_emails`` table (always wins — explicit DB association).
+    2. Registry fallback via ``users.registry_email`` (lazy import to avoid
+       load-order issues and keep the dashboard synthetic package clean).
+    """
     key = str(name).strip().lower()
     with _lock:
         conn = _get_conn()
         row = conn.execute(
             "SELECT email FROM user_emails WHERE name = ?", (key,)
         ).fetchone()
-    return row["email"] if row else None
+    if row:
+        return row["email"]
+    # Fall back to the users registry (calendar-users.json).
+    try:
+        from . import users
+        return users.registry_email(name)
+    except Exception:
+        return None
 
 
 def list_user_emails() -> List[Dict[str, Any]]:

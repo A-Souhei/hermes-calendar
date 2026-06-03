@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 router = APIRouter()
 
@@ -61,12 +62,24 @@ def _load_plugin_modules():
         spec.loader.exec_module(mod)
         return mod
 
-    # store + recurrence must be imported before planning (planning relative-
-    # imports both); planning is dependency-light (no notify/tools.registry).
-    return _sub("store"), _sub("recurrence"), _sub("planning")
+    # Load order matters: store + recurrence first (planning + timers import them);
+    # users next (timers is independent of users but users is dependency-light);
+    # timers last (it imports store + recurrence).
+    _sub("store")
+    _sub("recurrence")
+    _sub("planning")
+    _sub("users")
+    _sub("timers")
+    return (
+        _sub("store"),
+        _sub("recurrence"),
+        _sub("planning"),
+        _sub("users"),
+        _sub("timers"),
+    )
 
 
-store, recurrence, planning = _load_plugin_modules()
+store, recurrence, planning, users, timers = _load_plugin_modules()
 
 
 def _planning_name_for(ev: Dict[str, Any]) -> Optional[str]:
@@ -189,10 +202,16 @@ def _occurrences_in_range(
     start_utc: datetime,
     end_utc: datetime,
     owner: Optional[str] = None,
+    category: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     now = datetime.now(timezone.utc)
     for ev in store.list_events(owner=owner):
+        # Category filter: skip events whose category doesn't match (case-insensitive).
+        if category is not None:
+            ev_cat = (ev.get("category") or "").strip().lower()
+            if ev_cat != category.strip().lower():
+                continue
         ev_local = dict(ev)
         try:
             ev_local["_exceptions"] = store.get_exceptions(ev["id"])
@@ -256,15 +275,78 @@ def list_users():
         return {"users": []}
 
 
+@router.get("/categories")
+def list_categories(owner: Optional[str] = Query(None)):
+    """Distinct non-empty categories across events (for the category-filter UI)."""
+    try:
+        return {"categories": store.list_categories(owner=owner or None)}
+    except Exception:
+        return {"categories": []}
+
+
+class ResumeJobRequest(BaseModel):
+    owner: str
+    job: str
+
+
+@router.post("/jobs/resume")
+def resume_job(body: ResumeJobRequest):
+    """Start a new timer session resuming an existing job (same job + category).
+
+    Auth is handled by the dashboard session-token middleware — no per-route auth.
+    """
+    if not body.owner or not body.owner.strip():
+        raise HTTPException(400, detail="owner is required")
+    if not body.job or not body.job.strip():
+        raise HTTPException(400, detail="job is required")
+
+    owner = body.owner.strip()
+    job = body.job.strip()
+
+    if not users.is_registered(owner):
+        raise HTTPException(403, detail=(
+            f"{owner!r} is not a registered calendar user. Users must be registered "
+            "beforehand in ~/.hermes/calendar-users.json — add them there first."
+        ))
+
+    res = timers.resume_job(owner, job)
+    if not res["ok"]:
+        raise HTTPException(404, detail={
+            "message": f"No job named {job!r} for {owner}.",
+            "existing_jobs": res.get("existing_jobs", []),
+        })
+    return res["result"]
+
+
+class StopJobRequest(BaseModel):
+    event_id: str
+
+
+@router.post("/jobs/stop")
+def stop_job(body: StopJobRequest):
+    """Stop the running session of a specific event (the dashboard stop button).
+
+    Auth is handled by the dashboard session-token middleware. Stopping an
+    existing event creates nothing, so no registry check is needed here.
+    """
+    if not body.event_id or not body.event_id.strip():
+        raise HTTPException(400, detail="event_id is required")
+    res = timers.stop_event(body.event_id.strip())
+    if res is None:
+        raise HTTPException(404, detail="no running session for this event")
+    return res
+
+
 @router.get("/events")
 def list_events(
     frm: Optional[str] = Query(None, alias="from"),
     to: Optional[str] = Query(None),
     owner: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
 ):
     """Expanded occurrences in [from, to) (default: current month)."""
     start, end = _parse_range(frm, to)
-    return {"events": _occurrences_in_range(start, end, owner=owner or None)}
+    return {"events": _occurrences_in_range(start, end, owner=owner or None, category=category or None)}
 
 
 @router.get("/upcoming")
@@ -351,12 +433,14 @@ def event_detail(event_id: str):
 
 
 @router.get("/timers")
-def list_timers():
-    """Active (running) timers — occurrence_status rows where status='active'."""
+def list_timers(owner: Optional[str] = Query(None)):
+    """Active (running) timers — occurrence_status rows where status='active'.
+
+    Optionally scoped to one owner (matching the dashboard's user filter)."""
     now = datetime.now(timezone.utc)
     rows = []
     try:
-        actives = store.list_active()
+        actives = store.list_active(owner=owner or None)
     except Exception:
         actives = []
     for row in actives:
@@ -379,6 +463,9 @@ def list_timers():
             "event_id": row["event_id"],
             "occurrence_utc": row["occurrence_utc"],
             "title": ev["title"] if ev else row["event_id"],
+            "owner": ev.get("owner") if ev else None,
+            "job": ev.get("job") if ev else None,
+            "category": ev.get("category") if ev else None,
             "started_utc": started_iso,
             "elapsed_seconds": elapsed,
         })
