@@ -258,7 +258,7 @@ def list_events(owner: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = _get_conn()
         if owner is not None:
             rows = conn.execute(
-                "SELECT * FROM events WHERE owner = ? COLLATE NOCASE ORDER BY start_utc",
+                "SELECT * FROM events WHERE owner COLLATE NOCASE = ? ORDER BY start_utc",
                 (owner,),
             ).fetchall()
         else:
@@ -338,7 +338,7 @@ def get_planning_by_name(name: str, owner: Optional[str] = None) -> Optional[Dic
         conn = _get_conn()
         if owner is not None:
             row = conn.execute(
-                "SELECT * FROM plannings WHERE LOWER(name) = ? AND owner = ? COLLATE NOCASE "
+                "SELECT * FROM plannings WHERE LOWER(name) = ? AND owner COLLATE NOCASE = ? "
                 "ORDER BY created_utc DESC LIMIT 1",
                 (key, owner),
             ).fetchone()
@@ -356,7 +356,7 @@ def list_plannings(owner: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = _get_conn()
         if owner is not None:
             rows = conn.execute(
-                "SELECT * FROM plannings WHERE owner = ? COLLATE NOCASE ORDER BY period_start_utc",
+                "SELECT * FROM plannings WHERE owner COLLATE NOCASE = ? ORDER BY period_start_utc",
                 (owner,),
             ).fetchall()
         else:
