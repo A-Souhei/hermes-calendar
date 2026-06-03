@@ -366,6 +366,23 @@ def list_plannings(owner: Optional[str] = None) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def list_owners() -> List[str]:
+    """Distinct, non-empty owners across events and plannings, sorted.
+
+    Public helper for callers (e.g. the dashboard user-filter) that need the
+    set of users without reaching into this module's connection/lock internals.
+    """
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT owner FROM events WHERE owner IS NOT NULL AND owner != '' "
+            "UNION "
+            "SELECT DISTINCT owner FROM plannings WHERE owner IS NOT NULL AND owner != '' "
+            "ORDER BY owner"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
 def update_planning(planning_id: str, fields: Dict[str, Any]) -> bool:
     """Update only the provided keys. Bumps updated_utc. Returns False if no row matched."""
     if not fields:

@@ -273,8 +273,10 @@ def _human_recurrence(rec: Optional[Dict], tz_name: Optional[str] = None) -> Opt
 def _resolve_planning(id_or_name: Any, owner: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Resolve a planning by id first, then case-insensitive name.
 
-    When owner is provided the name lookup prefers that owner's planning so
-    two users can have plannings with the same name without colliding.
+    When owner is provided the name lookup is STRICTLY scoped to that owner
+    (no cross-owner fallback), so two users can have plannings with the same
+    name without one resolving the other's. Cross-user lookups still work
+    because the id lookup is tried first.
     """
     key = str(id_or_name or "").strip()
     if not key:

@@ -249,15 +249,7 @@ def _occurrences_in_range(
 def list_users():
     """Distinct owner values across events and plannings (for the user-filter UI)."""
     try:
-        with store._lock:
-            conn = store._get_conn()
-            rows = conn.execute(
-                "SELECT DISTINCT owner FROM events WHERE owner IS NOT NULL AND owner != '' "
-                "UNION "
-                "SELECT DISTINCT owner FROM plannings WHERE owner IS NOT NULL AND owner != '' "
-                "ORDER BY owner"
-            ).fetchall()
-        return {"users": [r[0] for r in rows]}
+        return {"users": store.list_owners()}
     except Exception:
         return {"users": []}
 
