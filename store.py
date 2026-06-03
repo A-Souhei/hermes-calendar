@@ -258,7 +258,7 @@ def list_events(owner: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = _get_conn()
         if owner is not None:
             rows = conn.execute(
-                "SELECT * FROM events WHERE owner = ? ORDER BY start_utc",
+                "SELECT * FROM events WHERE owner COLLATE NOCASE = ? ORDER BY start_utc",
                 (owner,),
             ).fetchall()
         else:
@@ -338,7 +338,7 @@ def get_planning_by_name(name: str, owner: Optional[str] = None) -> Optional[Dic
         conn = _get_conn()
         if owner is not None:
             row = conn.execute(
-                "SELECT * FROM plannings WHERE LOWER(name) = ? AND owner = ? "
+                "SELECT * FROM plannings WHERE LOWER(name) = ? AND owner COLLATE NOCASE = ? "
                 "ORDER BY created_utc DESC LIMIT 1",
                 (key, owner),
             ).fetchone()
@@ -356,7 +356,7 @@ def list_plannings(owner: Optional[str] = None) -> List[Dict[str, Any]]:
         conn = _get_conn()
         if owner is not None:
             rows = conn.execute(
-                "SELECT * FROM plannings WHERE owner = ? ORDER BY period_start_utc",
+                "SELECT * FROM plannings WHERE owner COLLATE NOCASE = ? ORDER BY period_start_utc",
                 (owner,),
             ).fetchall()
         else:
@@ -369,16 +369,21 @@ def list_plannings(owner: Optional[str] = None) -> List[Dict[str, Any]]:
 def list_owners() -> List[str]:
     """Distinct, non-empty owners across events and plannings, sorted.
 
-    Public helper for callers (e.g. the dashboard user-filter) that need the
-    set of users without reaching into this module's connection/lock internals.
+    Owners are collapsed case-insensitively (so 'Toavina' and 'toavina' are one
+    user, matching the case-insensitive owner filters); a single representative
+    casing is returned per person. Public helper for callers (e.g. the dashboard
+    user-filter) that need the set of users without reaching into this module's
+    connection/lock internals.
     """
     with _lock:
         conn = _get_conn()
         rows = conn.execute(
-            "SELECT DISTINCT owner FROM events WHERE owner IS NOT NULL AND owner != '' "
-            "UNION "
-            "SELECT DISTINCT owner FROM plannings WHERE owner IS NOT NULL AND owner != '' "
-            "ORDER BY owner"
+            "SELECT MIN(owner) AS owner FROM ("
+            "  SELECT owner FROM events    WHERE owner IS NOT NULL AND owner != '' "
+            "  UNION ALL "
+            "  SELECT owner FROM plannings WHERE owner IS NOT NULL AND owner != '' "
+            ") GROUP BY owner COLLATE NOCASE "
+            "ORDER BY owner COLLATE NOCASE"
         ).fetchall()
     return [r[0] for r in rows]
 
