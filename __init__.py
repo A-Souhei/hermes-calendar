@@ -206,10 +206,11 @@ _CHANNEL_DESCRIPTION = (
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 _OWNER_DESCRIPTION = (
-    "Name/identifier of the person this event belongs to (the asker). Set it "
-    "from who is making the request, and use a CONSISTENT identifier per person "
-    "so their email association resolves. Required for email reminders unless an "
-    "explicit notify_email is given."
+    "REQUIRED — the person this event belongs to (the asker). Every event must "
+    "have an owner so it appears on that person's calendar and nobody else's; "
+    "unassigned events are not allowed. Set it from who is making the request, "
+    "and use a CONSISTENT identifier per person (the same value each time) so "
+    "their events group together and their email association resolves."
 )
 
 _NOTIFY_EMAIL_DESCRIPTION = (
@@ -392,6 +393,13 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         if language is None and planning.get("language") in _LANGUAGE_ENUM:
             language = planning["language"]
 
+    # Every event must belong to a user — unassigned events are not allowed.
+    if not owner:
+        return tool_error(
+            "owner is required — every event must belong to a user. Set 'owner' "
+            "to the person this event is for (typically the asker)."
+        )
+
     d = {
         "title": title,
         "description": args.get("description"),
@@ -519,7 +527,13 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
 
     if "owner" in args:
         owner_raw = args["owner"]
-        fields["owner"] = (str(owner_raw).strip() or None) if owner_raw is not None else None
+        new_owner = str(owner_raw).strip() if owner_raw is not None else ""
+        if not new_owner:
+            return tool_error(
+                "owner cannot be cleared — every event must belong to a user. "
+                "Pass a valid owner, or omit 'owner' to leave it unchanged."
+            )
+        fields["owner"] = new_owner
 
     if "notify_email" in args:
         ne_raw = args["notify_email"]
@@ -838,11 +852,11 @@ CALENDAR_ADD_EVENT_SCHEMA = {
                 "enum": ["en", "fr", None],
                 "description": _LANGUAGE_DESCRIPTION,
             },
-            "owner": {"type": ["string", "null"], "description": _OWNER_DESCRIPTION},
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
             "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
             "planning": {"type": ["string", "null"], "description": _PLANNING_PARAM_DESCRIPTION},
         },
-        "required": ["title", "start"],
+        "required": ["title", "start", "owner"],
     },
 }
 
@@ -894,7 +908,7 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
                 "enum": ["en", "fr", None],
                 "description": _LANGUAGE_DESCRIPTION,
             },
-            "owner": {"type": ["string", "null"], "description": _OWNER_DESCRIPTION},
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
             "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
         },
         "required": ["id"],
@@ -1231,6 +1245,11 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
 
     owner_raw = args.get("owner")
     timer_owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not timer_owner:
+        return tool_error(
+            "owner is required — every event (including timers) must belong to a "
+            "user. Set 'owner' to the person this timer is for (typically the asker)."
+        )
     notify_email_raw = args.get("notify_email")
     timer_notify_email = (
         (str(notify_email_raw).strip().lower() or None)
@@ -1434,10 +1453,10 @@ CALENDAR_START_TIMER_SCHEMA = {
                 "enum": ["en", "fr", None],
                 "description": _LANGUAGE_DESCRIPTION,
             },
-            "owner": {"type": ["string", "null"], "description": _OWNER_DESCRIPTION},
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
             "notify_email": {"type": ["string", "null"], "description": _NOTIFY_EMAIL_DESCRIPTION},
         },
-        "required": ["title"],
+        "required": ["title", "owner"],
     },
 }
 

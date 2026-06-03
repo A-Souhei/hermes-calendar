@@ -327,10 +327,11 @@ def get_planning(planning_id: str) -> Optional[Dict[str, Any]]:
 def get_planning_by_name(name: str, owner: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Case-insensitive lookup by name.
 
-    When owner is given, returns that owner's matching planning first (most
-    recent). Falls back to any matching planning if the owner has none by that
-    name, so cross-user lookups by exact id still work. Returns None if no
-    match at all.
+    When owner is given, the match is STRICTLY scoped to that owner — no
+    cross-owner fallback — so one user can never resolve another user's
+    planning by name (which would let report/remove act on the wrong one).
+    Cross-user lookups by exact id are handled separately by the id lookup that
+    callers try first. Returns the most recent match, or None.
     """
     key = str(name).strip().lower()
     with _lock:
@@ -341,13 +342,12 @@ def get_planning_by_name(name: str, owner: Optional[str] = None) -> Optional[Dic
                 "ORDER BY created_utc DESC LIMIT 1",
                 (key, owner),
             ).fetchone()
-            if row is not None:
-                return dict(row)
-        row = conn.execute(
-            "SELECT * FROM plannings WHERE LOWER(name) = ? "
-            "ORDER BY created_utc DESC LIMIT 1",
-            (key,),
-        ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM plannings WHERE LOWER(name) = ? "
+                "ORDER BY created_utc DESC LIMIT 1",
+                (key,),
+            ).fetchone()
     return dict(row) if row else None
 
 
