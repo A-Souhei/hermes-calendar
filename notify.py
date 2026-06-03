@@ -31,7 +31,7 @@ import urllib.request
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,7 @@ def fire(
     message: str,
     target: Optional[str] = None,
     attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+    html: Optional[str] = None,
 ) -> dict:
     """Send a reminder.
 
@@ -123,8 +124,15 @@ def fire(
 
     attachments (email only): optional list of (filename, data_bytes,
     mime_subtype) tuples, e.g. ("planning-report.pdf", b"...", "pdf"). When
-    present the email is sent as a multipart message; otherwise a plain text
-    email is sent (unchanged behavior).
+    present the email includes those files as attachments.
+
+    html (email only): optional HTML body. When provided alongside `message`
+    (the plain-text fallback), the email is sent as multipart/alternative with
+    both parts so clients that cannot render HTML still receive readable text.
+    When both `html` and `attachments` are provided, the message is wrapped as
+    multipart/mixed containing the alternative part plus attachment parts.
+    When `html` is None, existing plain-text / attachment behavior is unchanged.
+
     Returns {"ok": bool, "status": int|None, "error": str|None}
     """
     if channel == "none":
@@ -147,7 +155,24 @@ def fire(
         if target.lower() not in allowed_email_recipients():
             return {"ok": False, "status": None, "error": "recipient not allowlisted"}
         try:
-            if attachments:
+            if html is not None:
+                # Build a multipart/alternative part with plain + HTML variants.
+                alt = MIMEMultipart("alternative")
+                alt.attach(MIMEText(message, "plain", _charset="utf-8"))
+                alt.attach(MIMEText(html, "html", _charset="utf-8"))
+                if attachments:
+                    # Wrap alternative inside multipart/mixed for attachments.
+                    mime: Any = MIMEMultipart("mixed")
+                    mime.attach(alt)
+                    for fname, data, subtype in attachments:
+                        part = MIMEApplication(data, _subtype=subtype)
+                        part.add_header(
+                            "Content-Disposition", "attachment", filename=fname
+                        )
+                        mime.attach(part)
+                else:
+                    mime = alt
+            elif attachments:
                 mime = MIMEMultipart()
                 mime.attach(MIMEText(message, _charset="utf-8"))
                 for fname, data, subtype in attachments:

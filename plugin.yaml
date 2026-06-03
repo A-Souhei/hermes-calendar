@@ -24,3 +24,4 @@ provides_tools:
   - calendar_get_planning
   - calendar_planning_report
   - calendar_remove_planning
+  - calendar_digest

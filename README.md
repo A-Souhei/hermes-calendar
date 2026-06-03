@@ -49,6 +49,30 @@ the last tick (capped at `max_catchup_seconds`) so brief downtime still catches
 up; `fired_alerts` dedup guarantees each alert fires once. The in-gateway thread
 is a bonus for sub-minute responsiveness when the agent is active.
 
+## Daily digest
+
+A per-owner daily digest summarises the calendar events that need attention
+today, delivered as a styled HTML email with a plain-text fallback.
+
+**Always delivered.** When an owner has no events today the digest falls back
+to showing their single closest upcoming event, so the email is never empty.
+
+**Cron setup** — place `calendar_digest.py` in `~/.hermes/scripts/` and run:
+
+```
+hermes cron create "0 7 * * *" --name calendar-digest --no-agent \
+    --script calendar_digest.py
+```
+
+**Delivery:**
+- Owners with a registered email address that is in the `EMAIL_ALLOWED_USERS`
+  allowlist receive the digest by email.
+- Owners without a usable email have their digest printed to stdout, so the
+  `--no-agent` cron posts it into the Hermes chat.
+
+**On-demand tool:** `calendar_digest` builds (and optionally emails) the digest
+for a given owner from within the agent conversation.
+
 ## Storage
 
 SQLite at `$HERMES_HOME/calendar.db` (default `~/.hermes/calendar.db`), WAL mode.
