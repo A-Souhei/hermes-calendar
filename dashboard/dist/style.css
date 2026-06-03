@@ -7,123 +7,6 @@
  * cells with unreadable text on the dark theme.
  */
 
-.cal-grid {
-  display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
-  gap: 4px;
-}
-
-.cal-weekday {
-  font-size: 0.72rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  text-align: center;
-  padding: 4px 0;
-  color: var(--color-muted-foreground);
-}
-
-.cal-cell {
-  min-height: 104px;
-  border: 1px solid var(--color-border);
-  border-radius: 0;
-  padding: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  overflow: hidden;
-  background: var(--color-card);
-  color: var(--color-card-foreground);
-}
-
-.cal-cell-muted { opacity: 0.45; }
-
-.cal-cell-today {
-  border-color: var(--color-primary);
-  box-shadow: inset 0 0 0 1px var(--color-primary);
-}
-
-.cal-daynum {
-  font-size: 0.72rem;
-  font-weight: 600;
-  align-self: flex-end;
-  color: var(--color-muted-foreground);
-  background: none;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-  font-family: inherit;
-}
-.cal-daynum:hover { color: var(--color-foreground); text-decoration: underline; }
-
-.cal-chip {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  width: 100%;
-  text-align: left;
-  font-size: 0.72rem;
-  line-height: 1.15;
-  padding: 2px 6px;
-  border-radius: 5px;
-  border: none;
-  cursor: pointer;
-  background: var(--color-muted);
-  color: var(--color-card-foreground);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.cal-chip:hover { filter: brightness(1.18); }
-
-/* Distinguish recurring vs one-time with a left accent rather than a fill,
-   so text contrast stays correct under any theme. */
-.cal-chip-recurring { border-left: 3px solid var(--color-primary); }
-.cal-chip-once { border-left: 3px solid var(--color-success, var(--color-primary)); }
-
-/* Regular (non-job) calendar appointments read in green; the left accent still
-   distinguishes recurring vs one-time. Job events override this to blue below
-   (`.cal-chip-job .cal-chip-title` is more specific, so it wins regardless of
-   source order). */
-.cal-chip-title { overflow: hidden; text-overflow: ellipsis; color: #16a34a; min-width: 0; flex: 1 1 auto; }
-
-/* Logged duration shown on the right of a timer/job chip (mirrors the day
-   modal). Pushed right, muted, doesn't shrink — the title ellipsizes instead. */
-.cal-chip-dur {
-  margin-left: auto;
-  padding-left: 6px;
-  flex-shrink: 0;
-  opacity: 0.65;
-  font-variant-numeric: tabular-nums;
-}
-
-/* Job / time-tracking events stand out with a blue accent + bold blue title,
-   so logged work reads distinctly from the green appointments. Placed after the
-   recurring/once rules so its left-accent wins for a job event. */
-.cal-chip-job { border-left: 3px solid #3b82f6; }
-.cal-chip-job .cal-chip-title { color: #3b82f6; font-weight: 600; }
-
-.cal-more {
-  font-size: 0.68rem;
-  color: var(--color-muted-foreground);
-  padding: 1px 6px;
-  background: none;
-  border: none;
-  cursor: pointer;
-  text-align: left;
-  font-family: inherit;
-}
-.cal-more:hover { color: var(--color-foreground); text-decoration: underline; }
-
-/* Day-view rows: full width, allow wrapping (unlike the truncated grid chips). */
-.cal-dayrow {
-  white-space: normal;
-  padding: 6px 8px;
-  line-height: 1.3;
-}
-.cal-dayrow .cal-chip-title { white-space: normal; overflow: visible; }
-
 /* ---- Detail modal ------------------------------------------------------- */
 
 .cal-overlay { overflow-y: auto; }
@@ -135,7 +18,12 @@
   border-radius: 12px;
   max-height: 86vh;
   overflow-y: auto;
+  /* Without this, overflow-y:auto makes overflow-x compute to auto too, so a
+     long unbreakable URL in the description triggers a horizontal scrollbar. */
+  overflow-x: hidden;
 }
+/* Break long URLs / unspaced strings so modal content never overflows sideways. */
+.cal-modal-body, .cal-modal-body * { overflow-wrap: anywhere; min-width: 0; }
 
 .cal-modal-head {
   position: sticky;
@@ -199,12 +87,13 @@
   border: 1px solid color-mix(in srgb, var(--color-destructive) 30%, transparent);
 }
 
-/* Small glyph prefix on grid chips */
-.cal-status-glyph {
-  font-size: 0.65rem;
-  line-height: 1;
-  flex-shrink: 0;
+/* Upcoming / not-yet-due (stored floating, future) — muted neutral. */
+.cal-status-floating {
+  background: var(--color-muted);
+  color: var(--color-muted-foreground);
+  border: 1px solid var(--color-border, rgba(127, 127, 127, 0.25));
 }
+
 /* Derived "missed" (past + still floating) — muted so it reads as
    unconfirmed rather than an explicit miss. */
 .cal-status-derived { opacity: 0.45; }
@@ -355,22 +244,15 @@
   color: var(--color-popover-foreground);
 }
 
-/* ---- Section micro-labels ------------------------------------------------ */
-
-.cal-section-label {
-  font-size: 0.66rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--color-muted-foreground);
-}
-
 /* ---- At-a-glance stat cards ---------------------------------------------- */
 
 .cal-statrow {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 8px;
+  /* Explicit gap below so the stats don't stick to the calendar/agenda split
+     (don't rely solely on the parent's space-y utility). */
+  margin-bottom: 28px;
 }
 
 .cal-stat {
@@ -395,47 +277,6 @@
   font-size: 1.4rem;
   font-weight: 600;
   line-height: 1;
-}
-
-/* ---- "Next up" chips ----------------------------------------------------- */
-
-.cal-nextup {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.cal-nextup-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-family: inherit;
-  font-size: 0.74rem;
-  line-height: 1.2;
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--color-border);
-  background: var(--color-card);
-  color: var(--color-card-foreground);
-  cursor: pointer;
-  max-width: 100%;
-}
-.cal-nextup-chip:hover {
-  border-color: var(--color-primary);
-  background: var(--color-muted);
-}
-
-.cal-nextup-when {
-  font-weight: 600;
-  color: var(--color-muted-foreground);
-  white-space: nowrap;
-}
-
-.cal-nextup-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 200px;
 }
 
 /* ---- Resume job success inline message ----------------------------------- */
@@ -489,3 +330,114 @@
   font-variant-numeric: tabular-nums;
   margin-left: 2px;
 }
+
+/* ==== Small-calendar + agenda split view ================================== */
+
+.cal-split {
+  display: grid;
+  grid-template-columns: minmax(250px, 330px) 1fr;
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 760px) {
+  .cal-split { grid-template-columns: 1fr; }
+}
+
+/* ---- compact month picker ---- */
+.sc-weekrow, .sc-grid { display: grid; grid-template-columns: repeat(7, 1fr); }
+.sc-grid { gap: 2px; }
+.sc-weekrow { margin-bottom: 4px; }
+.sc-weekday {
+  text-align: center;
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted-foreground);
+  padding: 2px 0;
+}
+.sc-day {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  aspect-ratio: 1 / 1;
+  border: none;
+  background: none;
+  cursor: pointer;
+  border-radius: 8px;
+  padding: 2px;
+  font-family: inherit;
+}
+.sc-day:hover { background: var(--color-muted); }
+.sc-day-num {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 9999px;
+  font-size: 0.8rem;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-card-foreground);
+}
+.sc-day-out .sc-day-num { color: var(--color-muted-foreground); opacity: 0.45; }
+/* days with events: a yellow circular background behind the number (dark number
+   for contrast). Yellow is neutral — it just means "this day has events". */
+.sc-day-has .sc-day-num { background: #facc15; color: #1c1917; font-weight: 600; }
+/* selected day: subtle fill + ring on the number */
+.sc-day-selected { background: var(--color-muted); }
+.sc-day-selected .sc-day-num { box-shadow: 0 0 0 2px var(--color-primary); }
+/* current day: just a distinct number colour (no filled circle). Declared AFTER
+   .sc-day-has so a plain today gets the colour; the overlap rule below keeps the
+   number readable on the yellow event background and rings it instead. */
+.sc-day-today .sc-day-num { color: #c084fc; font-weight: 700; }
+.sc-day-today.sc-day-has .sc-day-num { color: #1c1917; box-shadow: inset 0 0 0 2px #c084fc; }
+
+/* ---- agenda panel (events for the selected day) ---- */
+.agenda { display: flex; flex-direction: column; }
+.agenda-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--color-border, rgba(127,127,127,0.2));
+}
+.agenda-title { font-size: 0.95rem; font-weight: 600; }
+.agenda-count { font-size: 0.72rem; color: var(--color-muted-foreground); white-space: nowrap; }
+.agenda-list { display: flex; flex-direction: column; }
+.agenda-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  width: 100%; text-align: left;
+  padding: 10px 16px;
+  border: none; background: none; cursor: pointer;
+  border-bottom: 1px solid var(--color-border, rgba(127,127,127,0.15));
+  font-family: inherit;
+}
+.agenda-row:last-child { border-bottom: none; }
+.agenda-row:hover { background: var(--color-muted); }
+.agenda-row-job { border-left: 3px solid #3b82f6; }
+.agenda-time {
+  flex-shrink: 0; width: 60px; padding-top: 1px;
+  font-size: 0.78rem; font-variant-numeric: tabular-nums;
+  color: var(--color-muted-foreground);
+}
+.agenda-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.agenda-titleline { display: flex; align-items: center; gap: 6px; }
+/* Title colour mirrors the old chips: regular events green, job events blue. */
+.agenda-evtitle { font-size: 0.86rem; overflow: hidden; text-overflow: ellipsis; color: #16a34a; font-weight: 600; }
+.agenda-row-job .agenda-evtitle { color: #3b82f6; }
+.agenda-dur { font-size: 0.72rem; opacity: 0.6; margin-left: auto; font-variant-numeric: tabular-nums; }
+.agenda-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 0.72rem; color: var(--color-muted-foreground); }
+.agenda-job { color: #3b82f6; }
+.agenda-cat {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 1px 7px;
+  border-radius: 9999px;
+  background: var(--color-muted);
+  color: var(--color-muted-foreground);
+}
+.agenda-loc { white-space: nowrap; }
+.agenda-empty { padding: 28px 16px; text-align: center; color: var(--color-muted-foreground); font-size: 0.85rem; }
