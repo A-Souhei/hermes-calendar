@@ -1,21 +1,57 @@
 # hermes-calendar
 
-Personal secretary-book calendar for Hermes. One-time and recurring events with
-Home Assistant reminders. All editing is through the agent; a read-only dashboard
-is added separately.
+Personal secretary-book calendar for Hermes — one-time & recurring events with
+multi-channel reminders, meeting reports, work timers with job/category
+time-tracking, and period plannings with emailed completion reports. All editing
+is through the agent (CRUD via tools); a dashboard tab adds read-only
+Calendar/Plannings views plus one-click timer resume/stop. Owners are
+**pre-registered** (see [User registry](#user-registry)).
 
 ## Tools
+
+**Events**
 
 | Tool | Description |
 |---|---|
 | `calendar_add_event` | Create an event (one-time or recurring). Pass an absolute datetime for `start`. |
 | `calendar_update_event` | Update any field of an existing event by ID. |
 | `calendar_remove_event` | Delete a series (`scope=all`) or skip one occurrence (`scope=occurrence`). |
-| `calendar_list_events` | Expand occurrences in a date range; optional substring filter. |
+| `calendar_list_events` | Expand occurrences in a date range; optional substring filter. Defaults to **start of today → now+30d**. |
 | `calendar_get_event` | Full details: recurrence, alert config, meeting, next occurrence. |
-| `calendar_set_report` | Attach/update a **report** for one occurrence — minutes, transcription, attendees, decisions, outcome (a meeting/visio that happened). One-time *and* recurring (pass `occurrence` for recurring). Fields merge. |
-| `calendar_get_report` | Read the report for a given occurrence. |
-| `calendar_list_reports` | All reports for an event across its occurrences. |
+
+**Reports & status**
+
+| Tool | Description |
+|---|---|
+| `calendar_set_report` | Attach/update a **report** for one occurrence — minutes, transcription, attendees, decisions, outcome. One-time *and* recurring (pass `occurrence`). Fields merge. |
+| `calendar_get_report` / `calendar_list_reports` | Read one occurrence's report / all reports for an event. |
+| `calendar_set_status` | Mark an occurrence `confirmed` (it happened), `missed`, or `floating` (reset to unknown). |
+
+**Timers & jobs** — see [Realtime jobs & time tracking](#realtime-jobs--time-tracking)
+
+| Tool | Description |
+|---|---|
+| `calendar_start_timer` | Start a work timer now (open-ended or fixed `duration`); tag it with a `job`/`category`. |
+| `calendar_stop_timer` | Stop the running timer and record the measured duration. |
+| `calendar_resume_job` | Start a fresh session of an existing job, reusing its exact name + category so sessions aggregate. |
+| `calendar_list_jobs` | List distinct jobs for an owner with total time and session counts. |
+| `calendar_job_summary` | Aggregate tracked time by job/category for a period; optionally email a styled report (HTML + PDF). |
+
+**Plannings** — see [Plannings](#plannings)
+
+| Tool | Description |
+|---|---|
+| `calendar_create_planning` | Create a named, period-bounded set of objectives (events) scored by completion. |
+| `calendar_list_plannings` / `calendar_get_planning` | List plannings (with overall stats) / one planning's details. |
+| `calendar_planning_report` | Compute + (optionally) email the completion report for a planning. |
+| `calendar_remove_planning` | Delete a planning (optionally its events too). |
+
+**Users & digest**
+
+| Tool | Description |
+|---|---|
+| `calendar_set_user_email` / `calendar_list_user_emails` | Associate a person with an email (for email-channel reminders/reports) / list associations. |
+| `calendar_digest` | Build (and optionally email) a per-owner daily digest. |
 
 Reports are stored per `(event, occurrence)`, so each instance of a recurring event (e.g. every weekly standup) keeps its own minutes/transcription, and one-off meetings get a report too.
 
@@ -30,8 +66,15 @@ Reports are stored per `(event, occurrence)`, so each instance of a recurring ev
 
 ## Channels
 
-- `ha_notify` (default) — push notification (title + message body)
-- `ha_speak` — TTS spoken on phone
+`alert_channel` is a logical value expanded into concrete delivery channels:
+
+- `ha_notify` (default) — Home Assistant push notification (title + message body)
+- `ha_speak` — TTS spoken on the phone
+- `chat` — a message into the Hermes chat (delivered via the every-minute cron tick's stdout)
+- `email` — emailed reminder (only to an address in the `EMAIL_ALLOWED_USERS` allowlist)
+- `both` — `ha_notify` + `ha_speak`
+- `all` — `ha_notify` + `ha_speak` + `chat` + `email`
+- `none` — silence reminders for the event
 
 ## Alert engine
 
@@ -72,6 +115,24 @@ hermes cron create "0 7 * * *" --name calendar-digest --no-agent \
 
 **On-demand tool:** `calendar_digest` builds (and optionally emails) the digest
 for a given owner from within the agent conversation.
+
+## Plannings
+
+A **planning** is a named, period-bounded set of objectives (each objective is a
+calendar event tagged with the planning). Completion is scored per occurrence
+from the per-occurrence status: **only `confirmed` counts as done** — everything
+else (unconfirmed/floating, missed, active) counts as not done.
+
+- Create with `calendar_create_planning` (compute `period_start`/`period_end`
+  yourself — `period_end` is **exclusive**), then attach events via the
+  `planning` param of `calendar_add_event`.
+- The owner **must have a registered email** — reports are emailed (the chat only
+  announces a report is ready).
+- A report is **auto-emailed once at 09:00** the morning after the period ends,
+  and can be produced on demand with `calendar_planning_report`. It includes
+  overall + per-objective completion stats and a styled **PDF** attachment
+  (falls back to text-only if `weasyprint` is missing).
+- Plannings appear as a second dashboard tab with overall completion stats.
 
 ## User registry
 
@@ -150,23 +211,35 @@ silently creating a near-duplicate.
 - "How many hours did I spend on thesis-writing this month?" → `calendar_job_summary` with `period="monthly"`
 - "Email me my job report for this week" → `calendar_job_summary` with `period="weekly"` and `email=true`
 
-### Dashboard
+## Dashboard
 
-Job/timer events render with a **blue accent and bold blue title** in the
-read-only Calendar tab, while regular appointments read in **green** —
-distinguishing logged work from calendar events at a glance. The event's `job`
-and `category` appear in the chip tooltip, and also in the event detail modal.
+A dashboard tab (Calendar | Plannings) renders the calendar. It is read-only
+except for two timer actions (resume/stop) described below.
 
-**Category filter** — a second `<select>` appears in the hero header when there
-are categories for the selected owner. Choosing a category narrows the calendar
-view to events in that category (ANDs with the existing owner filter). "All
-categories" (empty selection) shows everything.
+**Calendar layout** — a compact **month picker** (left) + a **day agenda**
+(right). Click a day to populate the agenda.
 
-**Resume button** — job events (those with a `job` attribute) show a
-▶ Resume job button in the detail modal. Clicking it calls `POST /jobs/resume`,
-starts a new timer session with the same job + category (auto-stopping any
-currently running timer), and reloads the calendar view. No confirmation needed
-— just a click.
+- **Today** = a distinct number colour (no filled circle).
+- **Days with events** = a **yellow circular background** (neutral "has events").
+- **Agenda rows** show `time · title (+ logged duration)` plus a badge line:
+  **status** (`confirmed` / `running` / `missed` / `upcoming`), **category**,
+  **job**, location. Title colour mirrors the type — **green** regular, **blue**
+  job.
+- A live **"Running now" banner** names the currently-running session with a
+  ticking clock (polls `/timers`, owner-aware); **stat cards** (Events /
+  Confirmed / Missed / Upcoming / Active); and **user + category filters** (the
+  user filter is registry-driven, so registered users appear even with no events).
+
+**Timer actions (the only writes)** — a job event's detail modal shows:
+
+- **▶ Resume job** (when the session is stopped) → `POST /jobs/resume`, starting a
+  new session with the same job + category (auto-stopping any running timer).
+- **■ Stop** (when the session is running) → `POST /jobs/stop`, recording the
+  measured duration; the modal then flips to a Resume button.
+
+Both endpoints sit behind the dashboard's session-token auth middleware (same as
+the other plugins' write routes); the shared timer logic lives in `timers.py` so
+the tools and the dashboard cannot drift.
 
 ## Storage
 
