@@ -243,6 +243,38 @@ def test_create_planning_registry_gate():
     assert r_ok["ok"], f"Expected success, got: {r_ok}"
 
 
+def test_list_events_explicit_range_and_today_default():
+    """Regression: explicit from/to must not crash (it passed _parse_start the
+    wrong arity), and the default window must include events earlier *today*.
+
+    Computed in the plugin's DEFAULT_TZ so it's robust to a configured CALENDAR_TZ.
+    """
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(cal.recurrence_mod.DEFAULT_TZ)
+    local_now = datetime.now(tz)
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Midpoint of "today so far": strictly earlier today (so the OLD now-anchored
+    # default would have excluded it), regardless of timezone or hour of day.
+    event_local = local_midnight + (local_now - local_midnight) / 2
+    add = res(cal._handle_calendar_add_event({
+        "owner": "u_reg", "title": "Earlier today ev",
+        "start": event_local.astimezone(timezone.utc).isoformat(),
+        "alert_channel": "none",
+    }))
+    assert add["created"]
+
+    # explicit from/to spanning today (previously raised TypeError -> tool_error)
+    day0 = local_midnight.astimezone(timezone.utc).isoformat()
+    day1 = (local_midnight + timedelta(days=1)).astimezone(timezone.utc).isoformat()
+    r1 = res(cal._handle_calendar_list_events(
+        {"owner": "u_reg", "from": day0, "to": day1, "query": "Earlier"}))
+    assert any(e["title"] == "Earlier today ev" for e in r1["events"])
+
+    # default window (no from/to) must still include the earlier-today event
+    r2 = res(cal._handle_calendar_list_events({"owner": "u_reg", "query": "Earlier"}))
+    assert any(e["title"] == "Earlier today ev" for e in r2["events"])
+
+
 def test_get_user_email_registry_fallback():
     """An owner with only a registry email (no user_emails row) resolves via store.get_user_email."""
     # "Toavina" is registered with email "t@example.com" in the registry.
