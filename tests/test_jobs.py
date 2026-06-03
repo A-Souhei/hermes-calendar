@@ -22,8 +22,35 @@ import tempfile
 import types
 from datetime import datetime, timedelta, timezone
 
+# ---------------------------------------------------------------------------
+# --- Registry: set up CALENDAR_USERS_FILE FIRST so the plugin sees it -------
+# ---------------------------------------------------------------------------
+
+_tmpdir = tempfile.mkdtemp(prefix="caltest_")
+
 # --- isolate storage to a throwaway DB BEFORE the plugin imports store -------
-os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="caltest_")
+os.environ["HERMES_HOME"] = _tmpdir
+
+# Write a registry file covering EVERY owner used across the test suite.
+_registry_path = os.path.join(_tmpdir, "calendar-users.json")
+_registry_data = {
+    "users": [
+        {"name": "Toavina",   "email": "t@example.com",      "language": "en"},
+        {"name": "u_persist", "email": "persist@example.com", "language": "en"},
+        {"name": "u_switch",  "email": "switch@example.com",  "language": "en"},
+        {"name": "u_other",   "email": "other@example.com",   "language": "en"},
+        {"name": "u_sum",     "email": "sum@example.com",     "language": "en"},
+        {"name": "u_resume",  "email": "resume@example.com",  "language": "en"},
+        {"name": "u_upd",     "email": "upd@example.com",     "language": "en"},
+        {"name": "u_cat",     "email": "cat@example.com",     "language": "en"},
+        {"name": "u_reg",     "email": "reg@example.com",     "language": "en"},
+        {"name": "u_plan",    "email": "plan@example.com",    "language": "en"},
+    ]
+}
+with open(_registry_path, "w", encoding="utf-8") as _f:
+    json.dump(_registry_data, _f)
+
+os.environ["CALENDAR_USERS_FILE"] = _registry_path
 
 # --- stub the host runtime the plugin's __init__ imports ---------------------
 _tools = types.ModuleType("tools")
@@ -53,6 +80,7 @@ def _load_plugin():
 
 cal = _load_plugin()
 store = cal.store
+timers = cal.timers_mod
 
 
 def res(s):
@@ -153,6 +181,107 @@ def test_period_window_math():
     assert days("monthly", "2026-06-03") == 30   # June
     assert days("monthly", "2026-02-15") == 28   # Feb 2026
     assert days("yearly", "2026-06-03") == 365
+
+
+# ---------------------------------------------------------------------------
+# New tests: registry gating, email fallback, categories, timers shared logic
+# ---------------------------------------------------------------------------
+
+def test_registry_blocks_unknown_owner():
+    """Unregistered owner is refused by add_event, start_timer, resume_job."""
+    bad_owner = "ghost_user_xyz"
+
+    # calendar_add_event
+    r_add = json.loads(cal._handle_calendar_add_event({
+        "title": "test", "owner": bad_owner,
+        "start": "2026-06-10T14:00:00+03:00",
+    }))
+    assert not r_add["ok"]
+    assert "calendar-users.json" in r_add["error"]
+
+    # calendar_start_timer
+    r_start = json.loads(cal._handle_calendar_start_timer({
+        "title": "test timer", "owner": bad_owner,
+    }))
+    assert not r_start["ok"]
+    assert "calendar-users.json" in r_start["error"]
+
+    # calendar_resume_job
+    r_resume = json.loads(cal._handle_calendar_resume_job({
+        "owner": bad_owner, "job": "some-job",
+    }))
+    assert not r_resume["ok"]
+    assert "calendar-users.json" in r_resume["error"]
+
+    # A registered owner succeeds for add_event (no email needed, just title+start+owner)
+    r_ok = json.loads(cal._handle_calendar_add_event({
+        "title": "valid event", "owner": "u_reg",
+        "start": "2026-06-10T14:00:00+03:00",
+    }))
+    assert r_ok["ok"], f"Expected success for registered owner, got: {r_ok}"
+
+
+def test_get_user_email_registry_fallback():
+    """An owner with only a registry email (no user_emails row) resolves via store.get_user_email."""
+    # "Toavina" is registered with email "t@example.com" in the registry.
+    # Ensure there is no user_emails row for them so the fallback path is exercised.
+    # (They may have been set previously; we remove any DB row to force the fallback.)
+    key = "toavina"
+    try:
+        store.remove_user_email(key)
+    except Exception:
+        pass
+
+    email = store.get_user_email("Toavina")
+    assert email == "t@example.com", (
+        f"Expected registry fallback email 't@example.com', got {email!r}"
+    )
+
+
+def test_list_categories():
+    """store.list_categories returns distinct categories for an owner."""
+    o = "u_cat"
+    _start(o, title="task1", job="j1", category="alpha", duration="10 min")
+    _start(o, title="task2", job="j2", category="beta",  duration="10 min")
+    _start(o, title="task3", job="j3", category="Alpha", duration="10 min")  # duplicate (case)
+    _start(o, title="task4", job="j4", duration="10 min")  # no category — excluded
+
+    cats = store.list_categories(owner=o)
+    # Should include alpha and beta (exact stored spellings, case-insensitively sorted).
+    # Both "alpha" and "Alpha" exist; SQLite DISTINCT preserves both actual stored values.
+    cats_lower = [c.lower() for c in cats]
+    assert "alpha" in cats_lower, f"Expected 'alpha' in categories, got {cats}"
+    assert "beta" in cats_lower, f"Expected 'beta' in categories, got {cats}"
+    # No category entries should appear.
+    assert None not in cats
+
+
+def test_timers_resume_shared_logic():
+    """timers.resume_job returns not_found for unknown job, and ok after a session exists."""
+    o = "u_resume2"
+    # Ensure u_resume2 is in the registry (it's not — use a registered owner instead)
+    # Use u_sum which is registered and has sessions
+    o = "u_sum"
+
+    # Try resuming a job that was never started for this isolated check.
+    res_miss = timers.resume_job(o, "nonexistent_job_zzz")
+    assert res_miss["ok"] is False
+    assert res_miss["reason"] == "not_found"
+    assert isinstance(res_miss["existing_jobs"], list)
+
+    # Start a session so the job exists, then resume it.
+    _start(o, title="SharedJobTest", job="shared-job-x", category="testcat", duration="5 min")
+    res_ok = timers.resume_job(o, "shared-job-x")
+    assert res_ok["ok"] is True
+    result = res_ok["result"]
+    assert result.get("resumed") is True
+    assert result["resumed_from"]["job"] == "shared-job-x"
+    assert result["resumed_from"]["category"] == "testcat"
+    # Stop the open timer so it doesn't pollute other tests.
+    try:
+        res(cal._handle_calendar_stop_timer({"owner": o}))
+    except Exception:
+        pass
 
 
 def _run_all():

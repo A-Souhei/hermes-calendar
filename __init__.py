@@ -28,6 +28,8 @@ from . import planning as planning_mod
 from . import recurrence as recurrence_mod
 from . import scheduler
 from . import store
+from . import timers as timers_mod
+from . import users as users_mod
 from tools.registry import tool_error, tool_result
 
 logger = logging.getLogger(__name__)
@@ -161,6 +163,15 @@ def _parse_recurrence(value: Any) -> Optional[Dict[str, Any]]:
     if byweekday is not None:
         result["byweekday"] = byweekday
     return result
+
+
+def _unregistered_owner_error(owner: str) -> str:
+    """Return a refusal message for an unregistered owner, naming the fix."""
+    return (
+        f"{owner!r} is not a registered calendar user. Users must be registered "
+        "beforehand in ~/.hermes/calendar-users.json — add them there first; "
+        "do not create the user here."
+    )
 
 
 def _check_available() -> bool:
@@ -405,6 +416,8 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
             "owner is required — every event must belong to a user. Set 'owner' "
             "to the person this event is for (typically the asker)."
         )
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
 
     category_raw = args.get("category")
     category = (str(category_raw).strip() or None) if category_raw is not None else None
@@ -1244,8 +1257,11 @@ def _handle_calendar_set_status(args: Dict[str, Any], **kw) -> str:
 
 def _start_timer_impl(args: Dict[str, Any]) -> tuple:
     """Core of calendar_start_timer. Returns (ok, payload): (True, result_dict)
-    on success or (False, error_message) on failure. Shared by
-    calendar_start_timer and calendar_resume_job."""
+    on success or (False, error_message) on failure.
+
+    Handles all arg parsing/validation, then delegates the mechanics to
+    ``timers_mod.start_session`` so the dashboard can reuse the same code path.
+    """
     title = str(args.get("title") or "").strip()
     if not title:
         return (False, "title is required")
@@ -1263,7 +1279,6 @@ def _start_timer_impl(args: Dict[str, Any]) -> tuple:
             )
 
     tz_name = args.get("tz") or recurrence_mod.DEFAULT_TZ
-    now = datetime.now(timezone.utc)
 
     tags_raw = args.get("tags")
     tags: Optional[List[str]] = [str(t) for t in tags_raw] if isinstance(tags_raw, list) else None
@@ -1281,6 +1296,9 @@ def _start_timer_impl(args: Dict[str, Any]) -> tuple:
             "owner is required — every event (including timers) must belong to a "
             "user. Set 'owner' to the person this timer is for (typically the asker)."
         )
+    if not users_mod.is_registered(timer_owner):
+        return (False, _unregistered_owner_error(timer_owner))
+
     notify_email_raw = args.get("notify_email")
     timer_notify_email = (
         (str(notify_email_raw).strip().lower() or None)
@@ -1293,81 +1311,24 @@ def _start_timer_impl(args: Dict[str, Any]) -> tuple:
     category_raw = args.get("category")
     timer_category = (str(category_raw).strip() or None) if category_raw is not None else None
 
-    # Auto-switch: stop any running timers for THIS owner before starting the new one.
-    existing_actives = store.list_active(owner=timer_owner)
-    switched_from: List[Dict[str, Any]] = []
-    for active_row in existing_actives:
-        stopped = _stop_active_row(active_row)
-        switched_from.append({
-            "id": stopped["id"],
-            "title": stopped["title"],
-            "duration_seconds": stopped["duration_seconds"],
-        })
-
-    event_data = {
-        "title": title,
-        "description": args.get("description"),
-        "start_utc": now.isoformat(),
-        "tz": tz_name,
-        "all_day": False,
-        "recurrence": None,
-        "alert_lead_seconds": None,
-        "alert_channel": "none",
-        "meeting": None,
-        "location": args.get("location"),
-        "tags": tags,
-        "language": timer_language,
-        "owner": timer_owner,
-        "notify_email": timer_notify_email,
-        "job": timer_job,
-        "category": timer_category,
-    }
     try:
-        event_id = store.add_event(event_data)
+        result = timers_mod.start_session(
+            owner=timer_owner,
+            title=title,
+            job=timer_job,
+            category=timer_category,
+            duration_seconds=duration_seconds,
+            description=args.get("description"),
+            location=args.get("location"),
+            tags=tags,
+            language=timer_language,
+            notify_email=timer_notify_email,
+            tz=tz_name,
+        )
     except Exception as e:
         logger.exception("calendar_start_timer store error")
         return (False, f"Failed to create timer event: {e}")
 
-    occ_iso = now.isoformat()
-
-    if duration_seconds is not None:
-        ended_utc = (now + timedelta(seconds=duration_seconds)).isoformat()
-        store.set_status(
-            event_id, occ_iso, "confirmed",
-            started_utc=now.isoformat(),
-            ended_utc=ended_utc,
-            duration_seconds=duration_seconds,
-            source="timer",
-        )
-        status = "confirmed"
-    else:
-        store.set_status(
-            event_id, occ_iso, "active",
-            started_utc=now.isoformat(),
-            source="timer",
-        )
-        status = "active"
-
-    result: Dict[str, Any] = {
-        "id": event_id,
-        "title": title,
-        "started_utc": now.isoformat(),
-        "status": status,
-    }
-    if duration_seconds is not None:
-        result["duration_seconds"] = duration_seconds
-    if switched_from:
-        result["switched_from"] = switched_from
-        # Build human warning: list stopped jobs/titles
-        def _fmt_switched(s: Dict) -> str:
-            d = s.get("duration_seconds")
-            t = s.get("title") or s.get("id")
-            if d is not None:
-                m = max(0, round(d / 60))
-                return f"'{t}' ({m}m)"
-            return f"'{t}'"
-        stopped_labels = ", ".join(_fmt_switched(s) for s in switched_from)
-        result["warning"] = f"Stopped running job {stopped_labels} and started '{title}'."
     return (True, result)
 
 
@@ -1386,16 +1347,37 @@ def _handle_calendar_resume_job(args: Dict[str, Any], **kw) -> str:
     if not job:
         return tool_error("job is required — the name of the job to resume.")
 
-    match = store.find_job_event(owner, job)
-    if match is None:
-        # No match: ask for the exact name and surface the existing jobs so the
-        # agent (or user) can pick the right spelling rather than silently
-        # creating a near-duplicate job that won't aggregate.
-        try:
-            existing = store.list_jobs(owner)
-        except Exception:
-            existing = []
-        names = sorted({j["job"] for j in existing if j.get("job")})
+    # Validate registry BEFORE the job-not-found path so the messages are distinct.
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    # Optional overrides (advertised in the schema): a fixed duration, a session
+    # title, a category override, and a description for this session.
+    duration_raw = args.get("duration")
+    duration_seconds: Optional[int] = None
+    if duration_raw is not None:
+        duration_seconds = _parse_lead(duration_raw)
+        if duration_seconds is None:
+            return tool_error(
+                f"Couldn't understand duration {duration_raw!r} — use e.g. '2 hours', "
+                "'90 min', '1h30m', or omit it for an open-ended session."
+            )
+    title_raw = args.get("title")
+    title_override = (str(title_raw).strip() or None) if title_raw is not None else None
+    cat_raw = args.get("category")
+    category_override = (str(cat_raw).strip() or None) if cat_raw is not None else None
+    desc_raw = args.get("description")
+    description_override = (str(desc_raw) or None) if desc_raw is not None else None
+
+    res = timers_mod.resume_job(
+        owner, job,
+        title=title_override,
+        category=category_override,
+        duration_seconds=duration_seconds,
+        description=description_override,
+    )
+    if not res["ok"]:
+        names = res.get("existing_jobs", [])
         if names:
             listed = ", ".join(repr(n) for n in names)
             return tool_error(
@@ -1406,69 +1388,7 @@ def _handle_calendar_resume_job(args: Dict[str, Any], **kw) -> str:
             f"No tracked job named {job!r} for {owner}, and this user has no jobs yet. "
             "Use calendar_start_timer to begin a brand-new job."
         )
-
-    # Reuse the EXACT stored job spelling + its category/title so the resumed
-    # session aggregates with the prior ones. Explicit args still override.
-    start_args: Dict[str, Any] = {
-        "owner": owner,
-        "job": match.get("job") or job,
-        "title": args.get("title") or match.get("title") or match.get("job"),
-        "category": args.get("category") if args.get("category") is not None else match.get("category"),
-    }
-    if args.get("duration") is not None:
-        start_args["duration"] = args["duration"]
-    if args.get("description") is not None:
-        start_args["description"] = args["description"]
-
-    ok, payload = _start_timer_impl(start_args)
-    if not ok:
-        return tool_error(payload)
-    payload["resumed"] = True
-    payload["resumed_from"] = {
-        "job": match.get("job"),
-        "category": match.get("category"),
-        "last_session_utc": match.get("start_utc"),
-    }
-    return tool_result(payload)
-
-
-def _stop_active_row(row: Dict[str, Any], note: Optional[str] = None) -> Dict[str, Any]:
-    """Stop one active timer row: confirm it, record measured duration.
-
-    Returns a dict with id, title, started_utc, ended_utc, duration_seconds.
-    """
-    event_id = row["event_id"]
-    occ_iso = row["occurrence_utc"]
-    started_iso = row.get("started_utc")
-
-    now = datetime.now(timezone.utc)
-    measured: Optional[int] = None
-    if started_iso:
-        try:
-            started_dt = datetime.fromisoformat(started_iso)
-            if started_dt.tzinfo is None:
-                started_dt = started_dt.replace(tzinfo=timezone.utc)
-            measured = max(0, round((now - started_dt).total_seconds()))
-        except Exception:
-            pass
-
-    store.set_status(
-        event_id, occ_iso, "confirmed",
-        ended_utc=now.isoformat(),
-        duration_seconds=measured,
-        note=note,
-        source="timer",
-    )
-
-    ev = store.get_event(event_id)
-    title = ev["title"] if ev else event_id
-    return {
-        "id": event_id,
-        "title": title,
-        "started_utc": started_iso,
-        "ended_utc": now.isoformat(),
-        "duration_seconds": measured,
-    }
+    return tool_result(res["result"])
 
 
 def _handle_calendar_stop_timer(args: Dict[str, Any], **kw) -> str:
@@ -1497,7 +1417,7 @@ def _handle_calendar_stop_timer(args: Dict[str, Any], **kw) -> str:
             )
         row = actives[0]
 
-    stopped = _stop_active_row(row, note=note)
+    stopped = timers_mod.stop_active_row(row, note=note)
     result: Dict[str, Any] = {
         "id": stopped["id"],
         "title": stopped["title"],
@@ -1797,7 +1717,14 @@ def _handle_calendar_create_planning(args: Dict[str, Any], **kw) -> str:
 
     owner_raw = args.get("owner")
     owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
-    if not owner or store.get_user_email(owner) is None:
+    if not owner:
+        return tool_error(
+            "Planning needs an email for the owner. Associate one first with "
+            "calendar_set_user_email (reports are emailed)."
+        )
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+    if store.get_user_email(owner) is None:
         return tool_error(
             f"Planning needs an email for {owner!r}. Associate one first with "
             "calendar_set_user_email (reports are emailed)."
