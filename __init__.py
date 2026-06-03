@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from dateutil import parser as dtparser
 
+from . import digest as digest_mod
 from . import notify
 from . import planning as planning_mod
 from . import recurrence as recurrence_mod
@@ -1899,6 +1900,84 @@ CALENDAR_REMOVE_PLANNING_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Calendar digest (on-demand)
+# ---------------------------------------------------------------------------
+
+def _handle_calendar_digest(args: Dict[str, Any], **kw) -> str:
+    owner = str(args.get("owner") or "").strip()
+    if not owner:
+        return tool_error("owner is required")
+
+    try:
+        d = digest_mod.build_owner_digest(owner)
+    except Exception as e:
+        logger.exception("calendar_digest build error")
+        return tool_error(f"Failed to build digest: {e}")
+
+    markdown = digest_mod.render_markdown(d)
+
+    result: Dict[str, Any] = {
+        "owner": d["owner"],
+        "date_str": d["date_str"],
+        "events_today": len(d["today"]),
+        "has_events_today": d["has_events_today"],
+        "next_up_title": d["next_up"]["title"] if d.get("next_up") else None,
+        "digest": markdown,
+    }
+
+    do_email = bool(args.get("email", False))
+    if do_email:
+        owner_email = store.get_user_email(owner)
+        if not owner_email:
+            result["emailed"] = False
+            result["email_error"] = "no registered email for this owner"
+        else:
+            allowed = notify.allowed_email_recipients()
+            if owner_email.lower() not in allowed:
+                result["emailed"] = False
+                result["email_error"] = "owner email not allowlisted"
+            else:
+                html_doc = digest_mod.render_html(d)
+                subject = f"\U0001f4c5 Calendar digest — {d['date_str']}"
+                fire_result = notify.fire(
+                    "email",
+                    subject,
+                    markdown,
+                    target=owner_email,
+                    html=html_doc,
+                )
+                result["emailed"] = fire_result.get("ok", False)
+                result["email_error"] = fire_result.get("error")
+
+    return tool_result(result)
+
+
+CALENDAR_DIGEST_SCHEMA = {
+    "name": "calendar_digest",
+    "description": (
+        "Build and optionally email a daily digest for an owner: today's events "
+        "needing attention, with statuses. When today has no events, falls back to "
+        "the single closest upcoming event so the digest is always non-empty. "
+        "Set email=true to send it to the owner's registered allowlisted address."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "email": {
+                "type": "boolean",
+                "description": (
+                    "If true, email the digest to the owner's registered address "
+                    "(must be in the allowlist). Default false."
+                ),
+            },
+        },
+        "required": ["owner"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -1921,6 +2000,7 @@ _TOOLS = (
     ("calendar_get_planning",     CALENDAR_GET_PLANNING_SCHEMA,     _handle_calendar_get_planning,     "🔎"),
     ("calendar_planning_report",  CALENDAR_PLANNING_REPORT_SCHEMA,  _handle_calendar_planning_report,  "📊"),
     ("calendar_remove_planning",  CALENDAR_REMOVE_PLANNING_SCHEMA,  _handle_calendar_remove_planning,  "🗑️"),
+    ("calendar_digest",           CALENDAR_DIGEST_SCHEMA,           _handle_calendar_digest,           "🗞️"),
 )
 
 
