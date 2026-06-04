@@ -596,7 +596,12 @@
                             "div",
                             { className: "flex items-center justify-between gap-2 flex-wrap" },
                             h("span", { className: "font-medium" }, fmtDateTime(s.occurrence_local || s.occurrence_utc, data.tz)),
-                            h("span", { className: "cal-status cal-status-" + s.status }, (STATUS_GLYPH[s.status] || "") + " " + s.status)
+                            // Job events are inherently confirmed (timer sessions) — the
+                            // 'confirmed' status is a planning concept, so don't surface it
+                            // here for jobs. (A live 'active' session is still shown.)
+                            (data.job && s.status === "confirmed")
+                              ? null
+                              : h("span", { className: "cal-status cal-status-" + s.status }, (STATUS_GLYPH[s.status] || "") + " " + s.status)
                           ),
                           s.started_utc
                             ? h("div", { className: "text-xs opacity-60" }, "Started: " + fmtDateTime(s.started_utc, data.tz))
@@ -814,7 +819,10 @@
                   h(
                     "span",
                     { className: "agenda-sub" },
-                    ev.kind === "note" ? null : statusBadge(ev),
+                    // Notes have no status; job events are inherently confirmed
+                    // (timer sessions) so don't show a 'confirmed' badge for them
+                    // — a live 'running' session still shows.
+                    (ev.kind === "note" || (ev.job && effStatus(ev) === "confirmed")) ? null : statusBadge(ev),
                     ev.category ? h("span", { className: "agenda-cat" }, ev.category) : null,
                     ev.job ? h("span", { className: "agenda-job" }, "▸ " + ev.job) : null,
                     ev.location ? h("span", { className: "agenda-loc" }, "📍 " + ev.location) : null

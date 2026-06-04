@@ -223,6 +223,20 @@ def log_session(
     live session) and does NOT validate the registry — callers do.
     """
     tz_name = tz or recurrence.DEFAULT_TZ
+
+    # Normalize timestamps to UTC ISO with a +00:00 offset — the storage layer
+    # relies on that form for lexicographic range filtering (summarize_jobs);
+    # a trailing 'Z' or a non-UTC offset would skew job-aggregation windows.
+    def _utc_iso(s: str) -> str:
+        iso = s[:-1] + "+00:00" if isinstance(s, str) and s.endswith("Z") else s
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+
+    started_utc = _utc_iso(started_utc)
+    ended_utc = _utc_iso(ended_utc)
+
     event_data: Dict[str, Any] = {
         "title": title,
         "description": description,

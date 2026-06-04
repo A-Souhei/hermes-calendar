@@ -1407,7 +1407,7 @@ def _log_job_impl(args: Dict[str, Any]) -> tuple:
     if ended <= started:
         return (False, "end must be after start.")
     now = datetime.now(timezone.utc)
-    if ended > now + timedelta(minutes=1):
+    if ended > now:
         return (False, "cannot log a job that ends in the future — use calendar_start_timer for ongoing work.")
     duration_seconds = max(1, round((ended - started).total_seconds()))
 
@@ -1433,7 +1433,6 @@ def _log_job_impl(args: Dict[str, Any]) -> tuple:
             job=job,
             category=category,
             description=args.get("description"),
-            location=args.get("location"),
             tags=tags,
             language=language,
             tz=tz_name,
@@ -1481,6 +1480,7 @@ CALENDAR_LOG_JOB_SCHEMA = {
                 "description": "When the work FINISHED (absolute datetime). Provide this OR 'duration'.",
             },
             "duration": {
+                "type": "string",
                 "description": "How long it took, if you don't give 'end' — e.g. '2 hours', '90 min', '1h30m'.",
             },
             "title": {"type": "string", "description": "Optional short label for the session (defaults to the job name)."},
