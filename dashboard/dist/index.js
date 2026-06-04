@@ -611,6 +611,7 @@
         { className: "sc-grid" },
         cells.map(function (c) {
           var hasEvents = c.events && c.events.length > 0;
+          var hasNote = c.events && c.events.some(function (e) { return e.kind === "note"; });
           return h(
             "button",
             {
@@ -619,6 +620,7 @@
                 "sc-day",
                 !c.inMonth && "sc-day-out",
                 hasEvents && "sc-day-has",
+                hasNote && "sc-day-note",
                 c.key === selectedKey && "sc-day-selected",
                 c.isToday && "sc-day-today"
               ),
@@ -665,7 +667,7 @@
                 "button",
                 {
                   key: ev.id + "@" + ev.occurrence_utc + i,
-                  className: cn("agenda-row", ev.job && "agenda-row-job"),
+                  className: cn("agenda-row", ev.job && "agenda-row-job", ev.kind === "note" && "agenda-row-note"),
                   onClick: function () { props.onOpen(ev.id); },
                 },
                 h("span", { className: "agenda-time" }, timeStr),
@@ -675,6 +677,7 @@
                   h(
                     "span",
                     { className: "agenda-titleline" },
+                    ev.kind === "note" ? h("span", { className: "agenda-note-glyph" }, "🗒️") : null,
                     ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null,
                     h("span", { className: "agenda-evtitle" }, (ev.has_report ? "📝 " : "") + ev.title),
                     dur ? h("span", { className: "agenda-dur" }, dur) : null
@@ -683,7 +686,7 @@
                   h(
                     "span",
                     { className: "agenda-sub" },
-                    statusBadge(ev),
+                    ev.kind === "note" ? null : statusBadge(ev),
                     ev.category ? h("span", { className: "agenda-cat" }, ev.category) : null,
                     ev.job ? h("span", { className: "agenda-job" }, "▸ " + ev.job) : null,
                     ev.location ? h("span", { className: "agenda-loc" }, "📍 " + ev.location) : null
@@ -741,6 +744,7 @@
     const stats = useMemo(function () {
       var s = { total: 0, confirmed: 0, missed: 0, upcoming: 0, active: 0 };
       (events || []).forEach(function (ev) {
+        if (ev.kind === "note") return;
         s.total++;
         if (ev.status === "confirmed") s.confirmed++;
         if (ev.status === "active") s.active++;

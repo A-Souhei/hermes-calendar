@@ -206,7 +206,7 @@ def _occurrences_in_range(
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     now = datetime.now(timezone.utc)
-    for ev in store.list_events(owner=owner, kind="event"):
+    for ev in store.list_events(owner=owner):
         # Category filter: skip events whose category doesn't match (case-insensitive).
         if category is not None:
             ev_cat = (ev.get("category") or "").strip().lower()
@@ -235,12 +235,14 @@ def _occurrences_in_range(
         except Exception:
             status_map = {}
         planning_name = _planning_name_for(ev)
+        is_note = ev.get("kind") == "note"
         for occ in occs:
             occ_iso = occ.isoformat()
             status_row = status_map.get(occ_iso)
             out.append({
                 "id": ev["id"],
                 "title": ev["title"],
+                "kind": ev.get("kind", "event"),
                 "occurrence_utc": occ_iso,
                 "occurrence_local": occ.astimezone(tz).isoformat(),
                 "tz": ev.get("tz") or recurrence.DEFAULT_TZ,
@@ -254,8 +256,8 @@ def _occurrences_in_range(
                 "job": ev.get("job"),
                 "category": ev.get("category"),
                 "has_report": occ_iso in report_keys,
-                "status": status_row["status"] if status_row else "floating",
-                "effective_status": _effective_status(
+                "status": "floating" if is_note else (status_row["status"] if status_row else "floating"),
+                "effective_status": "floating" if is_note else _effective_status(
                     status_row["status"] if status_row else "floating", occ, now
                 ),
                 "duration_seconds": status_row.get("duration_seconds") if status_row else None,
