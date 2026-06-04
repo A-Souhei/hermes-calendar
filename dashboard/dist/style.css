@@ -417,6 +417,10 @@
 .agenda-row:last-child { border-bottom: none; }
 .agenda-row:hover { background: var(--color-muted); }
 .agenda-row-job { border-left: 3px solid #3b82f6; }
+.agenda-row-note { border-left: 3px solid #8b5cf6; }
+.agenda-row-note .agenda-evtitle { color: #8b5cf6; }
+.agenda-note-glyph { margin-right: 4px; }
+.sc-day-note .sc-day-num { background: #8b5cf6; color: #fff; font-weight: 600; }
 .agenda-time {
   flex-shrink: 0; width: 60px; padding-top: 1px;
   font-size: 0.78rem; font-variant-numeric: tabular-nums;
