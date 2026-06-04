@@ -423,15 +423,20 @@
     const activeStarted = activeRow ? activeRow.started_utc : null;
     const isRegularEvent = data && data.kind !== "note" && !data.job;
     var targetOcc = data ? (props.occurrence || data.start_utc || "") : "";
-    var alreadyConfirmed = isRegularEvent && data && (data.statuses || []).some(function (s) {
-      return s.occurrence_utc === targetOcc && s.status === "confirmed";
-    });
+    // The stored status row for this occurrence (if any) + when it was set —
+    // used to show the confirmation/cancellation time and block re-applying it.
+    var statusRow = (isRegularEvent && data)
+      ? (data.statuses || []).filter(function (s) { return s.occurrence_utc === targetOcc; })[0]
+      : null;
+    var confirmedAt = (statusRow && statusRow.status === "confirmed")
+      ? (statusRow.updated_utc || statusRow.created_utc) : null;
+    var cancelledAt = (statusRow && statusRow.status === "missed")
+      ? (statusRow.updated_utc || statusRow.created_utc) : null;
+    var alreadyConfirmed = !!confirmedAt;
+    var alreadyCancelled = !!cancelledAt;
     // A future occurrence can't be confirmed (it hasn't happened) — it can be
     // cancelled instead (marked 'missed'). Past/now → Confirm; future → Cancel.
     var isFuture = targetOcc ? (new Date(targetOcc).getTime() > Date.now()) : false;
-    var alreadyCancelled = isRegularEvent && data && (data.statuses || []).some(function (s) {
-      return s.occurrence_utc === targetOcc && s.status === "missed";
-    });
 
     return h(
       "div",
@@ -484,18 +489,22 @@
               // Past/now → Confirm (it happened); future → Cancel (call it off).
               isRegularEvent
                 ? (isFuture
-                    ? h("button", {
-                        className: "cal-cancel-btn",
-                        onClick: handleCancel,
-                        disabled: cancelling,
-                        title: alreadyCancelled ? "Update cancellation reason" : "Cancel this upcoming occurrence",
-                      }, cancelling ? "…" : "✕ Cancel")
-                    : h("button", {
-                        className: "cal-confirm-btn",
-                        onClick: handleConfirm,
-                        disabled: confirming,
-                        title: alreadyConfirmed ? "Re-confirm / update report" : "Mark this occurrence confirmed",
-                      }, confirming ? "…" : "✓ Confirm"))
+                    ? (alreadyCancelled
+                        ? null  // already cancelled — no re-cancel (status shown below)
+                        : h("button", {
+                            className: "cal-cancel-btn",
+                            onClick: handleCancel,
+                            disabled: cancelling,
+                            title: "Cancel this upcoming occurrence",
+                          }, cancelling ? "…" : "✕ Cancel"))
+                    : (alreadyConfirmed
+                        ? null  // already confirmed — no re-confirm (status shown below)
+                        : h("button", {
+                            className: "cal-confirm-btn",
+                            onClick: handleConfirm,
+                            disabled: confirming,
+                            title: "Mark this occurrence confirmed",
+                          }, confirming ? "…" : "✓ Confirm")))
                 : null,
               h(Button, { variant: "ghost", size: "sm", onClick: props.onClose }, "✕")
             )
@@ -624,30 +633,39 @@
                     : h("div", { className: "text-sm opacity-60" }, "No reports yet.")
                 ),
 
-                // Confirm/Cancel UI (textarea) — regular events only.
-                // Future occurrence → cancel mode (reason); past/now → confirm mode (report).
+                // Confirm/Cancel UI — regular events only. Already-confirmed /
+                // already-cancelled occurrences show the timestamp (no re-apply);
+                // otherwise a textarea: future → cancel reason, past/now → report.
                 isRegularEvent
-                  ? h(
-                      "div",
-                      { className: "space-y-2 pt-2 border-t" },
-                      alreadyConfirmed
-                        ? h("div", { className: "text-xs cal-resume-ok" }, "✓ already confirmed for this occurrence")
-                        : null,
-                      alreadyCancelled
-                        ? h("div", { className: "text-xs opacity-60" }, "✕ already cancelled for this occurrence")
-                        : null,
-                      h("label", { className: "text-xs font-semibold uppercase tracking-wide opacity-60", htmlFor: "cal-report-input" },
-                        isFuture ? "Reason for cancellation (optional)" : "Activity report / transcription (optional)"),
-                      h("textarea", {
-                        id: "cal-report-input",
-                        className: "cal-report-textarea",
-                        value: report,
-                        onChange: function (e) { setReport(e.target.value); },
-                        placeholder: isFuture
-                          ? "Why is this being cancelled?…"
-                          : "Add notes or a transcription for this occurrence…",
-                      })
-                    )
+                  ? (alreadyConfirmed
+                      ? h(
+                          "div",
+                          { className: "space-y-1 pt-2 border-t" },
+                          h("div", { className: "text-sm font-medium cal-resume-ok" }, "✓ Confirmed"),
+                          h("div", { className: "text-xs opacity-60" }, "on " + fmtDateTime(confirmedAt, data.tz))
+                        )
+                      : alreadyCancelled
+                        ? h(
+                            "div",
+                            { className: "space-y-1 pt-2 border-t" },
+                            h("div", { className: "text-sm font-medium" }, "✕ Cancelled"),
+                            h("div", { className: "text-xs opacity-60" }, "on " + fmtDateTime(cancelledAt, data.tz))
+                          )
+                        : h(
+                            "div",
+                            { className: "space-y-2 pt-2 border-t" },
+                            h("label", { className: "text-xs font-semibold uppercase tracking-wide opacity-60", htmlFor: "cal-report-input" },
+                              isFuture ? "Reason for cancellation (optional)" : "Activity report / transcription (optional)"),
+                            h("textarea", {
+                              id: "cal-report-input",
+                              className: "cal-report-textarea",
+                              value: report,
+                              onChange: function (e) { setReport(e.target.value); },
+                              placeholder: isFuture
+                                ? "Why is this being cancelled?…"
+                                : "Add notes or a transcription for this occurrence…",
+                            })
+                          ))
                   : h("div", { className: "text-xs opacity-40 pt-2 border-t" }, "Read-only — edits are made by talking to the assistant.")
               )
             : null
