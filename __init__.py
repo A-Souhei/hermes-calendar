@@ -783,7 +783,48 @@ def _handle_calendar_remove_event(args: Dict[str, Any], **kw) -> str:
             return tool_error(f"Failed to skip occurrence: {e}")
         return tool_result({"skipped_occurrence": occ_iso, "event_id": event_id})
 
-    # scope == "all" (default)
+    # scope == "all" (default) — PERMANENT deletion of the whole event/series.
+    # Force an explicit confirmation: the first call (without confirm=true)
+    # returns a prompt describing exactly what will be deleted and removes
+    # nothing. The agent must confirm with the user, then call again with
+    # confirm=true.
+    ev = store.get_event(event_id)
+    if ev is None:
+        return tool_error(f"Event not found: {event_id}")
+
+    if not bool(args.get("confirm", False)):
+        try:
+            n_statuses = len(store.list_statuses(event_id))
+        except Exception:
+            n_statuses = 0
+        try:
+            n_reports = len(store.list_reports(event_id))
+        except Exception:
+            n_reports = 0
+        is_rec = ev.get("recurrence") is not None
+        extras: List[str] = []
+        if is_rec:
+            extras.append("the entire recurring series")
+        if n_statuses:
+            extras.append(f"{n_statuses} status/session record(s)")
+        if n_reports:
+            extras.append(f"{n_reports} report(s)")
+        extra_txt = (" This also deletes " + ", ".join(extras) + ".") if extras else ""
+        num = ev.get("seq")
+        label = (f"#{num} " if num is not None else "") + (ev.get("title") or event_id)
+        return tool_result({
+            "needs_confirmation": True,
+            "removed": False,
+            "event_id": event_id,
+            "number": num,
+            "title": ev.get("title"),
+            "recurring": is_rec,
+            "message": (
+                f"This will permanently delete '{label}'.{extra_txt} "
+                "Confirm with the user, then call calendar_remove_event again with confirm=true."
+            ),
+        })
+
     try:
         removed = store.remove_event(event_id)
     except Exception as e:
@@ -1206,7 +1247,10 @@ CALENDAR_REMOVE_EVENT_SCHEMA = {
     "name": "calendar_remove_event",
     "description": (
         "Remove a calendar event. Use scope='all' (default) to delete the entire series, "
-        "or scope='occurrence' + occurrence date to skip a single occurrence of a recurring event."
+        "or scope='occurrence' + occurrence date to skip a single occurrence of a recurring event. "
+        "A full delete (scope='all') is PERMANENT and requires confirmation: call once WITHOUT "
+        "confirm to get a summary of what will be deleted, show it to the user, and only call "
+        "again with confirm=true after they explicitly agree."
     ),
     "parameters": {
         "type": "object",
@@ -1229,6 +1273,14 @@ CALENDAR_REMOVE_EVENT_SCHEMA = {
                 "description": (
                     "Required when scope='occurrence'. The datetime of the specific occurrence "
                     "to skip, e.g. '2026-07-14T09:00:00+03:00'."
+                ),
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": (
+                    "Must be true to actually perform a permanent full delete (scope='all'). "
+                    "Leave unset/false first to receive a confirmation prompt (needs_confirmation=true) "
+                    "describing what will be deleted; set true only after the user has confirmed."
                 ),
             },
         },

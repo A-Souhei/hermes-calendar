@@ -606,6 +606,28 @@ def test_handler_accepts_number_reference():
     assert r2["id"] == eid
 
 
+def test_remove_event_requires_confirmation():
+    """A full delete (scope='all') returns needs_confirmation and deletes nothing
+    until called again with confirm=true."""
+    o = "u_seq"
+    ev = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "delete-me", "start": "2026-09-09T09:00:00+03:00",
+    }))
+    eid = ev["id"]
+    seq = ev["number"]
+
+    # First call without confirm: nothing is deleted.
+    r1 = res(cal._handle_calendar_remove_event({"id": f"#{seq}", "owner": o}))
+    assert r1["needs_confirmation"] is True
+    assert r1["removed"] is False
+    assert store.get_event(eid) is not None, "event must still exist before confirmation"
+
+    # Second call with confirm=true: actually deleted.
+    r2 = res(cal._handle_calendar_remove_event({"id": eid, "confirm": True}))
+    assert r2["removed"] is True
+    assert store.get_event(eid) is None
+
+
 def test_calendar_tag_by_number_and_job():
     """calendar_tag adds tags to multiple events by number (merge, no clobber)
     and by job filter."""
