@@ -364,8 +364,10 @@ def _resolve_event_id(ref: Any, owner: Optional[str] = None) -> Optional[str]:
         s = s[1:].strip()
     # A 32-char hex string is an event id (uuid hex) — resolve it as such even
     # though it is digit-friendly, so an all-digit id is never mistaken for a
-    # per-owner #number reference.
+    # per-owner #number reference. Ids are stored lowercase, so normalize first
+    # (an uppercase uuid pasted by the user would otherwise miss).
     if len(s) == 32 and all(c in "0123456789abcdef" for c in s.lower()):
+        s = s.lower()
         return s if store.get_event(s) else None
     if s.isdigit():
         if not owner:
@@ -474,6 +476,8 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
             return tool_error(
                 f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'."
             )
+        if parsed_dur <= 0:
+            return tool_error("duration must be positive — a real time range needs a non-zero length.")
         duration_seconds = parsed_dur
     elif end_raw is not None:
         end_dt = _parse_start(end_raw, tz_name)
@@ -509,13 +513,17 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         logger.exception("calendar_add_event store error")
         return tool_error(f"Failed to save event: {e}")
 
-    # For a one-time past event with a duration, write a confirmed occurrence_status
-    # (source='manual') to record actuals — mirrors how a completed job is recorded.
+    # For a one-time event that has ALREADY FINISHED, write a confirmed
+    # occurrence_status (source='manual') to record actuals — mirrors how a
+    # completed job is recorded. Gate on the END time (start + duration), not
+    # just the start, so an event that began in the past but is still ongoing
+    # is not prematurely marked confirmed.
     if duration_seconds is not None and rec is None:
         now_utc = datetime.now(timezone.utc)
         start_aware = start_dt.astimezone(timezone.utc)
-        if start_aware < now_utc:
-            ended_utc = (start_aware + timedelta(seconds=duration_seconds)).isoformat()
+        ended_aware = start_aware + timedelta(seconds=duration_seconds)
+        if ended_aware <= now_utc:
+            ended_utc = ended_aware.isoformat()
             try:
                 store.set_status(
                     event_id, start_utc, "confirmed",
@@ -684,7 +692,9 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
                 return tool_error(
                     f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'."
                 )
-            fields["duration_seconds"] = parsed_dur
+            # A non-positive duration (e.g. '0' / '0 min') clears the range,
+            # matching the schema's "Pass 0 or null to clear".
+            fields["duration_seconds"] = parsed_dur if parsed_dur > 0 else None
         elif end_raw is not None:
             eff_tz = fields.get("tz") or ev.get("tz") or recurrence_mod.DEFAULT_TZ
             end_dt = _parse_start(end_raw, eff_tz)
@@ -731,25 +741,34 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
             existing_st = store.get_status(event_id, occ_key)
             if existing_st:
                 if new_dur is None:
-                    ended_upd = None
-                elif existing_st.get("started_utc"):
-                    try:
-                        s2 = existing_st["started_utc"]
-                        if s2.endswith("Z"):
-                            s2 = s2[:-1] + "+00:00"
-                        st_dt = datetime.fromisoformat(s2)
-                        if st_dt.tzinfo is None:
-                            st_dt = st_dt.replace(tzinfo=timezone.utc)
-                        ended_upd = (st_dt + timedelta(seconds=new_dur)).isoformat()
-                    except Exception:
-                        ended_upd = None
+                    # set_status preserves None args, so rebuild the row to
+                    # truly clear ended_utc/duration_seconds (keeping status,
+                    # started_utc, note and source).
+                    store.clear_status(event_id, occ_key)
+                    store.set_status(
+                        event_id, occ_key, existing_st["status"],
+                        started_utc=existing_st.get("started_utc"),
+                        note=existing_st.get("note"),
+                        source=existing_st.get("source"),
+                    )
                 else:
                     ended_upd = None
-                store.set_status(
-                    event_id, occ_key, existing_st["status"],
-                    ended_utc=ended_upd,
-                    duration_seconds=new_dur,
-                )
+                    if existing_st.get("started_utc"):
+                        try:
+                            s2 = existing_st["started_utc"]
+                            if s2.endswith("Z"):
+                                s2 = s2[:-1] + "+00:00"
+                            st_dt = datetime.fromisoformat(s2)
+                            if st_dt.tzinfo is None:
+                                st_dt = st_dt.replace(tzinfo=timezone.utc)
+                            ended_upd = (st_dt + timedelta(seconds=new_dur)).isoformat()
+                        except Exception:
+                            ended_upd = None
+                    store.set_status(
+                        event_id, occ_key, existing_st["status"],
+                        ended_utc=ended_upd,
+                        duration_seconds=new_dur,
+                    )
         except Exception:
             pass
 
@@ -3334,6 +3353,8 @@ def _handle_calendar_convert_to_job(args: Dict[str, Any], **kw) -> str:
             return tool_error(
                 f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'."
             )
+        if dur <= 0:
+            return tool_error("duration must be positive — a job session needs a non-zero length.")
     elif end_raw is not None:
         end_dt = _parse_start(end_raw, tz_name)
         if end_dt is None:
@@ -3375,6 +3396,11 @@ def _handle_calendar_convert_to_job(args: Dict[str, Any], **kw) -> str:
     if cat_raw is not None:
         update_fields["category"] = category
 
+    # Snapshot the fields we touch so we can roll back if the status write fails
+    # — otherwise the event would be left half-converted (job set, but no timer
+    # session), which won't aggregate correctly and is hard to diagnose.
+    prior = {k: ev.get(k) for k in update_fields}
+
     try:
         store.update_event(eid, update_fields)
     except Exception as e:
@@ -3391,6 +3417,10 @@ def _handle_calendar_convert_to_job(args: Dict[str, Any], **kw) -> str:
         )
     except Exception as e:
         logger.exception("calendar_convert_to_job set_status error")
+        try:
+            store.update_event(eid, prior)
+        except Exception:
+            logger.exception("calendar_convert_to_job rollback failed")
         return tool_error(f"Failed to write occurrence status: {e}")
 
     ev_after = store.get_event(eid)

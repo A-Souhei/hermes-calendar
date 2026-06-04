@@ -811,6 +811,56 @@ def test_future_event_with_duration_no_status_row():
     assert len(statuses) == 0, f"Expected no status for future event, got {statuses}"
 
 
+def test_add_event_rejects_nonpositive_duration():
+    """A zero/negative planned duration is rejected (a real range needs length)."""
+    o = "u_dur"
+    err = json.loads(cal._handle_calendar_add_event({
+        "owner": o, "title": "zero-dur", "start": "2030-02-02T09:00:00+03:00",
+        "duration": "0 min",
+    }))
+    assert not err["ok"] and "positive" in err["error"].lower()
+
+
+def test_ongoing_event_not_auto_confirmed():
+    """An event that started in the past but ENDS in the future (still ongoing)
+    must NOT be auto-confirmed — only finished events record actuals."""
+    o = "u_dur"
+    # Starts ~30 min ago, lasts 2 hours -> end is in the future.
+    start = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "ongoing", "start": start, "duration": "2 hours",
+    }))
+    statuses = store.list_statuses(r["id"])
+    assert len(statuses) == 0, f"Ongoing event must not be confirmed, got {statuses}"
+
+
+def test_update_event_clear_duration_via_zero_string_clears_status():
+    """Clearing the duration with a '0 min' string nulls duration_seconds AND
+    the occurrence_status ended/duration (set_status preserves None otherwise)."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "to-clear", "start": "2025-03-03T10:00:00+03:00",
+        "duration": "1 hour",
+    }))
+    eid = r["id"]
+    assert store.get_event(eid)["duration_seconds"] == 3600
+    res(cal._handle_calendar_update_event({"id": eid, "duration": "0 min"}))
+    assert store.get_event(eid)["duration_seconds"] is None
+    for st in store.list_statuses(eid):
+        assert st.get("duration_seconds") is None, "status duration not cleared"
+        assert st.get("ended_utc") is None, "status ended_utc not cleared"
+
+
+def test_resolve_event_id_uppercase_uuid():
+    """An uppercase uuid resolves (ids are stored lowercase)."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "upper-uuid", "start": "2030-04-04T09:00:00+03:00",
+    }))
+    eid = r["id"]
+    assert cal._resolve_event_id(eid.upper()) == eid
+
+
 # ---------------------------------------------------------------------------
 # calendar_convert_to_job and calendar_convert_to_regular
 # ---------------------------------------------------------------------------
@@ -865,6 +915,19 @@ def test_convert_to_job_requires_duration():
         "owner": o, "id": r["id"],
     }))
     assert not bad["ok"] and "duration" in bad["error"].lower()
+
+
+def test_convert_to_job_rejects_nonpositive_duration():
+    """convert_to_job with a zero/negative duration override is rejected."""
+    o = "u_conv"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "convert-zero",
+        "start": "2025-04-02T09:00:00+03:00", "duration": "1 hour",
+    }))
+    bad = json.loads(cal._handle_calendar_convert_to_job({
+        "owner": o, "id": r["id"], "duration": "0 min",
+    }))
+    assert not bad["ok"] and "positive" in bad["error"].lower()
 
 
 def test_convert_to_job_rejects_note():
