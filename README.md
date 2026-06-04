@@ -241,6 +241,14 @@ Both endpoints sit behind the dashboard's session-token auth middleware (same as
 the other plugins' write routes); the shared timer logic lives in `timers.py` so
 the tools and the dashboard cannot drift.
 
+## Notes
+
+Notes are alertless calendar entries for capturing quick thoughts and recalling them later ("what was that thing I noted last week?").
+
+- **Create** with `calendar_add_note` — supply `content` (the note text) and `owner`. Optional: `details` (longer body), `tags`, `when` (defaults to now), `language`.
+- **Recall** with `calendar_list_notes` — returns notes most-recent-first. Supports `query` (substring over content/details/tags) and `from`/`to` date-range bounds over the note's timestamp.
+- Notes are **never alerted** (`alert_channel=none`) and **never appear** in the agenda, calendar grid, or daily digest. They share the same SQLite `events` table, distinguished by `kind='note'`.
+
 ## Storage
 
 SQLite at `$HERMES_HOME/calendar.db` (default `~/.hermes/calendar.db`), WAL mode.

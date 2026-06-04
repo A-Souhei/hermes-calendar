@@ -144,6 +144,9 @@ def init_db() -> None:
         if "category" not in cols:
             conn.execute("ALTER TABLE events ADD COLUMN category TEXT")
             conn.commit()
+        if "kind" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN kind TEXT")
+            conn.commit()
         pcols = {row[1] for row in conn.execute("PRAGMA table_info(plannings)").fetchall()}
         if pcols and "tz" not in pcols:
             conn.execute("ALTER TABLE plannings ADD COLUMN tz TEXT")
@@ -166,6 +169,7 @@ def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
         else:
             d[field] = None
     d["all_day"] = bool(d.get("all_day", 0))
+    d["kind"] = d.get("kind") or "event"
     return d
 
 
@@ -185,8 +189,8 @@ def add_event(d: Dict[str, Any]) -> str:
                 (id, title, description, start_utc, tz, all_day,
                  recurrence, alert_lead_seconds, alert_channel,
                  meeting, location, tags, language, owner, notify_email,
-                 planning_id, job, category, created_utc, updated_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 planning_id, job, category, kind, created_utc, updated_utc)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 event_id,
@@ -207,6 +211,7 @@ def add_event(d: Dict[str, Any]) -> str:
                 d.get("planning_id"),
                 d.get("job"),
                 d.get("category"),
+                d.get("kind"),
                 now,
                 now,
             ),
@@ -263,16 +268,34 @@ def remove_event(event_id: str) -> bool:
     return cursor.rowcount > 0
 
 
-def list_events(owner: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_events(
+    owner: Optional[str] = None,
+    kind: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return events ordered by start_utc.
+
+    owner — case-insensitive owner filter; None returns all owners.
+    kind  — 'note' returns only notes; 'event' returns only regular events
+            (NULL/''/'event'); None returns everything (current default behaviour).
+    """
+    conditions: List[str] = []
+    params: List[Any] = []
+
+    if owner is not None:
+        conditions.append("owner COLLATE NOCASE = ?")
+        params.append(owner)
+
+    if kind == "note":
+        conditions.append("kind = 'note'")
+    elif kind == "event":
+        conditions.append("(kind IS NULL OR kind = '' OR kind = 'event')")
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    sql = f"SELECT * FROM events {where} ORDER BY start_utc"
+
     with _lock:
         conn = _get_conn()
-        if owner is not None:
-            rows = conn.execute(
-                "SELECT * FROM events WHERE owner COLLATE NOCASE = ? ORDER BY start_utc",
-                (owner,),
-            ).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM events ORDER BY start_utc").fetchall()
+        rows = conn.execute(sql, params).fetchall()
     return [_row_to_event(r) for r in rows]
 
 

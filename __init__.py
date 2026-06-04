@@ -331,6 +331,7 @@ def _event_summary(ev: Dict) -> Dict:
         "planning": _planning_name_for(ev),
         "job": ev.get("job"),
         "category": ev.get("category"),
+        "kind": ev.get("kind", "event"),
     }
 
 
@@ -663,7 +664,7 @@ def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
     owner_filter = (str(args["owner"]).strip() or None) if args.get("owner") else None
 
     try:
-        events = store.list_events(owner=owner_filter)
+        events = store.list_events(owner=owner_filter, kind="event")
     except Exception as e:
         return tool_error(f"Failed to list events: {e}")
 
@@ -776,6 +777,7 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
         "statuses": statuses,
         "created_utc": ev.get("created_utc"),
         "updated_utc": ev.get("updated_utc"),
+        "kind": ev.get("kind", "event"),
     })
 
 
@@ -2427,6 +2429,260 @@ CALENDAR_JOB_SUMMARY_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Notes (alertless quick-capture entries)
+# ---------------------------------------------------------------------------
+
+def _handle_calendar_add_note(args: Dict[str, Any], **kw) -> str:
+    """Create an alertless note entry stored in the calendar DB."""
+    content = str(args.get("content") or "").strip()
+    if not content:
+        return tool_error("content is required")
+
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error(
+            "owner is required — every note must belong to a user. Set 'owner' "
+            "to the person this note is for (typically the asker)."
+        )
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    tz_name = args.get("tz") or recurrence_mod.DEFAULT_TZ
+
+    when_raw = args.get("when")
+    if when_raw:
+        when_dt = _parse_start(when_raw, tz_name)
+        if when_dt is None:
+            return tool_error(f"Could not parse 'when': {when_raw!r}")
+    else:
+        when_dt = datetime.now(timezone.utc)
+
+    start_utc = when_dt.astimezone(timezone.utc).isoformat()
+
+    tags_raw = args.get("tags")
+    tags: Optional[List[str]] = None
+    if isinstance(tags_raw, list):
+        tags = [str(t) for t in tags_raw]
+
+    lang_raw = args.get("language")
+    language: Optional[str] = None
+    if lang_raw is not None:
+        lang_lower = str(lang_raw).strip().lower()
+        language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
+
+    d = {
+        "title": content,
+        "description": args.get("details"),
+        "start_utc": start_utc,
+        "tz": tz_name,
+        "all_day": False,
+        "recurrence": None,
+        "alert_lead_seconds": None,
+        "alert_channel": "none",
+        "meeting": None,
+        "location": None,
+        "tags": tags,
+        "language": language,
+        "owner": owner,
+        "notify_email": None,
+        "planning_id": None,
+        "kind": "note",
+    }
+    try:
+        event_id = store.add_event(d)
+    except Exception as e:
+        logger.exception("calendar_add_note store error")
+        return tool_error(f"Failed to save note: {e}")
+
+    return tool_result({
+        "created": True,
+        "kind": "note",
+        "id": event_id,
+        "content": content,
+        "when_utc": start_utc,
+        "tags": tags,
+        "owner": owner,
+    })
+
+
+def _handle_calendar_list_notes(args: Dict[str, Any], **kw) -> str:
+    """Search and return notes for an owner, most recent first."""
+    from zoneinfo import ZoneInfo
+
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error("owner is required")
+
+    try:
+        notes = store.list_events(owner=owner, kind="note")
+    except Exception as e:
+        return tool_error(f"Failed to list notes: {e}")
+
+    # Optional date-range filter on note timestamp (start_utc).
+    from_raw = args.get("from")
+    to_raw = args.get("to")
+    range_start: Optional[datetime] = None
+    range_end: Optional[datetime] = None
+    if from_raw:
+        range_start = _parse_start(from_raw, recurrence_mod.DEFAULT_TZ)
+        if range_start is None:
+            return tool_error(f"Could not parse 'from': {from_raw!r}")
+        range_start = range_start.astimezone(timezone.utc)
+    if to_raw:
+        range_end = _parse_start(to_raw, recurrence_mod.DEFAULT_TZ)
+        if range_end is None:
+            return tool_error(f"Could not parse 'to': {to_raw!r}")
+        range_end = range_end.astimezone(timezone.utc)
+
+    # Optional substring filter over title, description, and tags.
+    query = str(args.get("query") or "").strip().lower()
+
+    result_notes = []
+    for note in notes:
+        # Date-range filter.
+        if range_start is not None or range_end is not None:
+            try:
+                s = str(note["start_utc"])
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                note_dt = datetime.fromisoformat(s)
+                if note_dt.tzinfo is None:
+                    note_dt = note_dt.replace(tzinfo=timezone.utc)
+                note_dt = note_dt.astimezone(timezone.utc)
+            except Exception:
+                note_dt = None
+            if note_dt is not None:
+                if range_start is not None and note_dt < range_start:
+                    continue
+                if range_end is not None and note_dt > range_end:
+                    continue
+
+        # Substring filter.
+        if query:
+            haystack = " ".join(filter(None, [
+                note.get("title", ""),
+                note.get("description", ""),
+                " ".join(note.get("tags") or []),
+            ])).lower()
+            if query not in haystack:
+                continue
+
+        # Render when_local in the note's tz.
+        tz_name = note.get("tz") or recurrence_mod.DEFAULT_TZ
+        try:
+            note_tz = ZoneInfo(tz_name)
+            s = str(note["start_utc"])
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            when_local = dt.astimezone(note_tz).isoformat()
+        except Exception:
+            when_local = note["start_utc"]
+
+        result_notes.append({
+            "id": note["id"],
+            "content": note["title"],
+            "details": note.get("description"),
+            "when_utc": note["start_utc"],
+            "when_local": when_local,
+            "tags": note.get("tags"),
+            "created_utc": note.get("created_utc"),
+        })
+
+    # Most recent first.
+    result_notes.sort(key=lambda n: n["when_utc"], reverse=True)
+
+    return tool_result({"count": len(result_notes), "notes": result_notes})
+
+
+CALENDAR_ADD_NOTE_SCHEMA = {
+    "name": "calendar_add_note",
+    "description": (
+        "Capture an alertless note — a quick thought or piece of information to recall later "
+        "('what was that thing I noted last week?'). Notes are NEVER alerted and do NOT appear "
+        "in the agenda, calendar grid, or daily digest. They are owner-scoped and searchable "
+        "via calendar_list_notes. Use this when the user wants to jot something down for later "
+        "recall rather than schedule an event."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The note text (required). Stored as the entry title for searching.",
+            },
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "details": {
+                "type": "string",
+                "description": "Optional longer body / elaboration on the note.",
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags for grouping/filtering, e.g. ['idea', 'project-x'].",
+            },
+            "when": {
+                "type": "string",
+                "description": (
+                    "When the thought occurred (ISO datetime). Defaults to now. "
+                    "Useful when capturing a past thought: 'I had this idea yesterday' → "
+                    "pass yesterday's datetime. This timestamp is what makes "
+                    "'recall notes from last week' work."
+                ),
+            },
+            "language": {
+                "type": ["string", "null"],
+                "enum": ["en", "fr", None],
+                "description": _LANGUAGE_DESCRIPTION,
+            },
+            "tz": {
+                "type": "string",
+                "description": (
+                    f"IANA timezone for interpreting the 'when' string. "
+                    f"Defaults to {recurrence_mod.DEFAULT_TZ}."
+                ),
+            },
+        },
+        "required": ["content", "owner"],
+    },
+}
+
+CALENDAR_LIST_NOTES_SCHEMA = {
+    "name": "calendar_list_notes",
+    "description": (
+        "Search an owner's notes for recall. Returns notes most-recent-first. "
+        "Supports an optional text query (substring match over content, details, and tags), "
+        "and optional 'from'/'to' date-range bounds over the note's timestamp "
+        "(e.g. pass last Monday … today for 'what did I note last week?'). "
+        "Notes never appear in the agenda or digest — use this tool to recall them."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "query": {
+                "type": "string",
+                "description": "Substring filter applied (case-insensitive) to content, details, and tags.",
+            },
+            "from": {
+                "type": "string",
+                "description": "Lower bound on note timestamp (ISO datetime). E.g. start of last week.",
+            },
+            "to": {
+                "type": "string",
+                "description": "Upper bound on note timestamp (ISO datetime). E.g. end of last week.",
+            },
+        },
+        "required": ["owner"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -2453,6 +2709,8 @@ _TOOLS = (
     ("calendar_digest",           CALENDAR_DIGEST_SCHEMA,           _handle_calendar_digest,           "🗞️"),
     ("calendar_list_jobs",        CALENDAR_LIST_JOBS_SCHEMA,        _handle_calendar_list_jobs,        "🧰"),
     ("calendar_job_summary",      CALENDAR_JOB_SUMMARY_SCHEMA,      _handle_calendar_job_summary,      "📊"),
+    ("calendar_add_note",         CALENDAR_ADD_NOTE_SCHEMA,         _handle_calendar_add_note,         "🗒️"),
+    ("calendar_list_notes",       CALENDAR_LIST_NOTES_SCHEMA,       _handle_calendar_list_notes,       "📒"),
 )
 
 
