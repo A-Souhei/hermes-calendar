@@ -241,9 +241,13 @@ def _occurrences_in_range(
         for occ in occs:
             occ_iso = occ.isoformat()
             status_row = status_map.get(occ_iso)
-            # Planned duration from the event itself.
+            # Duration: prefer the measured (status) duration of a job/timer
+            # session, else the event's planned span. This keeps job events —
+            # whose duration lives only in occurrence_status — showing a span.
             ev_dur = ev.get("duration_seconds")
-            # end_utc: prefer status.ended_utc, else compute from planned span.
+            status_dur = status_row.get("duration_seconds") if status_row else None
+            occ_dur = status_dur if status_dur is not None else ev_dur
+            # end_utc: prefer status.ended_utc, else compute from the planned span.
             ended_utc: Optional[str] = None
             if status_row and status_row.get("ended_utc"):
                 ended_utc = status_row["ended_utc"]
@@ -275,7 +279,7 @@ def _occurrences_in_range(
                 "effective_status": "floating" if is_note else _effective_status(
                     status_row["status"] if status_row else "floating", occ, now
                 ),
-                "duration_seconds": ev_dur,
+                "duration_seconds": occ_dur,
             })
     out.sort(key=lambda e: e["occurrence_utc"])
     return out
@@ -526,11 +530,15 @@ def event_detail(event_id: str):
             ev_end_utc = (start_dt_ev + timedelta(seconds=ev_dur)).isoformat()
         except Exception:
             ev_end_utc = None
-    # Prefer status.ended_utc for the resolved occurrence if it exists.
+    # Prefer status.ended_utc / measured duration for the resolved occurrence.
     occ_key_for_end = ev.get("start_utc") or ""
+    occ_dur = ev_dur
     for s in statuses:
-        if s.get("occurrence_utc") == occ_key_for_end and s.get("ended_utc"):
-            ev_end_utc = s["ended_utc"]
+        if s.get("occurrence_utc") == occ_key_for_end:
+            if s.get("ended_utc"):
+                ev_end_utc = s["ended_utc"]
+            if s.get("duration_seconds") is not None:
+                occ_dur = s["duration_seconds"]
             break
     return {
         "id": ev["id"],
@@ -539,7 +547,7 @@ def event_detail(event_id: str):
         "description": ev.get("description"),
         "start_utc": ev.get("start_utc"),
         "end_utc": ev_end_utc,
-        "duration_seconds": ev_dur,
+        "duration_seconds": occ_dur,
         "tz": ev.get("tz") or recurrence.DEFAULT_TZ,
         "all_day": bool(ev.get("all_day")),
         "recurrence": ev.get("recurrence"),
