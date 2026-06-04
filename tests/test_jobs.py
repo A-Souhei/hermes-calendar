@@ -49,6 +49,9 @@ _registry_data = {
         {"name": "u_notelist", "email": "notelist@example.com", "language": "en"},
         {"name": "u_noteflt",  "email": "noteflt@example.com",  "language": "en"},
         {"name": "u_log",      "email": "log@example.com",      "language": "en"},
+        {"name": "u_seq",      "email": "seq@example.com",      "language": "en"},
+        {"name": "u_seq2",     "email": "seq2@example.com",     "language": "en"},
+        {"name": "u_tag",      "email": "tag@example.com",      "language": "en"},
         {"name": "u_noemail"},  # registered but no email (for the planning gate test)
     ]
 }
@@ -468,6 +471,213 @@ def test_log_job_rejects_future_and_bad_range():
     bad_owner = json.loads(cal._handle_calendar_log_job({
         "owner": "ghost_user_xyz", "job": "x", "start": "2026-06-03T14:00:00+03:00", "duration": "1h"}))
     assert not bad_owner["ok"] and "calendar-users.json" in bad_owner["error"]
+
+
+# ---------------------------------------------------------------------------
+# seq / per-owner numbering + _resolve_event_id + calendar_tag
+# ---------------------------------------------------------------------------
+
+def test_seq_per_owner_numbering():
+    """add_event assigns sequential per-owner numbers (monotonically increasing);
+    a fresh owner gets a monotone sequence starting at 1."""
+    o = "u_seq"
+    e1 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "seq-a", "start": "2026-07-10T09:00:00+03:00",
+    }))
+    e2 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "seq-b", "start": "2026-07-11T09:00:00+03:00",
+    }))
+    e3 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "seq-c", "start": "2026-07-12T09:00:00+03:00",
+    }))
+    # Numbers must be strictly increasing consecutive integers.
+    assert e1["number"] is not None
+    assert e2["number"] == e1["number"] + 1
+    assert e3["number"] == e2["number"] + 1
+
+    # A completely fresh owner (no prior events) starts at 1.
+    # Use a unique per-test owner to guarantee a clean slate.
+    import uuid as _uuid
+    fresh_owner = "u_fresh_" + _uuid.uuid4().hex[:6]
+    # Register the fresh owner on-the-fly via the registry file.
+    import json as _json
+    with open(_registry_path, "r", encoding="utf-8") as _f:
+        reg = _json.load(_f)
+    reg["users"].append({"name": fresh_owner, "email": fresh_owner + "@example.com"})
+    with open(_registry_path, "w", encoding="utf-8") as _f:
+        _json.dump(reg, _f)
+    # Reload users module so it picks up the new registry entry.
+    cal.users_mod._registry_cache.clear() if hasattr(cal.users_mod, "_registry_cache") else None
+    import importlib
+    importlib.reload(cal.users_mod)
+
+    e_fresh = res(cal._handle_calendar_add_event({
+        "owner": fresh_owner, "title": "first ever", "start": "2026-07-01T10:00:00+03:00",
+    }))
+    assert e_fresh["number"] == 1
+
+
+def test_seq_migration_and_backfill():
+    """The seq column exists after init_db(); existing rows (created before the
+    migration ran for the first time) have seq populated."""
+    cols = {r[1] for r in store._get_conn().execute("PRAGMA table_info(events)").fetchall()}
+    assert "seq" in cols, "seq column missing from events table"
+
+    # Every event with a non-empty owner must have a non-NULL seq.
+    rows = store._get_conn().execute(
+        "SELECT id, owner, seq FROM events WHERE owner IS NOT NULL AND owner != ''"
+    ).fetchall()
+    for row in rows:
+        assert row[2] is not None, (
+            f"Event {row[0]} (owner={row[1]!r}) has NULL seq after migration/backfill"
+        )
+
+
+def test_resolve_event_id_variants():
+    """_resolve_event_id resolves '#N', 'N', and full uuids; returns None for a
+    number without owner."""
+    o = "u_seq"
+    # Create a dedicated event so this test is self-contained regardless of run order.
+    ev = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "resolve-test", "start": "2026-11-01T09:00:00+03:00",
+    }))
+    full_id = ev["id"]
+    seq_num = ev["number"]
+    assert seq_num is not None
+
+    # Full uuid works without owner.
+    assert cal._resolve_event_id(full_id) == full_id
+
+    # #N with owner.
+    assert cal._resolve_event_id(f"#{seq_num}", owner=o) == full_id
+
+    # Plain digit string with owner.
+    assert cal._resolve_event_id(str(seq_num), owner=o) == full_id
+
+    # Number without owner returns None.
+    assert cal._resolve_event_id(str(seq_num), owner=None) is None
+
+    # Non-existent seq returns None.
+    assert cal._resolve_event_id("#9999", owner=o) is None
+
+    # Unknown uuid returns None.
+    assert cal._resolve_event_id("deadbeef" * 4) is None
+
+
+def test_handler_accepts_number_reference():
+    """calendar_get_event and calendar_set_status work with a #number + owner."""
+    o = "u_seq"
+    # Create a fresh event to get a known seq number.
+    ev_created = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "handler-ref-test", "start": "2026-10-01T09:00:00+03:00",
+    }))
+    seq = ev_created["number"]
+    eid = ev_created["id"]
+    assert seq is not None
+
+    # calendar_get_event by #number.
+    r = res(cal._handle_calendar_get_event({"id": f"#{seq}", "owner": o}))
+    assert r["id"] == eid
+    assert r["number"] == seq
+
+    # calendar_set_status by plain digit string.
+    r2 = res(cal._handle_calendar_set_status({
+        "id": str(seq), "owner": o, "status": "confirmed",
+    }))
+    assert r2["id"] == eid
+
+
+def test_calendar_tag_by_number_and_job():
+    """calendar_tag adds tags to multiple events by number (merge, no clobber)
+    and by job filter."""
+    o = "u_tag"
+
+    # Create two events with pre-existing tags.
+    e1 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "tagged-one", "start": "2026-08-01T09:00:00+03:00",
+        "tags": ["existing"],
+    }))
+    e2 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "tagged-two", "start": "2026-08-02T09:00:00+03:00",
+    }))
+    # A job event.
+    e3 = res(cal._handle_calendar_start_timer({
+        "owner": o, "title": "job session", "job": "myproject", "duration": "30 min",
+    }))
+
+    n1, n2 = e1["number"], e2["number"]
+
+    # Add "urgent" to #n1 and #n2 — should not clobber "existing" on e1.
+    r = res(cal._handle_calendar_tag({
+        "owner": o,
+        "ids": [f"#{n1}", f"#{n2}"],
+        "add_tags": ["urgent"],
+    }))
+    assert r["updated"] >= 1
+
+    ev1 = store.get_event(e1["id"])
+    assert "existing" in (ev1["tags"] or []), "pre-existing tag must not be clobbered"
+    assert "urgent" in (ev1["tags"] or [])
+
+    ev2 = store.get_event(e2["id"])
+    assert "urgent" in (ev2["tags"] or [])
+
+    # Tag by job filter.
+    r2 = res(cal._handle_calendar_tag({
+        "owner": o,
+        "job": "myproject",
+        "add_tags": ["billable"],
+    }))
+    assert r2["updated"] >= 1
+    ev3 = store.get_event(e3["id"])
+    assert "billable" in (ev3["tags"] or [])
+
+    # remove_tags works.
+    r3 = res(cal._handle_calendar_tag({
+        "owner": o,
+        "ids": [f"#{n1}"],
+        "remove_tags": ["existing"],
+    }))
+    ev1b = store.get_event(e1["id"])
+    assert "existing" not in (ev1b["tags"] or [])
+
+
+def test_update_event_add_remove_tags():
+    """calendar_update_event add_tags/remove_tags merge correctly without clobber."""
+    o = "u_tag"
+    e = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "merge-test", "start": "2026-09-01T10:00:00+03:00",
+        "tags": ["alpha", "beta"],
+    }))
+    eid = e["id"]
+
+    # Add "gamma", remove "alpha".
+    r = res(cal._handle_calendar_update_event({
+        "id": eid,
+        "add_tags": ["gamma"],
+        "remove_tags": ["alpha"],
+    }))
+    ev = store.get_event(eid)
+    tags = ev["tags"] or []
+    assert "beta" in tags
+    assert "gamma" in tags
+    assert "alpha" not in tags
+
+    # Full replacement with tags= still works.
+    r2 = res(cal._handle_calendar_update_event({
+        "id": eid,
+        "tags": ["only"],
+    }))
+    assert store.get_event(eid)["tags"] == ["only"]
+
+    # add_tags on top of replacement in same call.
+    r3 = res(cal._handle_calendar_update_event({
+        "id": eid,
+        "tags": ["base"],
+        "add_tags": ["extra"],
+    }))
+    final = store.get_event(eid)["tags"] or []
+    assert "base" in final and "extra" in final
 
 
 def _run_all():

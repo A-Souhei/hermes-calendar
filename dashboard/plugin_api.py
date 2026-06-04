@@ -243,6 +243,7 @@ def _occurrences_in_range(
             status_row = status_map.get(occ_iso)
             out.append({
                 "id": ev["id"],
+                "number": ev.get("seq"),
                 "title": ev["title"],
                 "kind": ev.get("kind", "event"),
                 "occurrence_utc": occ_iso,
@@ -502,6 +503,7 @@ def event_detail(event_id: str):
 
     return {
         "id": ev["id"],
+        "number": ev.get("seq"),
         "title": ev["title"],
         "description": ev.get("description"),
         "start_utc": ev.get("start_utc"),

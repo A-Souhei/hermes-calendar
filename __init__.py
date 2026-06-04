@@ -316,6 +316,7 @@ def _event_summary(ev: Dict) -> Dict:
     """Return a compact summary suitable for tool responses."""
     return {
         "id": ev["id"],
+        "number": ev.get("seq"),
         "title": ev["title"],
         "start_utc": ev["start_utc"],
         "tz": ev.get("tz"),
@@ -333,6 +334,26 @@ def _event_summary(ev: Dict) -> Dict:
         "category": ev.get("category"),
         "kind": ev.get("kind", "event"),
     }
+
+
+def _resolve_event_id(ref: Any, owner: Optional[str] = None) -> Optional[str]:
+    """Resolve an event reference to a stored event id.
+
+    Accepts a full event id (uuid hex) OR a per-owner number ('#3' / '3') —
+    a number requires `owner` (the asker) to resolve. Returns the id or None.
+    """
+    s = str(ref or "").strip()
+    if not s:
+        return None
+    if s.startswith("#"):
+        s = s[1:].strip()
+    if s.isdigit():
+        if not owner:
+            return None
+        ev = store.get_event_by_seq(str(owner).strip(), int(s))
+        return ev["id"] if ev else None
+    # Otherwise treat as a real id.
+    return s if store.get_event(s) else None
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +473,10 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
-    event_id = str(args.get("id") or "").strip()
-    if not event_id:
-        return tool_error("id is required")
+    eid = _resolve_event_id(args.get("id"), owner=args.get("owner"))
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    event_id = eid
 
     ev = store.get_event(event_id)
     if ev is None:
@@ -541,6 +563,28 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
         tags_raw = args["tags"]
         fields["tags"] = [str(t) for t in tags_raw] if isinstance(tags_raw, list) else None
 
+    # add_tags / remove_tags: merge into current (or just-replaced) tags list.
+    add_tags_raw = args.get("add_tags")
+    remove_tags_raw = args.get("remove_tags")
+    if add_tags_raw is not None or remove_tags_raw is not None:
+        # Base is whatever tags will be set after the `tags` replacement above,
+        # or the existing stored tags if no replacement was requested.
+        base_tags: List[str] = list(
+            fields["tags"] if "tags" in fields
+            else (ev.get("tags") or [])
+        )
+        if remove_tags_raw and isinstance(remove_tags_raw, list):
+            remove_lower = {str(t).strip().lower() for t in remove_tags_raw}
+            base_tags = [t for t in base_tags if t.strip().lower() not in remove_lower]
+        if add_tags_raw and isinstance(add_tags_raw, list):
+            existing_lower = {t.strip().lower() for t in base_tags}
+            for t in add_tags_raw:
+                ts = str(t).strip()
+                if ts and ts.lower() not in existing_lower:
+                    base_tags.append(ts)
+                    existing_lower.add(ts.lower())
+        fields["tags"] = base_tags if base_tags else None
+
     if "language" in args:
         lang_raw = args["language"]
         if lang_raw is None:
@@ -586,9 +630,10 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_remove_event(args: Dict[str, Any], **kw) -> str:
-    event_id = str(args.get("id") or "").strip()
-    if not event_id:
-        return tool_error("id is required")
+    eid = _resolve_event_id(args.get("id"), owner=args.get("owner"))
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    event_id = eid
 
     scope = str(args.get("scope") or "all").strip().lower()
     occurrence_raw = args.get("occurrence")
@@ -708,6 +753,7 @@ def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
             status_row = store.get_status(ev["id"], occ_iso)
             items.append({
                 "id": ev["id"],
+                "number": ev.get("seq"),
                 "title": ev["title"],
                 "occurrence_local": occ_local.isoformat(),
                 "occurrence_utc": occ_iso,
@@ -727,9 +773,10 @@ def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
-    event_id = str(args.get("id") or "").strip()
-    if not event_id:
-        return tool_error("id is required")
+    eid = _resolve_event_id(args.get("id"), owner=args.get("owner"))
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    event_id = eid
 
     ev = store.get_event(event_id)
     if ev is None:
@@ -756,6 +803,7 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
 
     return tool_result({
         "id": ev["id"],
+        "number": ev.get("seq"),
         "title": ev["title"],
         "description": ev.get("description"),
         "start_utc": ev["start_utc"],
@@ -960,6 +1008,19 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
             },
             "location": {"type": "string"},
             "tags": {"type": "array", "items": {"type": "string"}},
+            "add_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Tags to add (merged; existing tags preserved). Applied after 'tags' "
+                    "replacement if both are given. Case-insensitive dedup."
+                ),
+            },
+            "remove_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tags to remove (case-insensitive). Applied after 'tags' replacement if both given.",
+            },
             "language": {
                 "type": ["string", "null"],
                 "enum": ["en", "fr", None],
@@ -988,7 +1049,14 @@ CALENDAR_REMOVE_EVENT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Event ID."},
+            "id": {"type": "string", "description": "Event ID or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
             "scope": {
                 "type": "string",
                 "enum": ["all", "occurrence"],
@@ -1052,7 +1120,14 @@ CALENDAR_GET_EVENT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Event ID."},
+            "id": {"type": "string", "description": "Event ID or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
         },
         "required": ["id"],
     },
@@ -1117,9 +1192,11 @@ def _report_event_id(args: Dict[str, Any]) -> str:
 
 
 def _handle_calendar_set_report(args: Dict[str, Any], **kw) -> str:
-    event_id = _report_event_id(args)
-    if not event_id:
+    raw_id = _report_event_id(args)
+    eid = _resolve_event_id(raw_id, owner=args.get("owner")) if raw_id else None
+    if not eid:
         return tool_error("id (the event id) is required")
+    event_id = eid
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1151,9 +1228,11 @@ def _handle_calendar_set_report(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_get_report(args: Dict[str, Any], **kw) -> str:
-    event_id = _report_event_id(args)
-    if not event_id:
+    raw_id = _report_event_id(args)
+    eid = _resolve_event_id(raw_id, owner=args.get("owner")) if raw_id else None
+    if not eid:
         return tool_error("id (the event id) is required")
+    event_id = eid
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1170,9 +1249,11 @@ def _handle_calendar_get_report(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_list_reports(args: Dict[str, Any], **kw) -> str:
-    event_id = _report_event_id(args)
-    if not event_id:
+    raw_id = _report_event_id(args)
+    eid = _resolve_event_id(raw_id, owner=args.get("owner")) if raw_id else None
+    if not eid:
         return tool_error("id (the event id) is required")
+    event_id = eid
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1198,7 +1279,14 @@ CALENDAR_SET_REPORT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "The event id."},
+            "id": {"type": "string", "description": "Event id or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
             "occurrence": {"type": "string", "description": "Occurrence date/datetime — required for recurring events; omit for one-time."},
             "minutes": {"type": "string", "description": "Meeting minutes / what happened."},
             "transcription": {"type": "string", "description": "Full transcription of the meeting."},
@@ -1224,7 +1312,14 @@ CALENDAR_GET_REPORT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "The event id."},
+            "id": {"type": "string", "description": "Event id or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
             "occurrence": {"type": "string", "description": "Occurrence date/datetime — required for recurring; omit for one-time."},
         },
         "required": ["id"],
@@ -1239,7 +1334,16 @@ CALENDAR_LIST_REPORTS_SCHEMA = {
     ),
     "parameters": {
         "type": "object",
-        "properties": {"id": {"type": "string", "description": "The event id."}},
+        "properties": {
+            "id": {"type": "string", "description": "Event id or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
+        },
         "required": ["id"],
     },
 }
@@ -1250,9 +1354,10 @@ CALENDAR_LIST_REPORTS_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def _handle_calendar_set_status(args: Dict[str, Any], **kw) -> str:
-    event_id = str(args.get("id") or "").strip()
-    if not event_id:
-        return tool_error("id is required")
+    eid = _resolve_event_id(args.get("id"), owner=args.get("owner"))
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    event_id = eid
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1612,7 +1717,14 @@ CALENDAR_SET_STATUS_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Event ID."},
+            "id": {"type": "string", "description": "Event ID or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
             "occurrence": {
                 "type": "string",
                 "description": (
@@ -2729,6 +2841,7 @@ def _handle_calendar_list_notes(args: Dict[str, Any], **kw) -> str:
 
         result_notes.append({
             "id": note["id"],
+            "number": note.get("seq"),
             "content": note["title"],
             "details": note.get("description"),
             "when_utc": note["start_utc"],
@@ -2827,6 +2940,143 @@ CALENDAR_LIST_NOTES_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# General tag tool
+# ---------------------------------------------------------------------------
+
+def _handle_calendar_tag(args: Dict[str, Any], **kw) -> str:
+    """Tag (or untag) any set of events by #number, uuid, or job filter."""
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error("owner is required")
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    ids_raw = args.get("ids")
+    job_filter = (str(args.get("job") or "").strip() or None)
+    if not ids_raw and not job_filter:
+        return tool_error("Provide at least one of 'ids' or 'job' to select events.")
+
+    add_tags_raw = args.get("add_tags")
+    remove_tags_raw = args.get("remove_tags")
+    if not add_tags_raw and not remove_tags_raw:
+        return tool_error("Provide at least one of 'add_tags' or 'remove_tags'.")
+
+    add_tags: List[str] = [str(t).strip() for t in add_tags_raw if str(t).strip()] if add_tags_raw else []
+    remove_tags: List[str] = [str(t).strip() for t in remove_tags_raw if str(t).strip()] if remove_tags_raw else []
+    remove_lower = {t.lower() for t in remove_tags}
+
+    # Build target event id set.
+    target_ids: List[str] = []
+    not_found: List[str] = []
+
+    if ids_raw and isinstance(ids_raw, list):
+        for ref in ids_raw:
+            eid = _resolve_event_id(ref, owner=owner)
+            if eid:
+                if eid not in target_ids:
+                    target_ids.append(eid)
+            else:
+                not_found.append(str(ref))
+
+    if job_filter:
+        try:
+            all_evs = store.list_events(owner=owner)
+        except Exception as e:
+            return tool_error(f"Failed to list events: {e}")
+        for ev in all_evs:
+            ev_job = ev.get("job") or ""
+            if ev_job.strip().lower() == job_filter.lower():
+                if ev["id"] not in target_ids:
+                    target_ids.append(ev["id"])
+
+    if not target_ids and not not_found:
+        return tool_result({"updated": 0, "events": [], "not_found": []})
+
+    updated_count = 0
+    updated_events = []
+    for eid in target_ids:
+        ev = store.get_event(eid)
+        if ev is None:
+            not_found.append(eid)
+            continue
+        current_tags: List[str] = list(ev.get("tags") or [])
+        new_tags = [t for t in current_tags if t.strip().lower() not in remove_lower]
+        existing_lower = {t.strip().lower() for t in new_tags}
+        for t in add_tags:
+            if t.lower() not in existing_lower:
+                new_tags.append(t)
+                existing_lower.add(t.lower())
+        # Only write if something changed.
+        if new_tags != current_tags:
+            try:
+                store.update_event(eid, {"tags": new_tags if new_tags else None})
+            except Exception as e:
+                logger.warning("calendar_tag: failed to update %s: %s", eid, e)
+                continue
+            updated_count += 1
+        updated_events.append({
+            "number": ev.get("seq"),
+            "id": eid,
+            "title": ev.get("title"),
+            "job": ev.get("job"),
+            "tags": new_tags if new_tags else None,
+        })
+
+    return tool_result({
+        "updated": updated_count,
+        "events": updated_events,
+        "not_found": not_found,
+    })
+
+
+CALENDAR_TAG_SCHEMA = {
+    "name": "calendar_tag",
+    "description": (
+        "Add or remove tags on ANY event kind (regular event, note, or job session) "
+        "by #number, uuid, or job name — without clobbering existing tags. "
+        "Works across all dates including past job sessions that calendar_list_events' "
+        "default future window would miss. "
+        "Examples: 'add tag urgent to #1 #2 #4', 'tag the audrey job with client', "
+        "'remove tag draft from #3'. "
+        "Tags are merged case-insensitively (no duplicates, originals preserved)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Event references to tag — each can be a #number (e.g. '#3' or '3'), "
+                    "or a full event uuid. Requires owner to resolve #numbers."
+                ),
+            },
+            "job": {
+                "type": "string",
+                "description": (
+                    "Restrict to the owner's events whose job field matches this value "
+                    "(case-insensitive). All matching events are tagged."
+                ),
+            },
+            "add_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tags to add (merged; existing tags preserved). Case-insensitive dedup.",
+            },
+            "remove_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tags to remove (case-insensitive match).",
+            },
+        },
+        "required": ["owner"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -2856,6 +3106,7 @@ _TOOLS = (
     ("calendar_job_summary",      CALENDAR_JOB_SUMMARY_SCHEMA,      _handle_calendar_job_summary,      "📊"),
     ("calendar_add_note",         CALENDAR_ADD_NOTE_SCHEMA,         _handle_calendar_add_note,         "🗒️"),
     ("calendar_list_notes",       CALENDAR_LIST_NOTES_SCHEMA,       _handle_calendar_list_notes,       "📒"),
+    ("calendar_tag",              CALENDAR_TAG_SCHEMA,              _handle_calendar_tag,              "🏷️"),
 )
 
 

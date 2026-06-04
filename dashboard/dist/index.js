@@ -456,7 +456,12 @@
             h(
               "div",
               { className: "space-y-1" },
-              h("h2", { className: "text-lg font-semibold leading-tight" }, data ? data.title : "Loading…"),
+              h("h2", { className: "text-lg font-semibold leading-tight" },
+                data && data.number != null
+                  ? h("span", null,
+                      h("span", { className: "cal-evnum" }, "#" + data.number + " "),
+                      data.title)
+                  : (data ? data.title : "Loading…")),
               data && data.recurrence_human
                 ? h(Badge, { variant: "secondary" }, "↻ " + data.recurrence_human)
                 : null,
@@ -812,6 +817,7 @@
                     { className: "agenda-titleline" },
                     ev.kind === "note" ? h("span", { className: "agenda-note-glyph" }, "🗒️") : null,
                     ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null,
+                    ev.number != null ? h("span", { className: "agenda-evnum" }, "#" + ev.number + " ") : null,
                     h("span", { className: "agenda-evtitle" }, (ev.has_report ? "📝 " : "") + ev.title),
                     dur ? h("span", { className: "agenda-dur" }, dur) : null
                   ),

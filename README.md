@@ -7,6 +7,10 @@ is through the agent (CRUD via tools); a dashboard tab adds read-only
 Calendar/Plannings views plus one-click timer resume/stop. Owners are
 **pre-registered** (see [User registry](#user-registry)).
 
+## Referencing events by number
+
+Every event gets a short per-owner sequential number (`#1`, `#2`, …). You can pass `#3` (or just `3`) as the `id` in any operation — `calendar_get_event`, `calendar_update_event`, `calendar_remove_event`, `calendar_set_status`, `calendar_set_report`, `calendar_get_report`, `calendar_list_reports`, and `calendar_tag` — as long as you also pass `owner` so the number can be resolved to the right event. Full uuid ids continue to work without an owner.
+
 ## Tools
 
 **Events**
@@ -14,7 +18,8 @@ Calendar/Plannings views plus one-click timer resume/stop. Owners are
 | Tool | Description |
 |---|---|
 | `calendar_add_event` | Create an event (one-time or recurring). Pass an absolute datetime for `start`. |
-| `calendar_update_event` | Update any field of an existing event by ID. |
+| `calendar_update_event` | Update any field of an existing event by ID or #number. Supports `add_tags`/`remove_tags` for merge-style tag edits. |
+| `calendar_tag` | Add/remove tags on any event kind (regular/note/job) by #number, uuid, or job name — merges, never clobbers. Works across all dates. |
 | `calendar_remove_event` | Delete a series (`scope=all`) or skip one occurrence (`scope=occurrence`). |
 | `calendar_list_events` | Expand occurrences in a date range; optional substring filter. Defaults to **start of today → now+30d**. |
 | `calendar_get_event` | Full details: recurrence, alert config, meeting, next occurrence. |

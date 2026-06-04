@@ -147,6 +147,33 @@ def init_db() -> None:
         if "kind" not in cols:
             conn.execute("ALTER TABLE events ADD COLUMN kind TEXT")
             conn.commit()
+        # Re-fetch cols after potential additions above.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "seq" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN seq INTEGER")
+            conn.commit()
+        # Backfill seq for any rows that have a non-empty owner but NULL seq.
+        # Assigns 1,2,3… per owner ordered by created_utc then start_utc.
+        owners_needing_fill = conn.execute(
+            "SELECT DISTINCT owner FROM events WHERE seq IS NULL AND owner IS NOT NULL AND owner != ''"
+        ).fetchall()
+        for (owner_val,) in owners_needing_fill:
+            rows_to_fill = conn.execute(
+                "SELECT id FROM events WHERE owner COLLATE NOCASE = ? AND seq IS NULL "
+                "ORDER BY created_utc, start_utc",
+                (owner_val,),
+            ).fetchall()
+            # Find the highest existing seq for this owner first (idempotent).
+            max_seq_row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE owner COLLATE NOCASE = ? AND seq IS NOT NULL",
+                (owner_val,),
+            ).fetchone()
+            next_seq = (max_seq_row[0] if max_seq_row else 0) + 1
+            for (row_id,) in rows_to_fill:
+                conn.execute("UPDATE events SET seq = ? WHERE id = ?", (next_seq, row_id))
+                next_seq += 1
+        if owners_needing_fill:
+            conn.commit()
         pcols = {row[1] for row in conn.execute("PRAGMA table_info(plannings)").fetchall()}
         if pcols and "tz" not in pcols:
             conn.execute("ALTER TABLE plannings ADD COLUMN tz TEXT")
@@ -170,6 +197,8 @@ def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
             d[field] = None
     d["all_day"] = bool(d.get("all_day", 0))
     d["kind"] = d.get("kind") or "event"
+    # seq is stored as INTEGER or NULL; pass through as-is.
+    d["seq"] = d.get("seq")
     return d
 
 
@@ -181,16 +210,26 @@ def add_event(d: Dict[str, Any]) -> str:
     """Insert a new event; returns its generated id (uuid4 hex)."""
     event_id = uuid.uuid4().hex
     now = _now_iso()
+    owner_val = d.get("owner") or None
     with _lock:
         conn = _get_conn()
+        # Compute per-owner seq inside the same lock as INSERT.
+        if owner_val:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE owner COLLATE NOCASE = ?",
+                (owner_val,),
+            ).fetchone()
+            seq_val = (row[0] if row else 0) + 1
+        else:
+            seq_val = None
         conn.execute(
             """
             INSERT INTO events
                 (id, title, description, start_utc, tz, all_day,
                  recurrence, alert_lead_seconds, alert_channel,
                  meeting, location, tags, language, owner, notify_email,
-                 planning_id, job, category, kind, created_utc, updated_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 planning_id, job, category, kind, seq, created_utc, updated_utc)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 event_id,
@@ -206,12 +245,13 @@ def add_event(d: Dict[str, Any]) -> str:
                 d.get("location"),
                 json.dumps(d["tags"]) if d.get("tags") is not None else None,
                 d.get("language"),
-                d.get("owner"),
+                owner_val,
                 d.get("notify_email"),
                 d.get("planning_id"),
                 d.get("job"),
                 d.get("category"),
                 d.get("kind"),
+                seq_val,
                 now,
                 now,
             ),
@@ -225,6 +265,17 @@ def get_event(event_id: str) -> Optional[Dict[str, Any]]:
         conn = _get_conn()
         row = conn.execute(
             "SELECT * FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
+    return _row_to_event(row) if row else None
+
+
+def get_event_by_seq(owner: str, seq: int) -> Optional[Dict[str, Any]]:
+    """Return the event for `owner` with the given per-owner sequential number, or None."""
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT * FROM events WHERE owner COLLATE NOCASE = ? AND seq = ?",
+            (owner, seq),
         ).fetchone()
     return _row_to_event(row) if row else None
 
