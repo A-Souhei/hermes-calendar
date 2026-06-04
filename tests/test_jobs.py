@@ -45,6 +45,9 @@ _registry_data = {
         {"name": "u_cat",     "email": "cat@example.com",     "language": "en"},
         {"name": "u_reg",     "email": "reg@example.com",     "language": "en"},
         {"name": "u_plan",    "email": "plan@example.com",    "language": "en"},
+        {"name": "u_note",     "email": "note@example.com",     "language": "en"},
+        {"name": "u_notelist", "email": "notelist@example.com", "language": "en"},
+        {"name": "u_noteflt",  "email": "noteflt@example.com",  "language": "en"},
         {"name": "u_noemail"},  # registered but no email (for the planning gate test)
     ]
 }
@@ -336,6 +339,81 @@ def test_timers_resume_shared_logic():
         res(cal._handle_calendar_stop_timer({"owner": o}))
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Notes feature (alertless quick-capture entries)
+# ---------------------------------------------------------------------------
+
+def test_kind_migration_includes_kind():
+    cols = {r[1] for r in store._get_conn().execute("PRAGMA table_info(events)")}
+    assert "kind" in cols
+
+
+def test_add_note_persists_kind_and_is_alertless():
+    r = res(cal._handle_calendar_add_note({
+        "owner": "u_note", "content": "Call the bank", "tags": ["finance"],
+    }))
+    assert r["kind"] == "note"
+    ev = store.get_event(r["id"])
+    assert ev["kind"] == "note"
+    assert ev["alert_channel"] == "none"        # alertless
+    assert ev["title"] == "Call the bank"
+    assert ev["recurrence"] is None
+
+
+def test_add_note_requires_registered_owner():
+    bad = json.loads(cal._handle_calendar_add_note({
+        "owner": "ghost_user_xyz", "content": "x"}))
+    assert not bad["ok"] and "calendar-users.json" in bad["error"]
+
+
+def test_list_notes_recent_first_and_filters():
+    o = "u_notelist"
+    now = datetime.now(timezone.utc)
+    res(cal._handle_calendar_add_note({"owner": o, "content": "alpha note",
+        "when": (now - timedelta(days=10)).isoformat(), "tags": ["old"]}))
+    res(cal._handle_calendar_add_note({"owner": o, "content": "beta idea",
+        "when": (now - timedelta(days=2)).isoformat()}))
+    res(cal._handle_calendar_add_note({"owner": o, "content": "gamma thought",
+        "when": (now - timedelta(hours=1)).isoformat()}))
+
+    alln = res(cal._handle_calendar_list_notes({"owner": o}))
+    whens = [n["when_utc"] for n in alln["notes"]]
+    assert whens == sorted(whens, reverse=True)          # most-recent-first
+    assert alln["count"] == 3
+
+    # text query (substring over content/details/tags)
+    q = res(cal._handle_calendar_list_notes({"owner": o, "query": "idea"}))
+    assert [n["content"] for n in q["notes"]] == ["beta idea"]
+
+    # date-range over the note timestamp: last 3 days excludes the 10-day-old note
+    lo = (now - timedelta(days=3)).isoformat()
+    hi = (now + timedelta(days=1)).isoformat()
+    rng = res(cal._handle_calendar_list_notes({"owner": o, "from": lo, "to": hi}))
+    assert {n["content"] for n in rng["notes"]} == {"beta idea", "gamma thought"}
+
+
+def test_notes_excluded_from_agenda_and_digest():
+    from zoneinfo import ZoneInfo
+    o = "u_noteflt"
+    tz = ZoneInfo(cal.recurrence_mod.DEFAULT_TZ)
+    today9 = datetime.now(tz).replace(hour=9, minute=0, second=0, microsecond=0)
+    res(cal._handle_calendar_add_event({"owner": o, "title": "Real event",
+        "start": today9.astimezone(timezone.utc).isoformat(), "alert_channel": "none"}))
+    res(cal._handle_calendar_add_note({"owner": o, "content": "A note today"}))
+
+    # agenda (calendar_list_events) excludes the note
+    titles = {e["title"] for e in res(cal._handle_calendar_list_events({"owner": o}))["events"]}
+    assert "Real event" in titles and "A note today" not in titles
+
+    # store-level kind filter
+    assert {e["title"] for e in store.list_events(owner=o, kind="note")} == {"A note today"}
+    assert "A note today" not in {e["title"] for e in store.list_events(owner=o, kind="event")}
+
+    # daily digest excludes the note
+    dtitles = {i["title"] for i in cal.digest_mod.build_owner_digest(o)["today"]}
+    assert "Real event" in dtitles and "A note today" not in dtitles
 
 
 def _run_all():
