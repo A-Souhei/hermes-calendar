@@ -28,3 +28,5 @@ provides_tools:
   - calendar_digest
   - calendar_list_jobs
   - calendar_job_summary
+  - calendar_add_note
+  - calendar_list_notes

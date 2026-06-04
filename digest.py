@@ -67,7 +67,7 @@ def build_owner_digest(
         f"{day_start_local.strftime('%B %Y')}"
     )
 
-    events = store.list_events(owner=owner)
+    events = store.list_events(owner=owner, kind="event")
 
     today_items: List[Dict[str, Any]] = []
 

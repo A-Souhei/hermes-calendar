@@ -206,7 +206,7 @@ def _occurrences_in_range(
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     now = datetime.now(timezone.utc)
-    for ev in store.list_events(owner=owner):
+    for ev in store.list_events(owner=owner, kind="event"):
         # Category filter: skip events whose category doesn't match (case-insensitive).
         if category is not None:
             ev_cat = (ev.get("category") or "").strip().lower()
