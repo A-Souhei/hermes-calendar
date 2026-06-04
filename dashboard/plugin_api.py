@@ -384,6 +384,12 @@ def _apply_occurrence_outcome(body: "ConfirmEventRequest", status: str, *, rejec
     cur = store.get_status(eid, occ)
     if cur and cur.get("status") == "active":
         raise HTTPException(409, detail="this occurrence has a running timer; stop it first")
+    # Idempotency guard: don't let the same outcome be re-applied (e.g. re-confirm
+    # an already-confirmed occurrence) — that would reset the original timestamp.
+    if cur and cur.get("status") == status:
+        when = cur.get("updated_utc") or cur.get("created_utc")
+        verb = "confirmed" if status == "confirmed" else "cancelled"
+        raise HTTPException(409, detail=f"already {verb}" + (f" at {when}" if when else ""))
     store.set_status(eid, occ, status, source="dashboard")
     report_saved = False
     if body.report and body.report.strip():
@@ -488,6 +494,8 @@ def event_detail(event_id: str):
                 "duration_seconds": s.get("duration_seconds"),
                 "note": s.get("note"),
                 "source": s.get("source"),
+                "created_utc": s.get("created_utc"),
+                "updated_utc": s.get("updated_utc"),
             })
     except Exception:
         statuses = []
