@@ -340,6 +340,33 @@ class StopJobRequest(BaseModel):
     event_id: str
 
 
+class ConfirmEventRequest(BaseModel):
+    event_id: str
+    occurrence_utc: Optional[str] = None
+    report: Optional[str] = None
+
+
+@router.post("/event/confirm")
+def confirm_event(body: ConfirmEventRequest):
+    """Mark one occurrence of an event confirmed (dashboard 'Confirm' button),
+    optionally saving an activity report. Auth via dashboard middleware."""
+    if not body.event_id or not body.event_id.strip():
+        raise HTTPException(400, detail="event_id is required")
+    ev = store.get_event(body.event_id.strip())
+    if not ev:
+        raise HTTPException(404, detail="event not found")
+    occ = (body.occurrence_utc or "").strip() or ev["start_utc"]
+    store.set_status(body.event_id.strip(), occ, "confirmed", source="dashboard")
+    report_saved = False
+    if body.report and body.report.strip():
+        existing = store.get_report(body.event_id.strip(), occ)
+        rep = dict(existing["report"]) if existing and isinstance(existing.get("report"), dict) else {}
+        rep["notes"] = body.report.strip()
+        store.set_report(body.event_id.strip(), occ, rep)
+        report_saved = True
+    return {"ok": True, "occurrence_utc": occ, "status": "confirmed", "report_saved": report_saved}
+
+
 @router.post("/jobs/stop")
 def stop_job(body: StopJobRequest):
     """Stop the running session of a specific event (the dashboard stop button).
@@ -438,6 +465,7 @@ def event_detail(event_id: str):
         "owner": ev.get("owner"),
         "notify_email": ev.get("notify_email"),
         "planning": _planning_name_for(ev),
+        "kind": ev.get("kind") or "event",
         "job": ev.get("job"),
         "category": ev.get("category"),
         "meeting": ev.get("meeting"),

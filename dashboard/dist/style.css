@@ -445,3 +445,20 @@
 }
 .agenda-loc { white-space: nowrap; }
 .agenda-empty { padding: 28px 16px; text-align: center; color: var(--color-muted-foreground); font-size: 0.85rem; }
+
+/* ---- Confirm button + activity-report textarea --------------------------- */
+
+.cal-confirm-btn {
+  background: var(--color-success, #16a34a); color: #fff; border: none;
+  border-radius: 6px; font-size: 0.82rem; padding: 4px 12px; height: 32px;
+  cursor: pointer; font-weight: 600;
+}
+.cal-confirm-btn:hover { filter: brightness(0.95); }
+.cal-confirm-btn:disabled { opacity: 0.6; cursor: default; }
+.cal-report-textarea {
+  width: 100%; min-height: 90px; resize: vertical;
+  background: var(--color-card); color: var(--color-card-foreground);
+  border: 1px solid var(--color-border); border-radius: 8px;
+  padding: 8px 10px; font-size: 0.85rem; font-family: inherit;
+}
+.cal-report-textarea:focus { outline: none; border-color: var(--color-primary); }
