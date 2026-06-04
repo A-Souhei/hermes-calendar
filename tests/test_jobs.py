@@ -53,6 +53,8 @@ _registry_data = {
         {"name": "u_seq2",     "email": "seq2@example.com",     "language": "en"},
         {"name": "u_seq3",     "email": "seq3@example.com",     "language": "en"},
         {"name": "u_tag",      "email": "tag@example.com",      "language": "en"},
+        {"name": "u_dur",      "email": "dur@example.com",      "language": "en"},
+        {"name": "u_conv",     "email": "conv@example.com",     "language": "en"},
         {"name": "u_noemail"},  # registered but no email (for the planning gate test)
     ]
 }
@@ -695,6 +697,222 @@ def test_update_event_add_remove_tags():
     }))
     final = store.get_event(eid)["tags"] or []
     assert "base" in final and "extra" in final
+
+
+# ---------------------------------------------------------------------------
+# duration / end_utc on regular events
+# ---------------------------------------------------------------------------
+
+def test_add_event_with_duration_stores_duration_seconds():
+    """calendar_add_event with 'duration' stores duration_seconds and summary
+    includes end_utc = start + duration."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "dur-event",
+        "start": "2026-06-10T09:00:00+03:00",
+        "duration": "2 hours",
+    }))
+    assert r["created"] is True
+    assert r["duration_seconds"] == 2 * 3600
+    assert r["end_utc"] is not None
+    # end_utc should be 2 hours after start
+    from datetime import datetime as _dt, timezone as _tz
+    start_dt = _dt.fromisoformat("2026-06-10T09:00:00+03:00").astimezone(_tz.utc)
+    end_dt = _dt.fromisoformat(r["end_utc"])
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=_tz.utc)
+    diff = (end_dt.astimezone(_tz.utc) - start_dt).total_seconds()
+    assert abs(diff - 2 * 3600) < 2, f"Expected ~7200s diff, got {diff}"
+    # Store-level check
+    ev = store.get_event(r["id"])
+    assert ev["duration_seconds"] == 2 * 3600
+
+
+def test_add_event_with_end_computes_duration_seconds():
+    """calendar_add_event with 'end' computes duration_seconds = end - start."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "end-event",
+        "start": "2026-06-11T14:00:00+03:00",
+        "end":   "2026-06-11T15:30:00+03:00",
+    }))
+    assert r["created"] is True
+    assert r["duration_seconds"] == 90 * 60
+
+
+def test_add_event_with_end_before_start_errors():
+    """end before start returns an error."""
+    o = "u_dur"
+    bad = json.loads(cal._handle_calendar_add_event({
+        "owner": o, "title": "bad-end",
+        "start": "2026-06-12T15:00:00+03:00",
+        "end":   "2026-06-12T14:00:00+03:00",
+    }))
+    assert not bad["ok"] and "end must be after start" in bad["error"]
+
+
+def test_past_one_time_event_with_duration_writes_confirmed_status():
+    """A past one-time regular event with duration writes a confirmed
+    source='manual' occurrence_status AND does NOT appear in summarize_jobs."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "past-regular",
+        "start": "2025-01-10T10:00:00+03:00",
+        "duration": "1 hour",
+    }))
+    eid = r["id"]
+    statuses = store.list_statuses(eid)
+    assert len(statuses) == 1, f"Expected 1 status row, got {len(statuses)}"
+    st = statuses[0]
+    assert st["status"] == "confirmed"
+    assert st["source"] == "manual"
+    assert st["duration_seconds"] == 3600
+
+    # Must NOT appear in summarize_jobs (event has no job).
+    summ = store.summarize_jobs(o, "2020-01-01T00:00:00+00:00", "2030-01-01T00:00:00+00:00")
+    job_ids = {j["job"] for j in summ["jobs"]}
+    assert "past-regular" not in job_ids
+    assert summ["count"] == 0 or all(j["job"] for j in summ["jobs"])
+
+
+def test_future_event_with_duration_no_status_row():
+    """A future one-time event with a duration should NOT have a status row
+    (only past events get the confirmed record)."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "future-dur",
+        "start": "2030-06-10T09:00:00+03:00",
+        "duration": "30 min",
+    }))
+    assert r["duration_seconds"] == 30 * 60
+    statuses = store.list_statuses(r["id"])
+    assert len(statuses) == 0, f"Expected no status for future event, got {statuses}"
+
+
+# ---------------------------------------------------------------------------
+# calendar_convert_to_job and calendar_convert_to_regular
+# ---------------------------------------------------------------------------
+
+def test_convert_to_job_makes_event_aggregate_in_jobs():
+    """calendar_convert_to_job converts a regular event into a job session that
+    aggregates in summarize_jobs; same id and #N are preserved."""
+    o = "u_conv"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "meeting-work",
+        "start": "2025-03-01T10:00:00+03:00",
+        "duration": "2 hours",
+    }))
+    orig_id = r["id"]
+    orig_num = r["number"]
+
+    conv = res(cal._handle_calendar_convert_to_job({
+        "owner": o,
+        "id": f"#{orig_num}",
+        "job": "client-work",
+        "category": "consulting",
+    }))
+    assert conv["converted_to"] == "job"
+    assert conv["id"] == orig_id          # same id
+    assert conv["number"] == orig_num     # same #N
+
+    ev = store.get_event(orig_id)
+    assert ev["job"] == "client-work"
+    assert ev["category"] == "consulting"
+    assert ev["duration_seconds"] == 2 * 3600
+
+    # Now appears in summarize_jobs.
+    summ = store.summarize_jobs(o, "2020-01-01T00:00:00+00:00", "2030-01-01T00:00:00+00:00")
+    by_job = {j["job"]: j for j in summ["jobs"]}
+    assert "client-work" in by_job, f"Expected 'client-work' in jobs: {by_job}"
+    assert by_job["client-work"]["total_seconds"] == 2 * 3600
+
+    # occurrence_status has source='timer'.
+    statuses = store.list_statuses(orig_id)
+    assert any(s["source"] == "timer" for s in statuses)
+
+
+def test_convert_to_job_requires_duration():
+    """convert_to_job on an event with no duration and no override errors."""
+    o = "u_conv"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "no-duration-ev",
+        "start": "2025-04-01T09:00:00+03:00",
+        # no duration
+    }))
+    bad = json.loads(cal._handle_calendar_convert_to_job({
+        "owner": o, "id": r["id"],
+    }))
+    assert not bad["ok"] and "duration" in bad["error"].lower()
+
+
+def test_convert_to_job_rejects_note():
+    """Converting a note is rejected with the expected message."""
+    o = "u_conv"
+    note = res(cal._handle_calendar_add_note({
+        "owner": o, "content": "just a note",
+    }))
+    bad = json.loads(cal._handle_calendar_convert_to_job({
+        "owner": o, "id": note["id"],
+    }))
+    assert not bad["ok"]
+    assert "Notes have no time range" in bad["error"]
+
+
+def test_convert_to_regular_removes_from_jobs():
+    """calendar_convert_to_regular strips job, no longer in summarize_jobs, retains id/#N."""
+    o = "u_conv"
+    # Start a timer job session (confirmed).
+    r = _start(o, title="Timer session", job="timer-job", category="work", duration="1 hour")
+    orig_id = r["id"]
+    ev = store.get_event(orig_id)
+    orig_num = ev["seq"]
+
+    # Verify it appears in summarize_jobs before conversion.
+    summ_before = store.summarize_jobs(o, "2020-01-01T00:00:00+00:00", "2030-01-01T00:00:00+00:00")
+    jobs_before = {j["job"] for j in summ_before["jobs"]}
+    assert "timer-job" in jobs_before
+
+    conv = res(cal._handle_calendar_convert_to_regular({
+        "owner": o, "id": orig_id,
+    }))
+    assert conv["converted_to"] == "regular"
+    assert conv["id"] == orig_id
+    assert conv["number"] == orig_num
+
+    ev_after = store.get_event(orig_id)
+    assert not ev_after.get("job"), f"job should be cleared, got: {ev_after.get('job')}"
+    # duration_seconds should still be set (retained from the job session).
+    assert ev_after.get("duration_seconds") is not None
+
+    # No longer appears in summarize_jobs.
+    summ_after = store.summarize_jobs(o, "2020-01-01T00:00:00+00:00", "2030-01-01T00:00:00+00:00")
+    jobs_after = {j["job"] for j in summ_after["jobs"]}
+    assert "timer-job" not in jobs_after, f"timer-job should be gone, still in: {jobs_after}"
+
+    # source flipped to 'manual'.
+    statuses = store.list_statuses(orig_id)
+    assert all(s.get("source") != "timer" for s in statuses), (
+        f"Expected no timer sources, got: {[s.get('source') for s in statuses]}"
+    )
+
+
+def test_convert_to_regular_rejects_note():
+    """Converting a note to regular is rejected."""
+    o = "u_conv"
+    note = res(cal._handle_calendar_add_note({
+        "owner": o, "content": "another note",
+    }))
+    bad = json.loads(cal._handle_calendar_convert_to_regular({
+        "owner": o, "id": note["id"],
+    }))
+    assert not bad["ok"]
+    assert "Notes have no time range" in bad["error"]
+
+
+def test_migration_includes_duration_seconds():
+    """The duration_seconds column exists on the events table."""
+    cols = {r[1] for r in store._get_conn().execute("PRAGMA table_info(events)").fetchall()}
+    assert "duration_seconds" in cols, "duration_seconds column missing from events table"
 
 
 def _run_all():

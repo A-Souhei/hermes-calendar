@@ -17,12 +17,14 @@ Every event gets a short per-owner sequential number (`#1`, `#2`, …). You can 
 
 | Tool | Description |
 |---|---|
-| `calendar_add_event` | Create an event (one-time or recurring). Pass an absolute datetime for `start`. |
-| `calendar_update_event` | Update any field of an existing event by ID or #number. Supports `add_tags`/`remove_tags` for merge-style tag edits. |
+| `calendar_add_event` | Create an event (one-time or recurring). Pass `duration` (e.g. `"2 hours"`) or `end` to give it a time range. Past `start` values are allowed to log events that already happened — a confirmed status record is written automatically. |
+| `calendar_update_event` | Update any field of an existing event by ID or #number. Supports `add_tags`/`remove_tags` for merge-style tag edits. Also accepts `duration`/`end` to update the time range. |
 | `calendar_tag` | Add/remove tags on any event kind (regular/note/job) by #number, uuid, or job name — merges, never clobbers. Works across all dates. |
 | `calendar_remove_event` | Delete a series (`scope=all`) or skip one occurrence (`scope=occurrence`). |
 | `calendar_list_events` | Expand occurrences in a date range; optional substring filter. Defaults to **start of today → now+30d**. |
 | `calendar_get_event` | Full details: recurrence, alert config, meeting, next occurrence. |
+| `calendar_convert_to_job` | Convert a regular event into a job session in-place (same id/#N). Requires a duration. The event starts aggregating in `calendar_job_summary`. |
+| `calendar_convert_to_regular` | Convert a job event back to a regular event in-place. Clears the job field; retains duration. No longer aggregates in job summaries. |
 
 **Reports & status**
 

@@ -175,6 +175,9 @@ def init_db() -> None:
         if owners_needing_fill:
             conn.commit()
         pcols = {row[1] for row in conn.execute("PRAGMA table_info(plannings)").fetchall()}
+        if "duration_seconds" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN duration_seconds INTEGER")
+            conn.commit()
         if pcols and "tz" not in pcols:
             conn.execute("ALTER TABLE plannings ADD COLUMN tz TEXT")
             conn.commit()
@@ -199,6 +202,8 @@ def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
     d["kind"] = d.get("kind") or "event"
     # seq is stored as INTEGER or NULL; pass through as-is.
     d["seq"] = d.get("seq")
+    # duration_seconds is INTEGER or NULL; pass through as-is.
+    d["duration_seconds"] = d.get("duration_seconds")
     return d
 
 
@@ -228,8 +233,9 @@ def add_event(d: Dict[str, Any]) -> str:
                 (id, title, description, start_utc, tz, all_day,
                  recurrence, alert_lead_seconds, alert_channel,
                  meeting, location, tags, language, owner, notify_email,
-                 planning_id, job, category, kind, seq, created_utc, updated_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 planning_id, job, category, kind, seq, duration_seconds,
+                 created_utc, updated_utc)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 event_id,
@@ -252,6 +258,7 @@ def add_event(d: Dict[str, Any]) -> str:
                 d.get("category"),
                 d.get("kind"),
                 seq_val,
+                d.get("duration_seconds"),
                 now,
                 now,
             ),

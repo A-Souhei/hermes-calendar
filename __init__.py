@@ -314,11 +314,26 @@ def _planning_name_for(ev: Dict) -> Optional[str]:
 
 def _event_summary(ev: Dict) -> Dict:
     """Return a compact summary suitable for tool responses."""
+    dur = ev.get("duration_seconds")
+    end_utc: Optional[str] = None
+    if dur is not None:
+        try:
+            start_iso = ev["start_utc"]
+            if start_iso.endswith("Z"):
+                start_iso = start_iso[:-1] + "+00:00"
+            start_dt = datetime.fromisoformat(start_iso)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            end_utc = (start_dt + timedelta(seconds=dur)).isoformat()
+        except Exception:
+            end_utc = None
     return {
         "id": ev["id"],
         "number": ev.get("seq"),
         "title": ev["title"],
         "start_utc": ev["start_utc"],
+        "end_utc": end_utc,
+        "duration_seconds": dur,
         "tz": ev.get("tz"),
         "all_day": ev.get("all_day", False),
         "recurrence": _human_recurrence(ev.get("recurrence"), ev.get("tz")),
@@ -449,6 +464,26 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
     category_raw = args.get("category")
     category = (str(category_raw).strip() or None) if category_raw is not None else None
 
+    # Compute duration_seconds from `duration` or `end` args (both optional).
+    duration_seconds: Optional[int] = None
+    dur_raw = args.get("duration")
+    end_raw = args.get("end")
+    if dur_raw is not None:
+        parsed_dur = _parse_lead(dur_raw)
+        if parsed_dur is None:
+            return tool_error(
+                f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'."
+            )
+        duration_seconds = parsed_dur
+    elif end_raw is not None:
+        end_dt = _parse_start(end_raw, tz_name)
+        if end_dt is None:
+            return tool_error(f"Could not parse end datetime: {end_raw!r}")
+        dur_secs = round((end_dt.astimezone(timezone.utc) - start_dt.astimezone(timezone.utc)).total_seconds())
+        if dur_secs <= 0:
+            return tool_error("end must be after start")
+        duration_seconds = dur_secs
+
     d = {
         "title": title,
         "description": args.get("description"),
@@ -466,12 +501,31 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         "notify_email": notify_email,
         "planning_id": planning_id,
         "category": category,
+        "duration_seconds": duration_seconds,
     }
     try:
         event_id = store.add_event(d)
     except Exception as e:
         logger.exception("calendar_add_event store error")
         return tool_error(f"Failed to save event: {e}")
+
+    # For a one-time past event with a duration, write a confirmed occurrence_status
+    # (source='manual') to record actuals — mirrors how a completed job is recorded.
+    if duration_seconds is not None and rec is None:
+        now_utc = datetime.now(timezone.utc)
+        start_aware = start_dt.astimezone(timezone.utc)
+        if start_aware < now_utc:
+            ended_utc = (start_aware + timedelta(seconds=duration_seconds)).isoformat()
+            try:
+                store.set_status(
+                    event_id, start_utc, "confirmed",
+                    started_utc=start_utc,
+                    ended_utc=ended_utc,
+                    duration_seconds=duration_seconds,
+                    source="manual",
+                )
+            except Exception:
+                pass
 
     ev = store.get_event(event_id)
     return tool_result({"created": True, **_event_summary(ev)})
@@ -618,6 +672,43 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
         cat_raw = args["category"]
         fields["category"] = (str(cat_raw).strip() or None) if cat_raw is not None else None
 
+    # duration / end: recompute duration_seconds. Explicit 0 or null clears it.
+    if "duration" in args or "end" in args:
+        dur_raw = args.get("duration")
+        end_raw = args.get("end")
+        if dur_raw is not None and (isinstance(dur_raw, (int, float)) and dur_raw == 0):
+            fields["duration_seconds"] = None
+        elif dur_raw is not None:
+            parsed_dur = _parse_lead(dur_raw)
+            if parsed_dur is None:
+                return tool_error(
+                    f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'."
+                )
+            fields["duration_seconds"] = parsed_dur
+        elif end_raw is not None:
+            eff_tz = fields.get("tz") or ev.get("tz") or recurrence_mod.DEFAULT_TZ
+            end_dt = _parse_start(end_raw, eff_tz)
+            if end_dt is None:
+                return tool_error(f"Could not parse end datetime: {end_raw!r}")
+            start_iso = fields.get("start_utc") or ev.get("start_utc")
+            if start_iso:
+                try:
+                    s = start_iso[:-1] + "+00:00" if start_iso.endswith("Z") else start_iso
+                    start_dt_upd = datetime.fromisoformat(s)
+                    if start_dt_upd.tzinfo is None:
+                        start_dt_upd = start_dt_upd.replace(tzinfo=timezone.utc)
+                    dur_secs = round((end_dt.astimezone(timezone.utc) - start_dt_upd.astimezone(timezone.utc)).total_seconds())
+                    if dur_secs <= 0:
+                        return tool_error("end must be after start")
+                    fields["duration_seconds"] = dur_secs
+                except Exception:
+                    return tool_error("Could not compute duration from end time")
+            else:
+                return tool_error("Cannot compute duration: event has no start time")
+        else:
+            # "duration" key present but null value -> clear
+            fields["duration_seconds"] = None
+
     if not fields:
         return tool_error("No updatable fields provided")
 
@@ -629,6 +720,38 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
 
     if not updated:
         return tool_error(f"Event not found: {event_id}")
+
+    # If duration_seconds was updated, also patch the one-time occurrence_status row
+    # (best-effort: don't fail the whole update if this step errors).
+    if "duration_seconds" in fields:
+        try:
+            new_dur = fields["duration_seconds"]
+            ev_after = store.get_event(event_id)
+            occ_key = ev_after["start_utc"] if ev_after else ev["start_utc"]
+            existing_st = store.get_status(event_id, occ_key)
+            if existing_st:
+                if new_dur is None:
+                    ended_upd = None
+                elif existing_st.get("started_utc"):
+                    try:
+                        s2 = existing_st["started_utc"]
+                        if s2.endswith("Z"):
+                            s2 = s2[:-1] + "+00:00"
+                        st_dt = datetime.fromisoformat(s2)
+                        if st_dt.tzinfo is None:
+                            st_dt = st_dt.replace(tzinfo=timezone.utc)
+                        ended_upd = (st_dt + timedelta(seconds=new_dur)).isoformat()
+                    except Exception:
+                        ended_upd = None
+                else:
+                    ended_upd = None
+                store.set_status(
+                    event_id, occ_key, existing_st["status"],
+                    ended_utc=ended_upd,
+                    duration_seconds=new_dur,
+                )
+        except Exception:
+            pass
 
     ev = store.get_event(event_id)
     return tool_result({"updated": True, **_event_summary(ev)})
@@ -900,7 +1023,8 @@ _ALERT_LEAD_DESCRIPTION = (
 _START_DESCRIPTION = (
     "Absolute datetime for the event start. You know the current date — resolve relative "
     "expressions ('tomorrow', 'next Monday') to an ISO string before calling. "
-    "Example: '2026-06-15T09:00:00+03:00'. All-day events can use 'YYYY-MM-DD'."
+    "Example: '2026-06-15T09:00:00+03:00'. All-day events can use 'YYYY-MM-DD'. "
+    "Past datetimes are allowed — use them to log events that already happened."
 )
 
 CALENDAR_ADD_EVENT_SCHEMA = {
@@ -908,13 +1032,32 @@ CALENDAR_ADD_EVENT_SCHEMA = {
     "description": (
         "Add a new event to the calendar. Supports one-time and recurring events, "
         "meeting details (participants, video room URL/app), location, tags, and "
-        "configurable reminders via Home Assistant push or TTS."
+        "configurable reminders via Home Assistant push or TTS. "
+        "Pass 'duration' or 'end' to give the event a time range (start–end). "
+        "Past starts are allowed for logging events that already happened."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "Event title (required)."},
             "start": {"type": "string", "description": _START_DESCRIPTION},
+            "end": {
+                "type": "string",
+                "description": (
+                    "Optional absolute datetime when the event ends/ended. "
+                    "Used to compute duration_seconds (end - start). "
+                    "Ignored when 'duration' is also given (duration wins). "
+                    "Example: '2026-06-15T11:00:00+03:00'."
+                ),
+            },
+            "duration": {
+                "type": "string",
+                "description": (
+                    "Optional duration of the event, e.g. '2 hours', '90 min', '1h30m'. "
+                    "Takes precedence over 'end' when both are given. "
+                    "Omit for a point-in-time event (no time range)."
+                ),
+            },
             "description": {"type": "string", "description": "Optional free-text description."},
             "all_day": {"type": "boolean", "description": "True for all-day events (no specific time)."},
             "tz": {
@@ -1038,6 +1181,20 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
                 "description": (
                     "Free-text category to group this event for reports, "
                     "e.g. 'work', 'personal', 'client-acme'. Pass null to clear it."
+                ),
+            },
+            "end": {
+                "type": ["string", "null"],
+                "description": (
+                    "New end datetime for the event. Recomputes duration_seconds = end - start. "
+                    "Ignored when 'duration' is also given."
+                ),
+            },
+            "duration": {
+                "type": ["string", "number", "null"],
+                "description": (
+                    "New duration, e.g. '2 hours', '90 min'. "
+                    "Pass 0 or null to clear the time range (make it a point event)."
                 ),
             },
         },
@@ -3038,6 +3195,213 @@ def _handle_calendar_tag(args: Dict[str, Any], **kw) -> str:
     })
 
 
+CALENDAR_CONVERT_TO_JOB_SCHEMA = {
+    "name": "calendar_convert_to_job",
+    "description": (
+        "Convert a regular calendar event INTO a job session in-place — keeps the same id "
+        "and #N, sets a job name, and writes a confirmed occurrence_status (source='timer') "
+        "so it aggregates in calendar_job_summary / calendar_list_jobs. "
+        "Requires a duration (from the event's existing duration_seconds, or an explicit "
+        "'duration'/'end' override). Notes cannot be converted."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "id": {
+                "type": "string",
+                "description": "Event ID or #number (e.g. '#3'). Requires owner to resolve a #number.",
+            },
+            "job": {
+                "type": "string",
+                "description": "Job name for the converted session. Defaults to the event's title.",
+            },
+            "category": {
+                "type": ["string", "null"],
+                "description": "Optional category override.",
+            },
+            "duration": {
+                "type": "string",
+                "description": "Override the session duration, e.g. '2 hours'. Uses the event's existing duration_seconds if omitted.",
+            },
+            "end": {
+                "type": "string",
+                "description": "Override end datetime (used to compute duration when 'duration' is omitted).",
+            },
+        },
+        "required": ["owner", "id"],
+    },
+}
+
+CALENDAR_CONVERT_TO_REGULAR_SCHEMA = {
+    "name": "calendar_convert_to_regular",
+    "description": (
+        "Convert a job event back to a regular calendar event in-place — clears its job "
+        "field and flips the occurrence_status source to 'manual' so it no longer "
+        "aggregates in job summaries. Retains the same id, #N, and duration_seconds. "
+        "Notes cannot be converted."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "id": {
+                "type": "string",
+                "description": "Event ID or #number (e.g. '#3'). Requires owner to resolve a #number.",
+            },
+        },
+        "required": ["owner", "id"],
+    },
+}
+
+
+def _handle_calendar_convert_to_job(args: Dict[str, Any], **kw) -> str:
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error("owner is required")
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    eid = _resolve_event_id(args.get("id"), owner=owner)
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    ev = store.get_event(eid)
+    if ev is None:
+        return tool_error(f"Event not found: {eid}")
+    if ev.get("kind") == "note":
+        return tool_error("Notes have no time range and can't be converted.")
+
+    # Determine duration_seconds: explicit override wins, else existing on event.
+    tz_name = ev.get("tz") or recurrence_mod.DEFAULT_TZ
+    dur_raw = args.get("duration")
+    end_raw = args.get("end")
+    if dur_raw is not None:
+        dur = _parse_lead(dur_raw)
+        if dur is None:
+            return tool_error(
+                f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'."
+            )
+    elif end_raw is not None:
+        end_dt = _parse_start(end_raw, tz_name)
+        if end_dt is None:
+            return tool_error(f"Could not parse end: {end_raw!r}")
+        start_iso = ev["start_utc"]
+        if start_iso.endswith("Z"):
+            start_iso = start_iso[:-1] + "+00:00"
+        start_dt_ev = datetime.fromisoformat(start_iso)
+        if start_dt_ev.tzinfo is None:
+            start_dt_ev = start_dt_ev.replace(tzinfo=timezone.utc)
+        dur = round((end_dt.astimezone(timezone.utc) - start_dt_ev.astimezone(timezone.utc)).total_seconds())
+        if dur <= 0:
+            return tool_error("end must be after start")
+    else:
+        dur = ev.get("duration_seconds")
+
+    if dur is None:
+        return tool_error("Provide a duration — this event has no time range to convert.")
+
+    job_name = (str(args.get("job") or "").strip()) or ev["title"]
+    cat_raw = args.get("category")
+    category = (str(cat_raw).strip() or None) if cat_raw is not None else ev.get("category")
+
+    start_utc = ev["start_utc"]
+    if start_utc.endswith("Z"):
+        start_utc = start_utc[:-1] + "+00:00"
+    try:
+        start_dt_ev2 = datetime.fromisoformat(start_utc)
+        if start_dt_ev2.tzinfo is None:
+            start_dt_ev2 = start_dt_ev2.replace(tzinfo=timezone.utc)
+        ended_utc = (start_dt_ev2 + timedelta(seconds=dur)).isoformat()
+    except Exception as e:
+        return tool_error(f"Could not compute end time: {e}")
+
+    update_fields: Dict[str, Any] = {
+        "job": job_name,
+        "duration_seconds": dur,
+    }
+    if cat_raw is not None:
+        update_fields["category"] = category
+
+    try:
+        store.update_event(eid, update_fields)
+    except Exception as e:
+        logger.exception("calendar_convert_to_job update error")
+        return tool_error(f"Failed to update event: {e}")
+
+    try:
+        store.set_status(
+            eid, start_utc, "confirmed",
+            started_utc=start_utc,
+            ended_utc=ended_utc,
+            duration_seconds=dur,
+            source="timer",
+        )
+    except Exception as e:
+        logger.exception("calendar_convert_to_job set_status error")
+        return tool_error(f"Failed to write occurrence status: {e}")
+
+    ev_after = store.get_event(eid)
+    return tool_result({"converted_to": "job", **_event_summary(ev_after)})
+
+
+def _handle_calendar_convert_to_regular(args: Dict[str, Any], **kw) -> str:
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error("owner is required")
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    eid = _resolve_event_id(args.get("id"), owner=owner)
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    ev = store.get_event(eid)
+    if ev is None:
+        return tool_error(f"Event not found: {eid}")
+    if ev.get("kind") == "note":
+        return tool_error("Notes have no time range and can't be converted.")
+
+    # Preserve the span: if duration_seconds is NULL, try to recover from occurrence_status.
+    dur = ev.get("duration_seconds")
+    if dur is None:
+        try:
+            for s in store.list_statuses(eid):
+                if s.get("duration_seconds") is not None:
+                    dur = s["duration_seconds"]
+                    break
+        except Exception:
+            pass
+
+    update_fields: Dict[str, Any] = {"job": None}
+    if dur is not None and ev.get("duration_seconds") is None:
+        update_fields["duration_seconds"] = dur
+
+    try:
+        store.update_event(eid, update_fields)
+    except Exception as e:
+        logger.exception("calendar_convert_to_regular update error")
+        return tool_error(f"Failed to update event: {e}")
+
+    # Flip source='timer' status rows to source='manual' so they stop aggregating
+    # as job sessions (belt-and-suspenders alongside clearing the job field).
+    try:
+        for s in store.list_statuses(eid):
+            if s.get("source") == "timer":
+                store.set_status(
+                    eid, s["occurrence_utc"], s["status"],
+                    started_utc=s.get("started_utc"),
+                    ended_utc=s.get("ended_utc"),
+                    duration_seconds=s.get("duration_seconds"),
+                    source="manual",
+                )
+    except Exception:
+        pass
+
+    ev_after = store.get_event(eid)
+    return tool_result({"converted_to": "regular", **_event_summary(ev_after)})
+
+
 CALENDAR_TAG_SCHEMA = {
     "name": "calendar_tag",
     "description": (
@@ -3115,6 +3479,8 @@ _TOOLS = (
     ("calendar_add_note",         CALENDAR_ADD_NOTE_SCHEMA,         _handle_calendar_add_note,         "🗒️"),
     ("calendar_list_notes",       CALENDAR_LIST_NOTES_SCHEMA,       _handle_calendar_list_notes,       "📒"),
     ("calendar_tag",              CALENDAR_TAG_SCHEMA,              _handle_calendar_tag,              "🏷️"),
+    ("calendar_convert_to_job",     CALENDAR_CONVERT_TO_JOB_SCHEMA,     _handle_calendar_convert_to_job,     "🛠️"),
+    ("calendar_convert_to_regular", CALENDAR_CONVERT_TO_REGULAR_SCHEMA, _handle_calendar_convert_to_regular, "📅"),
 )
 
 

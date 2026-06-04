@@ -241,6 +241,17 @@ def _occurrences_in_range(
         for occ in occs:
             occ_iso = occ.isoformat()
             status_row = status_map.get(occ_iso)
+            # Planned duration from the event itself.
+            ev_dur = ev.get("duration_seconds")
+            # end_utc: prefer status.ended_utc, else compute from planned span.
+            ended_utc: Optional[str] = None
+            if status_row and status_row.get("ended_utc"):
+                ended_utc = status_row["ended_utc"]
+            elif ev_dur is not None:
+                try:
+                    ended_utc = (occ + timedelta(seconds=ev_dur)).isoformat()
+                except Exception:
+                    ended_utc = None
             out.append({
                 "id": ev["id"],
                 "number": ev.get("seq"),
@@ -248,6 +259,7 @@ def _occurrences_in_range(
                 "kind": ev.get("kind", "event"),
                 "occurrence_utc": occ_iso,
                 "occurrence_local": occ.astimezone(tz).isoformat(),
+                "end_utc": ended_utc,
                 "tz": ev.get("tz") or recurrence.DEFAULT_TZ,
                 "all_day": bool(ev.get("all_day")),
                 "recurring": ev.get("recurrence") is not None,
@@ -263,7 +275,7 @@ def _occurrences_in_range(
                 "effective_status": "floating" if is_note else _effective_status(
                     status_row["status"] if status_row else "floating", occ, now
                 ),
-                "duration_seconds": status_row.get("duration_seconds") if status_row else None,
+                "duration_seconds": ev_dur,
             })
     out.sort(key=lambda e: e["occurrence_utc"])
     return out
@@ -501,12 +513,33 @@ def event_detail(event_id: str):
     except Exception:
         statuses = []
 
+    ev_dur = ev.get("duration_seconds")
+    ev_end_utc: Optional[str] = None
+    if ev_dur is not None:
+        try:
+            start_iso = ev.get("start_utc") or ""
+            if start_iso.endswith("Z"):
+                start_iso = start_iso[:-1] + "+00:00"
+            start_dt_ev = datetime.fromisoformat(start_iso)
+            if start_dt_ev.tzinfo is None:
+                start_dt_ev = start_dt_ev.replace(tzinfo=timezone.utc)
+            ev_end_utc = (start_dt_ev + timedelta(seconds=ev_dur)).isoformat()
+        except Exception:
+            ev_end_utc = None
+    # Prefer status.ended_utc for the resolved occurrence if it exists.
+    occ_key_for_end = ev.get("start_utc") or ""
+    for s in statuses:
+        if s.get("occurrence_utc") == occ_key_for_end and s.get("ended_utc"):
+            ev_end_utc = s["ended_utc"]
+            break
     return {
         "id": ev["id"],
         "number": ev.get("seq"),
         "title": ev["title"],
         "description": ev.get("description"),
         "start_utc": ev.get("start_utc"),
+        "end_utc": ev_end_utc,
+        "duration_seconds": ev_dur,
         "tz": ev.get("tz") or recurrence.DEFAULT_TZ,
         "all_day": bool(ev.get("all_day")),
         "recurrence": ev.get("recurrence"),
