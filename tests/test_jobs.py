@@ -48,6 +48,7 @@ _registry_data = {
         {"name": "u_note",     "email": "note@example.com",     "language": "en"},
         {"name": "u_notelist", "email": "notelist@example.com", "language": "en"},
         {"name": "u_noteflt",  "email": "noteflt@example.com",  "language": "en"},
+        {"name": "u_log",      "email": "log@example.com",      "language": "en"},
         {"name": "u_noemail"},  # registered but no email (for the planning gate test)
     ]
 }
@@ -414,6 +415,59 @@ def test_notes_excluded_from_agenda_and_digest():
     # daily digest excludes the note
     dtitles = {i["title"] for i in cal.digest_mod.build_owner_digest(o)["today"]}
     assert "Real event" in dtitles and "A note today" not in dtitles
+
+
+def test_log_job_records_past_session_and_aggregates():
+    """calendar_log_job logs a completed past session (source=timer, started/
+    ended/duration) that aggregates in summarize_jobs exactly like a stop."""
+    o = "u_log"
+    start = "2026-06-03T14:00:00+03:00"   # 2pm
+    end = "2026-06-03T16:30:00+03:00"     # 4:30pm  -> 2h30m
+    r = res(cal._handle_calendar_log_job({
+        "owner": o, "job": "client-acme", "category": "work",
+        "start": start, "end": end, "title": "ACME retro",
+    }))
+    assert r["logged"] is True and r["status"] == "confirmed"
+    assert r["duration_seconds"] == 2 * 3600 + 30 * 60
+
+    # The occurrence_status carries the timer fields.
+    st = store.list_statuses(r["id"])[0]
+    assert st["status"] == "confirmed" and st["source"] == "timer"
+    assert st["started_utc"] and st["ended_utc"] and st["duration_seconds"] == 9000
+    ev = store.get_event(r["id"])
+    assert ev["job"] == "client-acme" and ev["category"] == "work"
+    assert ev["alert_channel"] == "none"   # alertless
+
+    # It aggregates in the job summary over a window covering that past day.
+    summ = store.summarize_jobs(o, "2026-06-01T00:00:00+00:00", "2026-06-30T00:00:00+00:00")
+    by_job = {j["job"]: j for j in summ["jobs"]}
+    assert by_job["client-acme"]["total_seconds"] == 9000
+    assert by_job["client-acme"]["count"] == 1
+
+
+def test_log_job_rejects_future_and_bad_range():
+    o = "u_log"
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    future_start = (_dt.now(_tz.utc) + _td(days=1)).isoformat()
+    future_end = (_dt.now(_tz.utc) + _td(days=1, hours=2)).isoformat()
+    bad_future = json.loads(cal._handle_calendar_log_job({
+        "owner": o, "job": "x", "start": future_start, "end": future_end}))
+    assert not bad_future["ok"] and "future" in bad_future["error"]
+
+    bad_range = json.loads(cal._handle_calendar_log_job({
+        "owner": o, "job": "x",
+        "start": "2026-06-03T16:00:00+03:00", "end": "2026-06-03T14:00:00+03:00"}))
+    assert not bad_range["ok"] and "after start" in bad_range["error"]
+
+    # duration form works (no explicit end)
+    ok = res(cal._handle_calendar_log_job({
+        "owner": o, "job": "thesis", "start": "2026-06-02T09:00:00+03:00", "duration": "45 min"}))
+    assert ok["duration_seconds"] == 45 * 60
+
+    # unregistered owner refused
+    bad_owner = json.loads(cal._handle_calendar_log_job({
+        "owner": "ghost_user_xyz", "job": "x", "start": "2026-06-03T14:00:00+03:00", "duration": "1h"}))
+    assert not bad_owner["ok"] and "calendar-users.json" in bad_owner["error"]
 
 
 def _run_all():

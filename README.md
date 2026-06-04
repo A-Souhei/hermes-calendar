@@ -34,6 +34,7 @@ Calendar/Plannings views plus one-click timer resume/stop. Owners are
 | `calendar_start_timer` | Start a work timer now (open-ended or fixed `duration`); tag it with a `job`/`category`. |
 | `calendar_stop_timer` | Stop the running timer and record the measured duration. |
 | `calendar_resume_job` | Start a fresh session of an existing job, reusing its exact name + category so sessions aggregate. |
+| `calendar_log_job` | **Retroactively log a past, finished job session** (`start` + `end`/`duration`) — a confirmed timer-backed record that aggregates in summaries, for work already done. |
 | `calendar_list_jobs` | List distinct jobs for an owner with total time and session counts. |
 | `calendar_job_summary` | Aggregate tracked time by job/category for a period; optionally email a styled report (HTML + PDF). |
 
@@ -201,6 +202,7 @@ silently creating a near-duplicate.
 | Tool | Description |
 |---|---|
 | `calendar_resume_job` | Start a fresh session of an existing job, reusing its exact name + category so sessions aggregate. |
+| `calendar_log_job` | **Retroactively log a past, finished job session** (`start` + `end`/`duration`) — a confirmed timer-backed record that aggregates in summaries, for work already done. |
 | `calendar_list_jobs` | List distinct jobs for an owner with total time and session counts. |
 | `calendar_job_summary` | Aggregate tracked time by job/category for a period; optionally email a styled report (HTML + PDF). |
 

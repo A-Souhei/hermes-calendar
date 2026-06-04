@@ -194,6 +194,90 @@ def start_session(
     return result
 
 
+def log_session(
+    *,
+    owner: str,
+    title: str,
+    started_utc: str,
+    ended_utc: str,
+    duration_seconds: int,
+    job: Optional[str] = None,
+    category: Optional[str] = None,
+    description: Optional[str] = None,
+    location: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    language: Optional[str] = None,
+    notify_email: Optional[str] = None,
+    tz: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record a PAST, already-finished timer-backed job session.
+
+    Unlike ``start_session`` (which begins at *now*), this logs a completed
+    session retroactively from explicit ``started_utc``/``ended_utc`` — for
+    logging work that was already done. It creates a one-time, alertless event
+    anchored at ``started_utc`` and a 'confirmed' occurrence_status carrying
+    ``source='timer'`` + started/ended/duration — the SAME shape a stopped
+    timer produces, so it aggregates in ``summarize_jobs`` / ``list_jobs``.
+
+    Does NOT auto-switch running timers (logging past work is independent of any
+    live session) and does NOT validate the registry — callers do.
+    """
+    tz_name = tz or recurrence.DEFAULT_TZ
+
+    # Normalize timestamps to UTC ISO with a +00:00 offset — the storage layer
+    # relies on that form for lexicographic range filtering (summarize_jobs);
+    # a trailing 'Z' or a non-UTC offset would skew job-aggregation windows.
+    def _utc_iso(s: str) -> str:
+        iso = s[:-1] + "+00:00" if isinstance(s, str) and s.endswith("Z") else s
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+
+    started_utc = _utc_iso(started_utc)
+    ended_utc = _utc_iso(ended_utc)
+
+    event_data: Dict[str, Any] = {
+        "title": title,
+        "description": description,
+        "start_utc": started_utc,
+        "tz": tz_name,
+        "all_day": False,
+        "recurrence": None,
+        "alert_lead_seconds": None,
+        "alert_channel": "none",
+        "meeting": None,
+        "location": location,
+        "tags": tags,
+        "language": language,
+        "owner": owner,
+        "notify_email": notify_email,
+        "job": job,
+        "category": category,
+    }
+    event_id = store.add_event(event_data)
+    # Occurrence key = the event's own start (one-time event), matching how
+    # start_session/stop key the status row.
+    store.set_status(
+        event_id, started_utc, "confirmed",
+        started_utc=started_utc,
+        ended_utc=ended_utc,
+        duration_seconds=duration_seconds,
+        source="timer",
+    )
+    return {
+        "id": event_id,
+        "title": title,
+        "job": job,
+        "category": category,
+        "started_utc": started_utc,
+        "ended_utc": ended_utc,
+        "duration_seconds": duration_seconds,
+        "status": "confirmed",
+        "logged": True,
+    }
+
+
 def resume_job(
     owner: str,
     job: str,
