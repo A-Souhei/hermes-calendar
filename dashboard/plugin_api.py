@@ -1,9 +1,12 @@
-"""Read-only FastAPI backend for the calendar dashboard tab.
+"""FastAPI backend for the calendar dashboard tab.
 
 Mounted by the Hermes dashboard at /api/plugins/calendar/ (session auth is
 applied by the dashboard middleware — no auth code needed here).
 
-All routes here are read-only — they only SELECT via ``store``. It reuses the
+Mostly read-only (GET routes that only SELECT via ``store``), plus a few
+mutating POST routes wired to dashboard buttons: ``/jobs/resume``,
+``/jobs/stop`` (timer actions) and ``/event/confirm`` / ``/event/cancel``
+(mark one occurrence confirmed/missed + optional report). It reuses the
 calendar plugin's own ``store`` and ``recurrence`` modules (loaded as a tiny
 synthetic package so their relative imports resolve) — that keeps occurrence
 math identical to what fires the real alerts, with no logic drift. We
@@ -13,8 +16,7 @@ service regardless of agent wiring.
 
 Note: importing ``store`` runs its idempotent ``init_db()`` (CREATE TABLE IF
 NOT EXISTS) on first import, so loading this module may create the DB
-file/schema if it does not already exist. That is the only write path; every
-HTTP route is strictly read-only.
+file/schema if it does not already exist.
 """
 
 from __future__ import annotations
@@ -266,7 +268,7 @@ def _occurrences_in_range(
     return out
 
 
-# --- routes (all GET, read-only) --------------------------------------------
+# --- routes (GET read-only, plus the POST action routes below) --------------
 
 @router.get("/users")
 def list_users():
@@ -365,18 +367,19 @@ def _apply_occurrence_outcome(body: "ConfirmEventRequest", status: str, *, rejec
     if ev.get("job"):
         raise HTTPException(400, detail="job/timer events are completed with stop, not confirm/cancel")
     occ = (body.occurrence_utc or "").strip() or ev["start_utc"]
-    if reject_future:
-        occ_dt = None
-        try:
-            _s = occ[:-1] + "+00:00" if occ.endswith("Z") else occ
-            occ_dt = datetime.fromisoformat(_s)
-            if occ_dt.tzinfo is None:
-                occ_dt = occ_dt.replace(tzinfo=timezone.utc)
-            occ_dt = occ_dt.astimezone(timezone.utc)
-        except Exception:
-            occ_dt = None
-        if occ_dt is not None and occ_dt > datetime.now(timezone.utc):
-            raise HTTPException(400, detail="cannot confirm a future event")
+    # Validate the occurrence key as ISO-8601 — reject a malformed one rather
+    # than writing an orphan status/report row under a bad key (and so the
+    # future-occurrence check below always has a real datetime to compare).
+    try:
+        _s = occ[:-1] + "+00:00" if occ.endswith("Z") else occ
+        occ_dt = datetime.fromisoformat(_s)
+        if occ_dt.tzinfo is None:
+            occ_dt = occ_dt.replace(tzinfo=timezone.utc)
+        occ_dt = occ_dt.astimezone(timezone.utc)
+    except Exception:
+        raise HTTPException(400, detail="invalid occurrence_utc")
+    if reject_future and occ_dt > datetime.now(timezone.utc):
+        raise HTTPException(400, detail="cannot confirm a future event")
     # Don't clobber a running timer on this occurrence.
     cur = store.get_status(eid, occ)
     if cur and cur.get("status") == "active":
