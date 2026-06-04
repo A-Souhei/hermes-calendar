@@ -455,6 +455,13 @@
 }
 .cal-confirm-btn:hover { filter: brightness(0.95); }
 .cal-confirm-btn:disabled { opacity: 0.6; cursor: default; }
+.cal-cancel-btn {
+  background: var(--color-warning, #d97706); color: #fff; border: none;
+  border-radius: 6px; font-size: 0.82rem; padding: 4px 12px; height: 32px;
+  cursor: pointer; font-weight: 600;
+}
+.cal-cancel-btn:hover { filter: brightness(0.95); }
+.cal-cancel-btn:disabled { opacity: 0.6; cursor: default; }
 .cal-report-textarea {
   width: 100%; min-height: 90px; resize: vertical;
   background: var(--color-card); color: var(--color-card-foreground);

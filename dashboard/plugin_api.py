@@ -346,25 +346,64 @@ class ConfirmEventRequest(BaseModel):
     report: Optional[str] = None
 
 
-@router.post("/event/confirm")
-def confirm_event(body: ConfirmEventRequest):
-    """Mark one occurrence of an event confirmed (dashboard 'Confirm' button),
-    optionally saving an activity report. Auth via dashboard middleware."""
+def _apply_occurrence_outcome(body: "ConfirmEventRequest", status: str, *, reject_future: bool):
+    """Shared logic for the dashboard Confirm/Cancel buttons.
+
+    Sets one occurrence's status to `status` ('confirmed' for Confirm, 'missed'
+    for Cancel) and optionally saves a report/reason. Regular events only —
+    notes aren't completable and job/timer occurrences use start/stop. Auth is
+    handled by the dashboard session middleware.
+    """
     if not body.event_id or not body.event_id.strip():
         raise HTTPException(400, detail="event_id is required")
-    ev = store.get_event(body.event_id.strip())
+    eid = body.event_id.strip()
+    ev = store.get_event(eid)
     if not ev:
         raise HTTPException(404, detail="event not found")
+    if (ev.get("kind") or "event") == "note":
+        raise HTTPException(400, detail="notes cannot be confirmed or cancelled")
+    if ev.get("job"):
+        raise HTTPException(400, detail="job/timer events are completed with stop, not confirm/cancel")
     occ = (body.occurrence_utc or "").strip() or ev["start_utc"]
-    store.set_status(body.event_id.strip(), occ, "confirmed", source="dashboard")
+    if reject_future:
+        occ_dt = None
+        try:
+            _s = occ[:-1] + "+00:00" if occ.endswith("Z") else occ
+            occ_dt = datetime.fromisoformat(_s)
+            if occ_dt.tzinfo is None:
+                occ_dt = occ_dt.replace(tzinfo=timezone.utc)
+            occ_dt = occ_dt.astimezone(timezone.utc)
+        except Exception:
+            occ_dt = None
+        if occ_dt is not None and occ_dt > datetime.now(timezone.utc):
+            raise HTTPException(400, detail="cannot confirm a future event")
+    # Don't clobber a running timer on this occurrence.
+    cur = store.get_status(eid, occ)
+    if cur and cur.get("status") == "active":
+        raise HTTPException(409, detail="this occurrence has a running timer; stop it first")
+    store.set_status(eid, occ, status, source="dashboard")
     report_saved = False
     if body.report and body.report.strip():
-        existing = store.get_report(body.event_id.strip(), occ)
+        existing = store.get_report(eid, occ)
         rep = dict(existing["report"]) if existing and isinstance(existing.get("report"), dict) else {}
         rep["notes"] = body.report.strip()
-        store.set_report(body.event_id.strip(), occ, rep)
+        store.set_report(eid, occ, rep)
         report_saved = True
-    return {"ok": True, "occurrence_utc": occ, "status": "confirmed", "report_saved": report_saved}
+    return {"ok": True, "occurrence_utc": occ, "status": status, "report_saved": report_saved}
+
+
+@router.post("/event/confirm")
+def confirm_event(body: ConfirmEventRequest):
+    """Confirm one occurrence of a regular event (past/now), optionally saving
+    an activity report. Future occurrences are rejected (use cancel)."""
+    return _apply_occurrence_outcome(body, "confirmed", reject_future=True)
+
+
+@router.post("/event/cancel")
+def cancel_event(body: ConfirmEventRequest):
+    """Cancel one occurrence of a regular event — mark it 'missed' (it won't
+    happen), optionally saving a reason. Used for future occurrences."""
+    return _apply_occurrence_outcome(body, "missed", reject_future=False)
 
 
 @router.post("/jobs/stop")
