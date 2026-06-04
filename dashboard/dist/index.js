@@ -283,13 +283,16 @@
     const [error, setError] = useState(null);
     const [resuming, setResuming] = useState(false);
     const [stopping, setStopping] = useState(false);
+    const [confirming, setConfirming] = useState(false);
+    const [cancelling, setCancelling] = useState(false);
+    const [report, setReport] = useState("");
     const [actionMsg, setActionMsg] = useState(null);
     const [reloadTick, setReloadTick] = useState(0);
     const [, setNowTick] = useState(0);
 
     // Clear any action message only when switching to a different event (not on
     // a reload, so a "Stopped"/"Started" confirmation survives the refetch).
-    useEffect(function () { setActionMsg(null); }, [id]);
+    useEffect(function () { setActionMsg(null); setReport(""); }, [id]);
 
     useEffect(function () {
       let alive = true;
@@ -300,6 +303,15 @@
         .catch(function (err) { if (alive) { setError((err && err.message) || "Failed to load"); setLoading(false); } });
       return function () { alive = false; };
     }, [id, reloadTick]);
+
+    // Prefill the report textarea from any existing report notes for targetOcc.
+    useEffect(function () {
+      if (!data) return;
+      var targetOcc = (props.occurrence || data.start_utc || "");
+      var existing = (data.reports || []).filter(function (r) { return r.occurrence_utc === targetOcc; })[0];
+      var notes = (existing && existing.report && existing.report.notes) || "";
+      setReport(notes);
+    }, [data]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // While a session is running, re-render every second so the elapsed time
     // shown in the details ticks live. No interval is set up when idle.
@@ -357,12 +369,69 @@
         });
     }
 
+    function handleConfirm() {
+      if (!data || !data.id) return;
+      var targetOcc = (props.occurrence || data.start_utc || "");
+      setConfirming(true);
+      setActionMsg(null);
+      SDK.fetchJSON(API + "/event/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event_id: data.id, occurrence_utc: targetOcc, report: report }),
+      })
+        .then(function (result) {
+          var msg = "✓ Confirmed" + (result && result.report_saved ? " — report saved" : "");
+          setActionMsg({ ok: true, text: msg });
+          setConfirming(false);
+          setReloadTick(function (t) { return t + 1; });
+          if (props.onResumed) props.onResumed();
+        })
+        .catch(function (err) {
+          setActionMsg({ ok: false, text: (err && err.message) || "Confirm failed" });
+          setConfirming(false);
+        });
+    }
+
+    function handleCancel() {
+      if (!data || !data.id) return;
+      var targetOcc = (props.occurrence || data.start_utc || "");
+      setCancelling(true);
+      setActionMsg(null);
+      SDK.fetchJSON(API + "/event/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event_id: data.id, occurrence_utc: targetOcc, report: report }),
+      })
+        .then(function (result) {
+          var msg = "✕ Cancelled" + (result && result.report_saved ? " — reason saved" : "");
+          setActionMsg({ ok: true, text: msg });
+          setCancelling(false);
+          setReloadTick(function (t) { return t + 1; });
+          if (props.onResumed) props.onResumed();
+        })
+        .catch(function (err) {
+          setActionMsg({ ok: false, text: (err && err.message) || "Cancel failed" });
+          setCancelling(false);
+        });
+    }
+
     const meeting = data && data.meeting;
     const tags = (data && data.tags) || [];
     const activeRow = ((data && data.statuses) || []).filter(function (s) {
       return s.status === "active" && s.started_utc;
     })[0];
     const activeStarted = activeRow ? activeRow.started_utc : null;
+    const isRegularEvent = data && data.kind !== "note" && !data.job;
+    var targetOcc = data ? (props.occurrence || data.start_utc || "") : "";
+    var alreadyConfirmed = isRegularEvent && data && (data.statuses || []).some(function (s) {
+      return s.occurrence_utc === targetOcc && s.status === "confirmed";
+    });
+    // A future occurrence can't be confirmed (it hasn't happened) — it can be
+    // cancelled instead (marked 'missed'). Past/now → Confirm; future → Cancel.
+    var isFuture = targetOcc ? (new Date(targetOcc).getTime() > Date.now()) : false;
+    var alreadyCancelled = isRegularEvent && data && (data.statuses || []).some(function (s) {
+      return s.occurrence_utc === targetOcc && s.status === "missed";
+    });
 
     return h(
       "div",
@@ -411,6 +480,23 @@
                         title: "Resume this job (start a new session)",
                       }, resuming ? "…" : "▶ Resume job")
                     : null),
+              // Regular (green) events: kind === "event" and no job.
+              // Past/now → Confirm (it happened); future → Cancel (call it off).
+              isRegularEvent
+                ? (isFuture
+                    ? h("button", {
+                        className: "cal-cancel-btn",
+                        onClick: handleCancel,
+                        disabled: cancelling,
+                        title: alreadyCancelled ? "Update cancellation reason" : "Cancel this upcoming occurrence",
+                      }, cancelling ? "…" : "✕ Cancel")
+                    : h("button", {
+                        className: "cal-confirm-btn",
+                        onClick: handleConfirm,
+                        disabled: confirming,
+                        title: alreadyConfirmed ? "Re-confirm / update report" : "Mark this occurrence confirmed",
+                      }, confirming ? "…" : "✓ Confirm"))
+                : null,
               h(Button, { variant: "ghost", size: "sm", onClick: props.onClose }, "✕")
             )
           ),
@@ -538,7 +624,31 @@
                     : h("div", { className: "text-sm opacity-60" }, "No reports yet.")
                 ),
 
-                h("div", { className: "text-xs opacity-40 pt-2 border-t" }, "Read-only — edits are made by talking to the assistant.")
+                // Confirm/Cancel UI (textarea) — regular events only.
+                // Future occurrence → cancel mode (reason); past/now → confirm mode (report).
+                isRegularEvent
+                  ? h(
+                      "div",
+                      { className: "space-y-2 pt-2 border-t" },
+                      alreadyConfirmed
+                        ? h("div", { className: "text-xs cal-resume-ok" }, "✓ already confirmed for this occurrence")
+                        : null,
+                      alreadyCancelled
+                        ? h("div", { className: "text-xs opacity-60" }, "✕ already cancelled for this occurrence")
+                        : null,
+                      h("label", { className: "text-xs font-semibold uppercase tracking-wide opacity-60", htmlFor: "cal-report-input" },
+                        isFuture ? "Reason for cancellation (optional)" : "Activity report / transcription (optional)"),
+                      h("textarea", {
+                        id: "cal-report-input",
+                        className: "cal-report-textarea",
+                        value: report,
+                        onChange: function (e) { setReport(e.target.value); },
+                        placeholder: isFuture
+                          ? "Why is this being cancelled?…"
+                          : "Add notes or a transcription for this occurrence…",
+                      })
+                    )
+                  : h("div", { className: "text-xs opacity-40 pt-2 border-t" }, "Read-only — edits are made by talking to the assistant.")
               )
             : null
         )
@@ -579,7 +689,7 @@
             key: t.event_id + i,
             className: "cal-running-banner",
             title: "Open the running session",
-            onClick: function () { if (props.onOpen) props.onOpen(t.event_id); },
+            onClick: function () { if (props.onOpen) props.onOpen(t.event_id, t.occurrence_utc || null); },
           },
           h("span", { className: "cal-running-dot" }, "●"),
           h("span", { className: "cal-running-label" }, "Running"),
@@ -668,7 +778,7 @@
                 {
                   key: ev.id + "@" + ev.occurrence_utc + i,
                   className: cn("agenda-row", ev.job && "agenda-row-job", ev.kind === "note" && "agenda-row-note"),
-                  onClick: function () { props.onOpen(ev.id); },
+                  onClick: function () { props.onOpen(ev.id, ev.occurrence_utc); },
                 },
                 h("span", { className: "agenda-time" }, timeStr),
                 h(
@@ -707,7 +817,7 @@
     const timers = useTimers(owner);
     const [anchor, setAnchor] = useState(function () { return monthAnchor(new Date()); });
     const [selectedDay, setSelectedDay] = useState(function () { return new Date(); });
-    const [openId, setOpenId] = useState(null);
+    const [openModal, setOpenModal] = useState(null); // {id, occ}
     const { events, loading, error, reload } = useEvents(anchor, owner, category);
 
     const byDate = useMemo(function () {
@@ -795,7 +905,7 @@
       ),
 
       // currently-running session(s)
-      h(RunningBanner, { timers: timers, onOpen: setOpenId }),
+      h(RunningBanner, { timers: timers, onOpen: function (id, occ) { setOpenModal({ id: id, occ: occ || null }); } }),
 
       // at-a-glance stat cards
       h(
@@ -837,15 +947,16 @@
             h(AgendaPanel, {
               date: selectedDay,
               events: selectedEvents,
-              onOpen: setOpenId,
+              onOpen: function (id, occ) { setOpenModal({ id: id, occ: occ || null }); },
             })
           )
         )
       ),
 
-      openId ? h(DetailModal, {
-        eventId: openId,
-        onClose: function () { setOpenId(null); },
+      openModal ? h(DetailModal, {
+        eventId: openModal.id,
+        occurrence: openModal.occ,
+        onClose: function () { setOpenModal(null); },
         onResumed: reload,
       }) : null
     );

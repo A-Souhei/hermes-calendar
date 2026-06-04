@@ -1,9 +1,12 @@
-"""Read-only FastAPI backend for the calendar dashboard tab.
+"""FastAPI backend for the calendar dashboard tab.
 
 Mounted by the Hermes dashboard at /api/plugins/calendar/ (session auth is
 applied by the dashboard middleware — no auth code needed here).
 
-All routes here are read-only — they only SELECT via ``store``. It reuses the
+Mostly read-only (GET routes that only SELECT via ``store``), plus a few
+mutating POST routes wired to dashboard buttons: ``/jobs/resume``,
+``/jobs/stop`` (timer actions) and ``/event/confirm`` / ``/event/cancel``
+(mark one occurrence confirmed/missed + optional report). It reuses the
 calendar plugin's own ``store`` and ``recurrence`` modules (loaded as a tiny
 synthetic package so their relative imports resolve) — that keeps occurrence
 math identical to what fires the real alerts, with no logic drift. We
@@ -13,8 +16,7 @@ service regardless of agent wiring.
 
 Note: importing ``store`` runs its idempotent ``init_db()`` (CREATE TABLE IF
 NOT EXISTS) on first import, so loading this module may create the DB
-file/schema if it does not already exist. That is the only write path; every
-HTTP route is strictly read-only.
+file/schema if it does not already exist.
 """
 
 from __future__ import annotations
@@ -266,7 +268,7 @@ def _occurrences_in_range(
     return out
 
 
-# --- routes (all GET, read-only) --------------------------------------------
+# --- routes (GET read-only, plus the POST action routes below) --------------
 
 @router.get("/users")
 def list_users():
@@ -338,6 +340,73 @@ def resume_job(body: ResumeJobRequest):
 
 class StopJobRequest(BaseModel):
     event_id: str
+
+
+class ConfirmEventRequest(BaseModel):
+    event_id: str
+    occurrence_utc: Optional[str] = None
+    report: Optional[str] = None
+
+
+def _apply_occurrence_outcome(body: "ConfirmEventRequest", status: str, *, reject_future: bool):
+    """Shared logic for the dashboard Confirm/Cancel buttons.
+
+    Sets one occurrence's status to `status` ('confirmed' for Confirm, 'missed'
+    for Cancel) and optionally saves a report/reason. Regular events only —
+    notes aren't completable and job/timer occurrences use start/stop. Auth is
+    handled by the dashboard session middleware.
+    """
+    if not body.event_id or not body.event_id.strip():
+        raise HTTPException(400, detail="event_id is required")
+    eid = body.event_id.strip()
+    ev = store.get_event(eid)
+    if not ev:
+        raise HTTPException(404, detail="event not found")
+    if (ev.get("kind") or "event") == "note":
+        raise HTTPException(400, detail="notes cannot be confirmed or cancelled")
+    if ev.get("job"):
+        raise HTTPException(400, detail="job/timer events are completed with stop, not confirm/cancel")
+    occ = (body.occurrence_utc or "").strip() or ev["start_utc"]
+    # Validate the occurrence key as ISO-8601 — reject a malformed one rather
+    # than writing an orphan status/report row under a bad key (and so the
+    # future-occurrence check below always has a real datetime to compare).
+    try:
+        _s = occ[:-1] + "+00:00" if occ.endswith("Z") else occ
+        occ_dt = datetime.fromisoformat(_s)
+        if occ_dt.tzinfo is None:
+            occ_dt = occ_dt.replace(tzinfo=timezone.utc)
+        occ_dt = occ_dt.astimezone(timezone.utc)
+    except Exception:
+        raise HTTPException(400, detail="invalid occurrence_utc")
+    if reject_future and occ_dt > datetime.now(timezone.utc):
+        raise HTTPException(400, detail="cannot confirm a future event")
+    # Don't clobber a running timer on this occurrence.
+    cur = store.get_status(eid, occ)
+    if cur and cur.get("status") == "active":
+        raise HTTPException(409, detail="this occurrence has a running timer; stop it first")
+    store.set_status(eid, occ, status, source="dashboard")
+    report_saved = False
+    if body.report and body.report.strip():
+        existing = store.get_report(eid, occ)
+        rep = dict(existing["report"]) if existing and isinstance(existing.get("report"), dict) else {}
+        rep["notes"] = body.report.strip()
+        store.set_report(eid, occ, rep)
+        report_saved = True
+    return {"ok": True, "occurrence_utc": occ, "status": status, "report_saved": report_saved}
+
+
+@router.post("/event/confirm")
+def confirm_event(body: ConfirmEventRequest):
+    """Confirm one occurrence of a regular event (past/now), optionally saving
+    an activity report. Future occurrences are rejected (use cancel)."""
+    return _apply_occurrence_outcome(body, "confirmed", reject_future=True)
+
+
+@router.post("/event/cancel")
+def cancel_event(body: ConfirmEventRequest):
+    """Cancel one occurrence of a regular event — mark it 'missed' (it won't
+    happen), optionally saving a reason. Used for future occurrences."""
+    return _apply_occurrence_outcome(body, "missed", reject_future=False)
 
 
 @router.post("/jobs/stop")
@@ -438,6 +507,7 @@ def event_detail(event_id: str):
         "owner": ev.get("owner"),
         "notify_email": ev.get("notify_email"),
         "planning": _planning_name_for(ev),
+        "kind": ev.get("kind") or "event",
         "job": ev.get("job"),
         "category": ev.get("category"),
         "meeting": ev.get("meeting"),
