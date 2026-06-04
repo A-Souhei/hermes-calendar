@@ -456,7 +456,12 @@
             h(
               "div",
               { className: "space-y-1" },
-              h("h2", { className: "text-lg font-semibold leading-tight" }, data ? data.title : "Loading…"),
+              h("h2", { className: "text-lg font-semibold leading-tight" },
+                data && data.number != null
+                  ? h("span", null,
+                      h("span", { className: "cal-evnum" }, "#" + data.number + " "),
+                      data.title)
+                  : (data ? data.title : "Loading…")),
               data && data.recurrence_human
                 ? h(Badge, { variant: "secondary" }, "↻ " + data.recurrence_human)
                 : null,
@@ -525,7 +530,9 @@
                 h(
                   "dl",
                   { className: "cal-kv" },
-                  h(KV, { label: "When", value: fmtDateTime(data.start_utc, data.tz, data.all_day) + (data.all_day ? " (all day)" : "") }),
+                  h(KV, { label: "When", value: (data.end_utc && !data.all_day)
+                    ? fmtDateTime(data.start_utc, data.tz, data.all_day) + " – " + fmtTime(data.end_utc, data.tz)
+                    : fmtDateTime(data.start_utc, data.tz, data.all_day) + (data.all_day ? " (all day)" : "") }),
                   data.planning
                     ? h(KV, { label: "Planning", value: h(Badge, { variant: "secondary" }, "🗜️ " + data.planning) })
                     : null,
@@ -794,7 +801,15 @@
             "div",
             { className: "agenda-list" },
             events.map(function (ev, i) {
-              var timeStr = ev.all_day ? "All day" : fmtTime(ev.occurrence_local || ev.occurrence_utc, ev.tz);
+              var startTime = ev.all_day ? null : fmtTime(ev.occurrence_local || ev.occurrence_utc, ev.tz);
+              var timeStr;
+              if (ev.all_day) {
+                timeStr = "All day";
+              } else if (ev.end_utc) {
+                timeStr = startTime + " – " + fmtTime(ev.end_utc, ev.tz);
+              } else {
+                timeStr = startTime;
+              }
               var dur = ev.duration_seconds != null ? fmtDuration(ev.duration_seconds) : null;
               return h(
                 "button",
@@ -812,6 +827,7 @@
                     { className: "agenda-titleline" },
                     ev.kind === "note" ? h("span", { className: "agenda-note-glyph" }, "🗒️") : null,
                     ev.planning ? h("span", { className: "cal-plan-glyph" }, "🗜️") : null,
+                    ev.number != null ? h("span", { className: "agenda-evnum" }, "#" + ev.number + " ") : null,
                     h("span", { className: "agenda-evtitle" }, (ev.has_report ? "📝 " : "") + ev.title),
                     dur ? h("span", { className: "agenda-dur" }, dur) : null
                   ),

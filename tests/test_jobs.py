@@ -49,6 +49,12 @@ _registry_data = {
         {"name": "u_notelist", "email": "notelist@example.com", "language": "en"},
         {"name": "u_noteflt",  "email": "noteflt@example.com",  "language": "en"},
         {"name": "u_log",      "email": "log@example.com",      "language": "en"},
+        {"name": "u_seq",      "email": "seq@example.com",      "language": "en"},
+        {"name": "u_seq2",     "email": "seq2@example.com",     "language": "en"},
+        {"name": "u_seq3",     "email": "seq3@example.com",     "language": "en"},
+        {"name": "u_tag",      "email": "tag@example.com",      "language": "en"},
+        {"name": "u_dur",      "email": "dur@example.com",      "language": "en"},
+        {"name": "u_conv",     "email": "conv@example.com",     "language": "en"},
         {"name": "u_noemail"},  # registered but no email (for the planning gate test)
     ]
 }
@@ -468,6 +474,530 @@ def test_log_job_rejects_future_and_bad_range():
     bad_owner = json.loads(cal._handle_calendar_log_job({
         "owner": "ghost_user_xyz", "job": "x", "start": "2026-06-03T14:00:00+03:00", "duration": "1h"}))
     assert not bad_owner["ok"] and "calendar-users.json" in bad_owner["error"]
+
+
+# ---------------------------------------------------------------------------
+# seq / per-owner numbering + _resolve_event_id + calendar_tag
+# ---------------------------------------------------------------------------
+
+def test_seq_per_owner_numbering():
+    """add_event assigns sequential per-owner numbers (monotonically increasing);
+    a fresh owner gets a monotone sequence starting at 1."""
+    o = "u_seq"
+    e1 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "seq-a", "start": "2026-07-10T09:00:00+03:00",
+    }))
+    e2 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "seq-b", "start": "2026-07-11T09:00:00+03:00",
+    }))
+    e3 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "seq-c", "start": "2026-07-12T09:00:00+03:00",
+    }))
+    # Numbers must be strictly increasing consecutive integers.
+    assert e1["number"] is not None
+    assert e2["number"] == e1["number"] + 1
+    assert e3["number"] == e2["number"] + 1
+
+    # A completely fresh owner (no prior events) starts at 1.
+    # Use the pre-registered, otherwise-unused 'u_seq2' owner so we don't mutate
+    # the shared registry file (which would leak into later tests).
+    fresh_owner = "u_seq2"
+    e_fresh = res(cal._handle_calendar_add_event({
+        "owner": fresh_owner, "title": "first ever", "start": "2026-07-01T10:00:00+03:00",
+    }))
+    assert e_fresh["number"] == 1
+
+
+def test_seq_migration_and_backfill():
+    """The seq column exists after init_db(); existing rows (created before the
+    migration ran for the first time) have seq populated."""
+    cols = {r[1] for r in store._get_conn().execute("PRAGMA table_info(events)").fetchall()}
+    assert "seq" in cols, "seq column missing from events table"
+
+    # Every event with a non-empty owner must have a non-NULL seq.
+    rows = store._get_conn().execute(
+        "SELECT id, owner, seq FROM events WHERE owner IS NOT NULL AND owner != ''"
+    ).fetchall()
+    for row in rows:
+        assert row[2] is not None, (
+            f"Event {row[0]} (owner={row[1]!r}) has NULL seq after migration/backfill"
+        )
+
+
+def test_resolve_event_id_variants():
+    """_resolve_event_id resolves '#N', 'N', and full uuids; returns None for a
+    number without owner."""
+    o = "u_seq"
+    # Create a dedicated event so this test is self-contained regardless of run order.
+    ev = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "resolve-test", "start": "2026-11-01T09:00:00+03:00",
+    }))
+    full_id = ev["id"]
+    seq_num = ev["number"]
+    assert seq_num is not None
+
+    # Full uuid works without owner.
+    assert cal._resolve_event_id(full_id) == full_id
+
+    # #N with owner.
+    assert cal._resolve_event_id(f"#{seq_num}", owner=o) == full_id
+
+    # Plain digit string with owner.
+    assert cal._resolve_event_id(str(seq_num), owner=o) == full_id
+
+    # Number without owner returns None.
+    assert cal._resolve_event_id(str(seq_num), owner=None) is None
+
+    # Non-existent seq returns None.
+    assert cal._resolve_event_id("#9999", owner=o) is None
+
+    # Unknown uuid returns None.
+    assert cal._resolve_event_id("deadbeef" * 4) is None
+
+
+def test_owner_change_reassigns_seq():
+    """Moving an event to a different owner gives it a fresh per-owner seq so
+    #N stays unique within the new owner's namespace (no collision with an
+    existing event the new owner already has)."""
+    # u_seqA already has an event #1; u_seq3 also gets its own #1.
+    a = "u_seq"
+    b = "u_seq3"
+    # Ensure u_seq2 has at least one event so its next seq is > 1.
+    res(cal._handle_calendar_add_event({
+        "owner": b, "title": "b-owns-1", "start": "2026-12-01T09:00:00+03:00",
+    }))
+    b_max = max(
+        r[0] for r in store._get_conn().execute(
+            "SELECT seq FROM events WHERE owner COLLATE NOCASE = ?", (b,)
+        ).fetchall()
+    )
+
+    # Create an event under owner a, then move it to owner b.
+    moved = res(cal._handle_calendar_add_event({
+        "owner": a, "title": "to-be-moved", "start": "2026-12-02T09:00:00+03:00",
+    }))
+    store.update_event(moved["id"], {"owner": b})
+    after = store.get_event(moved["id"])
+    # New seq is the next free number under b, and it resolves cleanly via #N.
+    assert after["seq"] == b_max + 1
+    assert cal._resolve_event_id(f"#{after['seq']}", owner=b) == moved["id"]
+
+
+def test_handler_accepts_number_reference():
+    """calendar_get_event and calendar_set_status work with a #number + owner."""
+    o = "u_seq"
+    # Create a fresh event to get a known seq number.
+    ev_created = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "handler-ref-test", "start": "2026-10-01T09:00:00+03:00",
+    }))
+    seq = ev_created["number"]
+    eid = ev_created["id"]
+    assert seq is not None
+
+    # calendar_get_event by #number.
+    r = res(cal._handle_calendar_get_event({"id": f"#{seq}", "owner": o}))
+    assert r["id"] == eid
+    assert r["number"] == seq
+
+    # calendar_set_status by plain digit string.
+    r2 = res(cal._handle_calendar_set_status({
+        "id": str(seq), "owner": o, "status": "confirmed",
+    }))
+    assert r2["id"] == eid
+
+
+def test_remove_event_requires_confirmation():
+    """A full delete (scope='all') returns needs_confirmation and deletes nothing
+    until called again with confirm=true."""
+    o = "u_seq"
+    ev = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "delete-me", "start": "2026-09-09T09:00:00+03:00",
+    }))
+    eid = ev["id"]
+    seq = ev["number"]
+
+    # First call without confirm: nothing is deleted.
+    r1 = res(cal._handle_calendar_remove_event({"id": f"#{seq}", "owner": o}))
+    assert r1["needs_confirmation"] is True
+    assert r1["removed"] is False
+    assert store.get_event(eid) is not None, "event must still exist before confirmation"
+
+    # Second call with confirm=true: actually deleted.
+    r2 = res(cal._handle_calendar_remove_event({"id": eid, "confirm": True}))
+    assert r2["removed"] is True
+    assert store.get_event(eid) is None
+
+
+def test_calendar_tag_by_number_and_job():
+    """calendar_tag adds tags to multiple events by number (merge, no clobber)
+    and by job filter."""
+    o = "u_tag"
+
+    # Create two events with pre-existing tags.
+    e1 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "tagged-one", "start": "2026-08-01T09:00:00+03:00",
+        "tags": ["existing"],
+    }))
+    e2 = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "tagged-two", "start": "2026-08-02T09:00:00+03:00",
+    }))
+    # A job event.
+    e3 = res(cal._handle_calendar_start_timer({
+        "owner": o, "title": "job session", "job": "myproject", "duration": "30 min",
+    }))
+
+    n1, n2 = e1["number"], e2["number"]
+
+    # Add "urgent" to #n1 and #n2 — should not clobber "existing" on e1.
+    r = res(cal._handle_calendar_tag({
+        "owner": o,
+        "ids": [f"#{n1}", f"#{n2}"],
+        "add_tags": ["urgent"],
+    }))
+    assert r["updated"] >= 1
+
+    ev1 = store.get_event(e1["id"])
+    assert "existing" in (ev1["tags"] or []), "pre-existing tag must not be clobbered"
+    assert "urgent" in (ev1["tags"] or [])
+
+    ev2 = store.get_event(e2["id"])
+    assert "urgent" in (ev2["tags"] or [])
+
+    # Tag by job filter.
+    r2 = res(cal._handle_calendar_tag({
+        "owner": o,
+        "job": "myproject",
+        "add_tags": ["billable"],
+    }))
+    assert r2["updated"] >= 1
+    ev3 = store.get_event(e3["id"])
+    assert "billable" in (ev3["tags"] or [])
+
+    # remove_tags works.
+    r3 = res(cal._handle_calendar_tag({
+        "owner": o,
+        "ids": [f"#{n1}"],
+        "remove_tags": ["existing"],
+    }))
+    ev1b = store.get_event(e1["id"])
+    assert "existing" not in (ev1b["tags"] or [])
+
+
+def test_update_event_add_remove_tags():
+    """calendar_update_event add_tags/remove_tags merge correctly without clobber."""
+    o = "u_tag"
+    e = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "merge-test", "start": "2026-09-01T10:00:00+03:00",
+        "tags": ["alpha", "beta"],
+    }))
+    eid = e["id"]
+
+    # Add "gamma", remove "alpha".
+    r = res(cal._handle_calendar_update_event({
+        "id": eid,
+        "add_tags": ["gamma"],
+        "remove_tags": ["alpha"],
+    }))
+    ev = store.get_event(eid)
+    tags = ev["tags"] or []
+    assert "beta" in tags
+    assert "gamma" in tags
+    assert "alpha" not in tags
+
+    # Full replacement with tags= still works.
+    r2 = res(cal._handle_calendar_update_event({
+        "id": eid,
+        "tags": ["only"],
+    }))
+    assert store.get_event(eid)["tags"] == ["only"]
+
+    # add_tags on top of replacement in same call.
+    r3 = res(cal._handle_calendar_update_event({
+        "id": eid,
+        "tags": ["base"],
+        "add_tags": ["extra"],
+    }))
+    final = store.get_event(eid)["tags"] or []
+    assert "base" in final and "extra" in final
+
+
+# ---------------------------------------------------------------------------
+# duration / end_utc on regular events
+# ---------------------------------------------------------------------------
+
+def test_add_event_with_duration_stores_duration_seconds():
+    """calendar_add_event with 'duration' stores duration_seconds and summary
+    includes end_utc = start + duration."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "dur-event",
+        "start": "2026-06-10T09:00:00+03:00",
+        "duration": "2 hours",
+    }))
+    assert r["created"] is True
+    assert r["duration_seconds"] == 2 * 3600
+    assert r["end_utc"] is not None
+    # end_utc should be 2 hours after start
+    from datetime import datetime as _dt, timezone as _tz
+    start_dt = _dt.fromisoformat("2026-06-10T09:00:00+03:00").astimezone(_tz.utc)
+    end_dt = _dt.fromisoformat(r["end_utc"])
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=_tz.utc)
+    diff = (end_dt.astimezone(_tz.utc) - start_dt).total_seconds()
+    assert abs(diff - 2 * 3600) < 2, f"Expected ~7200s diff, got {diff}"
+    # Store-level check
+    ev = store.get_event(r["id"])
+    assert ev["duration_seconds"] == 2 * 3600
+
+
+def test_add_event_with_end_computes_duration_seconds():
+    """calendar_add_event with 'end' computes duration_seconds = end - start."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "end-event",
+        "start": "2026-06-11T14:00:00+03:00",
+        "end":   "2026-06-11T15:30:00+03:00",
+    }))
+    assert r["created"] is True
+    assert r["duration_seconds"] == 90 * 60
+
+
+def test_add_event_with_end_before_start_errors():
+    """end before start returns an error."""
+    o = "u_dur"
+    bad = json.loads(cal._handle_calendar_add_event({
+        "owner": o, "title": "bad-end",
+        "start": "2026-06-12T15:00:00+03:00",
+        "end":   "2026-06-12T14:00:00+03:00",
+    }))
+    assert not bad["ok"] and "end must be after start" in bad["error"]
+
+
+def test_past_one_time_event_with_duration_writes_confirmed_status():
+    """A past one-time regular event with duration writes a confirmed
+    source='manual' occurrence_status AND does NOT appear in summarize_jobs."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "past-regular",
+        "start": "2025-01-10T10:00:00+03:00",
+        "duration": "1 hour",
+    }))
+    eid = r["id"]
+    statuses = store.list_statuses(eid)
+    assert len(statuses) == 1, f"Expected 1 status row, got {len(statuses)}"
+    st = statuses[0]
+    assert st["status"] == "confirmed"
+    assert st["source"] == "manual"
+    assert st["duration_seconds"] == 3600
+
+    # Must NOT appear in summarize_jobs (event has no job).
+    summ = store.summarize_jobs(o, "2020-01-01T00:00:00+00:00", "2030-01-01T00:00:00+00:00")
+    job_ids = {j["job"] for j in summ["jobs"]}
+    assert "past-regular" not in job_ids
+    assert summ["count"] == 0 or all(j["job"] for j in summ["jobs"])
+
+
+def test_future_event_with_duration_no_status_row():
+    """A future one-time event with a duration should NOT have a status row
+    (only past events get the confirmed record)."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "future-dur",
+        "start": "2030-06-10T09:00:00+03:00",
+        "duration": "30 min",
+    }))
+    assert r["duration_seconds"] == 30 * 60
+    statuses = store.list_statuses(r["id"])
+    assert len(statuses) == 0, f"Expected no status for future event, got {statuses}"
+
+
+def test_add_event_rejects_nonpositive_duration():
+    """A zero/negative planned duration is rejected (a real range needs length)."""
+    o = "u_dur"
+    err = json.loads(cal._handle_calendar_add_event({
+        "owner": o, "title": "zero-dur", "start": "2030-02-02T09:00:00+03:00",
+        "duration": "0 min",
+    }))
+    assert not err["ok"] and "positive" in err["error"].lower()
+
+
+def test_ongoing_event_not_auto_confirmed():
+    """An event that started in the past but ENDS in the future (still ongoing)
+    must NOT be auto-confirmed — only finished events record actuals."""
+    o = "u_dur"
+    # Starts ~30 min ago, lasts 2 hours -> end is in the future.
+    start = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "ongoing", "start": start, "duration": "2 hours",
+    }))
+    statuses = store.list_statuses(r["id"])
+    assert len(statuses) == 0, f"Ongoing event must not be confirmed, got {statuses}"
+
+
+def test_update_event_clear_duration_via_zero_string_clears_status():
+    """Clearing the duration with a '0 min' string nulls duration_seconds AND
+    the occurrence_status ended/duration (set_status preserves None otherwise)."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "to-clear", "start": "2025-03-03T10:00:00+03:00",
+        "duration": "1 hour",
+    }))
+    eid = r["id"]
+    assert store.get_event(eid)["duration_seconds"] == 3600
+    res(cal._handle_calendar_update_event({"id": eid, "duration": "0 min"}))
+    assert store.get_event(eid)["duration_seconds"] is None
+    for st in store.list_statuses(eid):
+        assert st.get("duration_seconds") is None, "status duration not cleared"
+        assert st.get("ended_utc") is None, "status ended_utc not cleared"
+
+
+def test_resolve_event_id_uppercase_uuid():
+    """An uppercase uuid resolves (ids are stored lowercase)."""
+    o = "u_dur"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "upper-uuid", "start": "2030-04-04T09:00:00+03:00",
+    }))
+    eid = r["id"]
+    assert cal._resolve_event_id(eid.upper()) == eid
+
+
+# ---------------------------------------------------------------------------
+# calendar_convert_to_job and calendar_convert_to_regular
+# ---------------------------------------------------------------------------
+
+def test_convert_to_job_makes_event_aggregate_in_jobs():
+    """calendar_convert_to_job converts a regular event into a job session that
+    aggregates in summarize_jobs; same id and #N are preserved."""
+    o = "u_conv"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "meeting-work",
+        "start": "2025-03-01T10:00:00+03:00",
+        "duration": "2 hours",
+    }))
+    orig_id = r["id"]
+    orig_num = r["number"]
+
+    conv = res(cal._handle_calendar_convert_to_job({
+        "owner": o,
+        "id": f"#{orig_num}",
+        "job": "client-work",
+        "category": "consulting",
+    }))
+    assert conv["converted_to"] == "job"
+    assert conv["id"] == orig_id          # same id
+    assert conv["number"] == orig_num     # same #N
+
+    ev = store.get_event(orig_id)
+    assert ev["job"] == "client-work"
+    assert ev["category"] == "consulting"
+    assert ev["duration_seconds"] == 2 * 3600
+
+    # Now appears in summarize_jobs.
+    summ = store.summarize_jobs(o, "2020-01-01T00:00:00+00:00", "2030-01-01T00:00:00+00:00")
+    by_job = {j["job"]: j for j in summ["jobs"]}
+    assert "client-work" in by_job, f"Expected 'client-work' in jobs: {by_job}"
+    assert by_job["client-work"]["total_seconds"] == 2 * 3600
+
+    # occurrence_status has source='timer'.
+    statuses = store.list_statuses(orig_id)
+    assert any(s["source"] == "timer" for s in statuses)
+
+
+def test_convert_to_job_requires_duration():
+    """convert_to_job on an event with no duration and no override errors."""
+    o = "u_conv"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "no-duration-ev",
+        "start": "2025-04-01T09:00:00+03:00",
+        # no duration
+    }))
+    bad = json.loads(cal._handle_calendar_convert_to_job({
+        "owner": o, "id": r["id"],
+    }))
+    assert not bad["ok"] and "duration" in bad["error"].lower()
+
+
+def test_convert_to_job_rejects_nonpositive_duration():
+    """convert_to_job with a zero/negative duration override is rejected."""
+    o = "u_conv"
+    r = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "convert-zero",
+        "start": "2025-04-02T09:00:00+03:00", "duration": "1 hour",
+    }))
+    bad = json.loads(cal._handle_calendar_convert_to_job({
+        "owner": o, "id": r["id"], "duration": "0 min",
+    }))
+    assert not bad["ok"] and "positive" in bad["error"].lower()
+
+
+def test_convert_to_job_rejects_note():
+    """Converting a note is rejected with the expected message."""
+    o = "u_conv"
+    note = res(cal._handle_calendar_add_note({
+        "owner": o, "content": "just a note",
+    }))
+    bad = json.loads(cal._handle_calendar_convert_to_job({
+        "owner": o, "id": note["id"],
+    }))
+    assert not bad["ok"]
+    assert "Notes have no time range" in bad["error"]
+
+
+def test_convert_to_regular_removes_from_jobs():
+    """calendar_convert_to_regular strips job, no longer in summarize_jobs, retains id/#N."""
+    o = "u_conv"
+    # Start a timer job session (confirmed).
+    r = _start(o, title="Timer session", job="timer-job", category="work", duration="1 hour")
+    orig_id = r["id"]
+    ev = store.get_event(orig_id)
+    orig_num = ev["seq"]
+
+    # Verify it appears in summarize_jobs before conversion.
+    summ_before = store.summarize_jobs(o, "2020-01-01T00:00:00+00:00", "2030-01-01T00:00:00+00:00")
+    jobs_before = {j["job"] for j in summ_before["jobs"]}
+    assert "timer-job" in jobs_before
+
+    conv = res(cal._handle_calendar_convert_to_regular({
+        "owner": o, "id": orig_id,
+    }))
+    assert conv["converted_to"] == "regular"
+    assert conv["id"] == orig_id
+    assert conv["number"] == orig_num
+
+    ev_after = store.get_event(orig_id)
+    assert not ev_after.get("job"), f"job should be cleared, got: {ev_after.get('job')}"
+    # duration_seconds should still be set (retained from the job session).
+    assert ev_after.get("duration_seconds") is not None
+
+    # No longer appears in summarize_jobs.
+    summ_after = store.summarize_jobs(o, "2020-01-01T00:00:00+00:00", "2030-01-01T00:00:00+00:00")
+    jobs_after = {j["job"] for j in summ_after["jobs"]}
+    assert "timer-job" not in jobs_after, f"timer-job should be gone, still in: {jobs_after}"
+
+    # source flipped to 'manual'.
+    statuses = store.list_statuses(orig_id)
+    assert all(s.get("source") != "timer" for s in statuses), (
+        f"Expected no timer sources, got: {[s.get('source') for s in statuses]}"
+    )
+
+
+def test_convert_to_regular_rejects_note():
+    """Converting a note to regular is rejected."""
+    o = "u_conv"
+    note = res(cal._handle_calendar_add_note({
+        "owner": o, "content": "another note",
+    }))
+    bad = json.loads(cal._handle_calendar_convert_to_regular({
+        "owner": o, "id": note["id"],
+    }))
+    assert not bad["ok"]
+    assert "Notes have no time range" in bad["error"]
+
+
+def test_migration_includes_duration_seconds():
+    """The duration_seconds column exists on the events table."""
+    cols = {r[1] for r in store._get_conn().execute("PRAGMA table_info(events)").fetchall()}
+    assert "duration_seconds" in cols, "duration_seconds column missing from events table"
 
 
 def _run_all():

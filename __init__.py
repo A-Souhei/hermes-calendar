@@ -314,10 +314,26 @@ def _planning_name_for(ev: Dict) -> Optional[str]:
 
 def _event_summary(ev: Dict) -> Dict:
     """Return a compact summary suitable for tool responses."""
+    dur = ev.get("duration_seconds")
+    end_utc: Optional[str] = None
+    if dur is not None:
+        try:
+            start_iso = ev["start_utc"]
+            if start_iso.endswith("Z"):
+                start_iso = start_iso[:-1] + "+00:00"
+            start_dt = datetime.fromisoformat(start_iso)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            end_utc = (start_dt + timedelta(seconds=dur)).isoformat()
+        except Exception:
+            end_utc = None
     return {
         "id": ev["id"],
+        "number": ev.get("seq"),
         "title": ev["title"],
         "start_utc": ev["start_utc"],
+        "end_utc": end_utc,
+        "duration_seconds": dur,
         "tz": ev.get("tz"),
         "all_day": ev.get("all_day", False),
         "recurrence": _human_recurrence(ev.get("recurrence"), ev.get("tz")),
@@ -333,6 +349,33 @@ def _event_summary(ev: Dict) -> Dict:
         "category": ev.get("category"),
         "kind": ev.get("kind", "event"),
     }
+
+
+def _resolve_event_id(ref: Any, owner: Optional[str] = None) -> Optional[str]:
+    """Resolve an event reference to a stored event id.
+
+    Accepts a full event id (uuid hex) OR a per-owner number ('#3' / '3') —
+    a number requires `owner` (the asker) to resolve. Returns the id or None.
+    """
+    s = str(ref or "").strip()
+    if not s:
+        return None
+    if s.startswith("#"):
+        s = s[1:].strip()
+    # A 32-char hex string is an event id (uuid hex) — resolve it as such even
+    # though it is digit-friendly, so an all-digit id is never mistaken for a
+    # per-owner #number reference. Ids are stored lowercase, so normalize first
+    # (an uppercase uuid pasted by the user would otherwise miss).
+    if len(s) == 32 and all(c in "0123456789abcdef" for c in s.lower()):
+        s = s.lower()
+        return s if store.get_event(s) else None
+    if s.isdigit():
+        if not owner:
+            return None
+        ev = store.get_event_by_seq(str(owner).strip(), int(s))
+        return ev["id"] if ev else None
+    # Otherwise treat as a real id.
+    return s if store.get_event(s) else None
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +466,28 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
     category_raw = args.get("category")
     category = (str(category_raw).strip() or None) if category_raw is not None else None
 
+    # Compute duration_seconds from `duration` or `end` args (both optional).
+    duration_seconds: Optional[int] = None
+    dur_raw = args.get("duration")
+    end_raw = args.get("end")
+    if dur_raw is not None:
+        parsed_dur = _parse_lead(dur_raw)
+        if parsed_dur is None:
+            return tool_error(
+                f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'."
+            )
+        if parsed_dur <= 0:
+            return tool_error("duration must be positive — a real time range needs a non-zero length.")
+        duration_seconds = parsed_dur
+    elif end_raw is not None:
+        end_dt = _parse_start(end_raw, tz_name)
+        if end_dt is None:
+            return tool_error(f"Could not parse end datetime: {end_raw!r}")
+        dur_secs = round((end_dt.astimezone(timezone.utc) - start_dt.astimezone(timezone.utc)).total_seconds())
+        if dur_secs <= 0:
+            return tool_error("end must be after start")
+        duration_seconds = dur_secs
+
     d = {
         "title": title,
         "description": args.get("description"),
@@ -440,6 +505,7 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         "notify_email": notify_email,
         "planning_id": planning_id,
         "category": category,
+        "duration_seconds": duration_seconds,
     }
     try:
         event_id = store.add_event(d)
@@ -447,14 +513,37 @@ def _handle_calendar_add_event(args: Dict[str, Any], **kw) -> str:
         logger.exception("calendar_add_event store error")
         return tool_error(f"Failed to save event: {e}")
 
+    # For a one-time event that has ALREADY FINISHED, write a confirmed
+    # occurrence_status (source='manual') to record actuals — mirrors how a
+    # completed job is recorded. Gate on the END time (start + duration), not
+    # just the start, so an event that began in the past but is still ongoing
+    # is not prematurely marked confirmed.
+    if duration_seconds is not None and rec is None:
+        now_utc = datetime.now(timezone.utc)
+        start_aware = start_dt.astimezone(timezone.utc)
+        ended_aware = start_aware + timedelta(seconds=duration_seconds)
+        if ended_aware <= now_utc:
+            ended_utc = ended_aware.isoformat()
+            try:
+                store.set_status(
+                    event_id, start_utc, "confirmed",
+                    started_utc=start_utc,
+                    ended_utc=ended_utc,
+                    duration_seconds=duration_seconds,
+                    source="manual",
+                )
+            except Exception:
+                pass
+
     ev = store.get_event(event_id)
     return tool_result({"created": True, **_event_summary(ev)})
 
 
 def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
-    event_id = str(args.get("id") or "").strip()
-    if not event_id:
-        return tool_error("id is required")
+    eid = _resolve_event_id(args.get("id"), owner=args.get("owner"))
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    event_id = eid
 
     ev = store.get_event(event_id)
     if ev is None:
@@ -541,6 +630,28 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
         tags_raw = args["tags"]
         fields["tags"] = [str(t) for t in tags_raw] if isinstance(tags_raw, list) else None
 
+    # add_tags / remove_tags: merge into current (or just-replaced) tags list.
+    add_tags_raw = args.get("add_tags")
+    remove_tags_raw = args.get("remove_tags")
+    if add_tags_raw is not None or remove_tags_raw is not None:
+        # Base is whatever tags will be set after the `tags` replacement above,
+        # or the existing stored tags if no replacement was requested.
+        base_tags: List[str] = list(
+            fields["tags"] if "tags" in fields
+            else (ev.get("tags") or [])
+        )
+        if remove_tags_raw and isinstance(remove_tags_raw, list):
+            remove_lower = {str(t).strip().lower() for t in remove_tags_raw}
+            base_tags = [t for t in base_tags if t.strip().lower() not in remove_lower]
+        if add_tags_raw and isinstance(add_tags_raw, list):
+            existing_lower = {t.strip().lower() for t in base_tags}
+            for t in add_tags_raw:
+                ts = str(t).strip()
+                if ts and ts.lower() not in existing_lower:
+                    base_tags.append(ts)
+                    existing_lower.add(ts.lower())
+        fields["tags"] = base_tags if base_tags else None
+
     if "language" in args:
         lang_raw = args["language"]
         if lang_raw is None:
@@ -569,6 +680,45 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
         cat_raw = args["category"]
         fields["category"] = (str(cat_raw).strip() or None) if cat_raw is not None else None
 
+    # duration / end: recompute duration_seconds. Explicit 0 or null clears it.
+    if "duration" in args or "end" in args:
+        dur_raw = args.get("duration")
+        end_raw = args.get("end")
+        if dur_raw is not None and (isinstance(dur_raw, (int, float)) and dur_raw == 0):
+            fields["duration_seconds"] = None
+        elif dur_raw is not None:
+            parsed_dur = _parse_lead(dur_raw)
+            if parsed_dur is None:
+                return tool_error(
+                    f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'."
+                )
+            # A non-positive duration (e.g. '0' / '0 min') clears the range,
+            # matching the schema's "Pass 0 or null to clear".
+            fields["duration_seconds"] = parsed_dur if parsed_dur > 0 else None
+        elif end_raw is not None:
+            eff_tz = fields.get("tz") or ev.get("tz") or recurrence_mod.DEFAULT_TZ
+            end_dt = _parse_start(end_raw, eff_tz)
+            if end_dt is None:
+                return tool_error(f"Could not parse end datetime: {end_raw!r}")
+            start_iso = fields.get("start_utc") or ev.get("start_utc")
+            if start_iso:
+                try:
+                    s = start_iso[:-1] + "+00:00" if start_iso.endswith("Z") else start_iso
+                    start_dt_upd = datetime.fromisoformat(s)
+                    if start_dt_upd.tzinfo is None:
+                        start_dt_upd = start_dt_upd.replace(tzinfo=timezone.utc)
+                    dur_secs = round((end_dt.astimezone(timezone.utc) - start_dt_upd.astimezone(timezone.utc)).total_seconds())
+                    if dur_secs <= 0:
+                        return tool_error("end must be after start")
+                    fields["duration_seconds"] = dur_secs
+                except Exception:
+                    return tool_error("Could not compute duration from end time")
+            else:
+                return tool_error("Cannot compute duration: event has no start time")
+        else:
+            # "duration" key present but null value -> clear
+            fields["duration_seconds"] = None
+
     if not fields:
         return tool_error("No updatable fields provided")
 
@@ -581,14 +731,56 @@ def _handle_calendar_update_event(args: Dict[str, Any], **kw) -> str:
     if not updated:
         return tool_error(f"Event not found: {event_id}")
 
+    # If duration_seconds was updated, also patch the one-time occurrence_status row
+    # (best-effort: don't fail the whole update if this step errors).
+    if "duration_seconds" in fields:
+        try:
+            new_dur = fields["duration_seconds"]
+            ev_after = store.get_event(event_id)
+            occ_key = ev_after["start_utc"] if ev_after else ev["start_utc"]
+            existing_st = store.get_status(event_id, occ_key)
+            if existing_st:
+                if new_dur is None:
+                    # set_status preserves None args, so rebuild the row to
+                    # truly clear ended_utc/duration_seconds (keeping status,
+                    # started_utc, note and source).
+                    store.clear_status(event_id, occ_key)
+                    store.set_status(
+                        event_id, occ_key, existing_st["status"],
+                        started_utc=existing_st.get("started_utc"),
+                        note=existing_st.get("note"),
+                        source=existing_st.get("source"),
+                    )
+                else:
+                    ended_upd = None
+                    if existing_st.get("started_utc"):
+                        try:
+                            s2 = existing_st["started_utc"]
+                            if s2.endswith("Z"):
+                                s2 = s2[:-1] + "+00:00"
+                            st_dt = datetime.fromisoformat(s2)
+                            if st_dt.tzinfo is None:
+                                st_dt = st_dt.replace(tzinfo=timezone.utc)
+                            ended_upd = (st_dt + timedelta(seconds=new_dur)).isoformat()
+                        except Exception:
+                            ended_upd = None
+                    store.set_status(
+                        event_id, occ_key, existing_st["status"],
+                        ended_utc=ended_upd,
+                        duration_seconds=new_dur,
+                    )
+        except Exception:
+            pass
+
     ev = store.get_event(event_id)
     return tool_result({"updated": True, **_event_summary(ev)})
 
 
 def _handle_calendar_remove_event(args: Dict[str, Any], **kw) -> str:
-    event_id = str(args.get("id") or "").strip()
-    if not event_id:
-        return tool_error("id is required")
+    eid = _resolve_event_id(args.get("id"), owner=args.get("owner"))
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    event_id = eid
 
     scope = str(args.get("scope") or "all").strip().lower()
     occurrence_raw = args.get("occurrence")
@@ -610,7 +802,48 @@ def _handle_calendar_remove_event(args: Dict[str, Any], **kw) -> str:
             return tool_error(f"Failed to skip occurrence: {e}")
         return tool_result({"skipped_occurrence": occ_iso, "event_id": event_id})
 
-    # scope == "all" (default)
+    # scope == "all" (default) — PERMANENT deletion of the whole event/series.
+    # Force an explicit confirmation: the first call (without confirm=true)
+    # returns a prompt describing exactly what will be deleted and removes
+    # nothing. The agent must confirm with the user, then call again with
+    # confirm=true.
+    ev = store.get_event(event_id)
+    if ev is None:
+        return tool_error(f"Event not found: {event_id}")
+
+    if not bool(args.get("confirm", False)):
+        try:
+            n_statuses = len(store.list_statuses(event_id))
+        except Exception:
+            n_statuses = 0
+        try:
+            n_reports = len(store.list_reports(event_id))
+        except Exception:
+            n_reports = 0
+        is_rec = ev.get("recurrence") is not None
+        extras: List[str] = []
+        if is_rec:
+            extras.append("the entire recurring series")
+        if n_statuses:
+            extras.append(f"{n_statuses} status/session record(s)")
+        if n_reports:
+            extras.append(f"{n_reports} report(s)")
+        extra_txt = (" This also deletes " + ", ".join(extras) + ".") if extras else ""
+        num = ev.get("seq")
+        label = (f"#{num} " if num is not None else "") + (ev.get("title") or event_id)
+        return tool_result({
+            "needs_confirmation": True,
+            "removed": False,
+            "event_id": event_id,
+            "number": num,
+            "title": ev.get("title"),
+            "recurring": is_rec,
+            "message": (
+                f"This will permanently delete '{label}'.{extra_txt} "
+                "Confirm with the user, then call calendar_remove_event again with confirm=true."
+            ),
+        })
+
     try:
         removed = store.remove_event(event_id)
     except Exception as e:
@@ -708,6 +941,7 @@ def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
             status_row = store.get_status(ev["id"], occ_iso)
             items.append({
                 "id": ev["id"],
+                "number": ev.get("seq"),
                 "title": ev["title"],
                 "occurrence_local": occ_local.isoformat(),
                 "occurrence_utc": occ_iso,
@@ -727,9 +961,10 @@ def _handle_calendar_list_events(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
-    event_id = str(args.get("id") or "").strip()
-    if not event_id:
-        return tool_error("id is required")
+    eid = _resolve_event_id(args.get("id"), owner=args.get("owner"))
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    event_id = eid
 
     ev = store.get_event(event_id)
     if ev is None:
@@ -756,6 +991,7 @@ def _handle_calendar_get_event(args: Dict[str, Any], **kw) -> str:
 
     return tool_result({
         "id": ev["id"],
+        "number": ev.get("seq"),
         "title": ev["title"],
         "description": ev.get("description"),
         "start_utc": ev["start_utc"],
@@ -847,7 +1083,8 @@ _ALERT_LEAD_DESCRIPTION = (
 _START_DESCRIPTION = (
     "Absolute datetime for the event start. You know the current date — resolve relative "
     "expressions ('tomorrow', 'next Monday') to an ISO string before calling. "
-    "Example: '2026-06-15T09:00:00+03:00'. All-day events can use 'YYYY-MM-DD'."
+    "Example: '2026-06-15T09:00:00+03:00'. All-day events can use 'YYYY-MM-DD'. "
+    "Past datetimes are allowed — use them to log events that already happened."
 )
 
 CALENDAR_ADD_EVENT_SCHEMA = {
@@ -855,13 +1092,32 @@ CALENDAR_ADD_EVENT_SCHEMA = {
     "description": (
         "Add a new event to the calendar. Supports one-time and recurring events, "
         "meeting details (participants, video room URL/app), location, tags, and "
-        "configurable reminders via Home Assistant push or TTS."
+        "configurable reminders via Home Assistant push or TTS. "
+        "Pass 'duration' or 'end' to give the event a time range (start–end). "
+        "Past starts are allowed for logging events that already happened."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "Event title (required)."},
             "start": {"type": "string", "description": _START_DESCRIPTION},
+            "end": {
+                "type": "string",
+                "description": (
+                    "Optional absolute datetime when the event ends/ended. "
+                    "Used to compute duration_seconds (end - start). "
+                    "Ignored when 'duration' is also given (duration wins). "
+                    "Example: '2026-06-15T11:00:00+03:00'."
+                ),
+            },
+            "duration": {
+                "type": "string",
+                "description": (
+                    "Optional duration of the event, e.g. '2 hours', '90 min', '1h30m'. "
+                    "Takes precedence over 'end' when both are given. "
+                    "Omit for a point-in-time event (no time range)."
+                ),
+            },
             "description": {"type": "string", "description": "Optional free-text description."},
             "all_day": {"type": "boolean", "description": "True for all-day events (no specific time)."},
             "tz": {
@@ -960,6 +1216,19 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
             },
             "location": {"type": "string"},
             "tags": {"type": "array", "items": {"type": "string"}},
+            "add_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Tags to add (merged; existing tags preserved). Applied after 'tags' "
+                    "replacement if both are given. Case-insensitive dedup."
+                ),
+            },
+            "remove_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tags to remove (case-insensitive). Applied after 'tags' replacement if both given.",
+            },
             "language": {
                 "type": ["string", "null"],
                 "enum": ["en", "fr", None],
@@ -974,6 +1243,20 @@ CALENDAR_UPDATE_EVENT_SCHEMA = {
                     "e.g. 'work', 'personal', 'client-acme'. Pass null to clear it."
                 ),
             },
+            "end": {
+                "type": ["string", "null"],
+                "description": (
+                    "New end datetime for the event. Recomputes duration_seconds = end - start. "
+                    "Ignored when 'duration' is also given."
+                ),
+            },
+            "duration": {
+                "type": ["string", "number", "null"],
+                "description": (
+                    "New duration, e.g. '2 hours', '90 min'. "
+                    "Pass 0 or null to clear the time range (make it a point event)."
+                ),
+            },
         },
         "required": ["id"],
     },
@@ -983,12 +1266,22 @@ CALENDAR_REMOVE_EVENT_SCHEMA = {
     "name": "calendar_remove_event",
     "description": (
         "Remove a calendar event. Use scope='all' (default) to delete the entire series, "
-        "or scope='occurrence' + occurrence date to skip a single occurrence of a recurring event."
+        "or scope='occurrence' + occurrence date to skip a single occurrence of a recurring event. "
+        "A full delete (scope='all') is PERMANENT and requires confirmation: call once WITHOUT "
+        "confirm to get a summary of what will be deleted, show it to the user, and only call "
+        "again with confirm=true after they explicitly agree."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Event ID."},
+            "id": {"type": "string", "description": "Event ID or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
             "scope": {
                 "type": "string",
                 "enum": ["all", "occurrence"],
@@ -999,6 +1292,14 @@ CALENDAR_REMOVE_EVENT_SCHEMA = {
                 "description": (
                     "Required when scope='occurrence'. The datetime of the specific occurrence "
                     "to skip, e.g. '2026-07-14T09:00:00+03:00'."
+                ),
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": (
+                    "Must be true to actually perform a permanent full delete (scope='all'). "
+                    "Leave unset/false first to receive a confirmation prompt (needs_confirmation=true) "
+                    "describing what will be deleted; set true only after the user has confirmed."
                 ),
             },
         },
@@ -1052,7 +1353,14 @@ CALENDAR_GET_EVENT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Event ID."},
+            "id": {"type": "string", "description": "Event ID or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
         },
         "required": ["id"],
     },
@@ -1117,9 +1425,12 @@ def _report_event_id(args: Dict[str, Any]) -> str:
 
 
 def _handle_calendar_set_report(args: Dict[str, Any], **kw) -> str:
-    event_id = _report_event_id(args)
-    if not event_id:
+    raw_id = _report_event_id(args)
+    if not raw_id:
         return tool_error("id (the event id) is required")
+    event_id = _resolve_event_id(raw_id, owner=args.get("owner"))
+    if not event_id:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1151,9 +1462,12 @@ def _handle_calendar_set_report(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_get_report(args: Dict[str, Any], **kw) -> str:
-    event_id = _report_event_id(args)
-    if not event_id:
+    raw_id = _report_event_id(args)
+    if not raw_id:
         return tool_error("id (the event id) is required")
+    event_id = _resolve_event_id(raw_id, owner=args.get("owner"))
+    if not event_id:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1170,9 +1484,12 @@ def _handle_calendar_get_report(args: Dict[str, Any], **kw) -> str:
 
 
 def _handle_calendar_list_reports(args: Dict[str, Any], **kw) -> str:
-    event_id = _report_event_id(args)
-    if not event_id:
+    raw_id = _report_event_id(args)
+    if not raw_id:
         return tool_error("id (the event id) is required")
+    event_id = _resolve_event_id(raw_id, owner=args.get("owner"))
+    if not event_id:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1198,7 +1515,14 @@ CALENDAR_SET_REPORT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "The event id."},
+            "id": {"type": "string", "description": "Event id or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
             "occurrence": {"type": "string", "description": "Occurrence date/datetime — required for recurring events; omit for one-time."},
             "minutes": {"type": "string", "description": "Meeting minutes / what happened."},
             "transcription": {"type": "string", "description": "Full transcription of the meeting."},
@@ -1224,7 +1548,14 @@ CALENDAR_GET_REPORT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "The event id."},
+            "id": {"type": "string", "description": "Event id or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
             "occurrence": {"type": "string", "description": "Occurrence date/datetime — required for recurring; omit for one-time."},
         },
         "required": ["id"],
@@ -1239,7 +1570,16 @@ CALENDAR_LIST_REPORTS_SCHEMA = {
     ),
     "parameters": {
         "type": "object",
-        "properties": {"id": {"type": "string", "description": "The event id."}},
+        "properties": {
+            "id": {"type": "string", "description": "Event id or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
+        },
         "required": ["id"],
     },
 }
@@ -1250,9 +1590,10 @@ CALENDAR_LIST_REPORTS_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def _handle_calendar_set_status(args: Dict[str, Any], **kw) -> str:
-    event_id = str(args.get("id") or "").strip()
-    if not event_id:
-        return tool_error("id is required")
+    eid = _resolve_event_id(args.get("id"), owner=args.get("owner"))
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    event_id = eid
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1612,7 +1953,14 @@ CALENDAR_SET_STATUS_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "description": "Event ID."},
+            "id": {"type": "string", "description": "Event ID or #number (e.g. '#3')."},
+            "owner": {
+                "type": "string",
+                "description": (
+                    "Owner of the event — required only to resolve a #number reference "
+                    "(the asker's identifier); not needed when 'id' is a full event id."
+                ),
+            },
             "occurrence": {
                 "type": "string",
                 "description": (
@@ -2729,6 +3077,7 @@ def _handle_calendar_list_notes(args: Dict[str, Any], **kw) -> str:
 
         result_notes.append({
             "id": note["id"],
+            "number": note.get("seq"),
             "content": note["title"],
             "details": note.get("description"),
             "when_utc": note["start_utc"],
@@ -2827,6 +3176,361 @@ CALENDAR_LIST_NOTES_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# General tag tool
+# ---------------------------------------------------------------------------
+
+def _handle_calendar_tag(args: Dict[str, Any], **kw) -> str:
+    """Tag (or untag) any set of events by #number, uuid, or job filter."""
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error("owner is required")
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    ids_raw = args.get("ids")
+    job_filter = (str(args.get("job") or "").strip() or None)
+    if not ids_raw and not job_filter:
+        return tool_error("Provide at least one of 'ids' or 'job' to select events.")
+
+    add_tags_raw = args.get("add_tags")
+    remove_tags_raw = args.get("remove_tags")
+    if not add_tags_raw and not remove_tags_raw:
+        return tool_error("Provide at least one of 'add_tags' or 'remove_tags'.")
+
+    add_tags: List[str] = [str(t).strip() for t in add_tags_raw if str(t).strip()] if add_tags_raw else []
+    remove_tags: List[str] = [str(t).strip() for t in remove_tags_raw if str(t).strip()] if remove_tags_raw else []
+    remove_lower = {t.lower() for t in remove_tags}
+
+    # Build target event id set.
+    target_ids: List[str] = []
+    not_found: List[str] = []
+
+    if ids_raw and isinstance(ids_raw, list):
+        for ref in ids_raw:
+            eid = _resolve_event_id(ref, owner=owner)
+            if eid:
+                if eid not in target_ids:
+                    target_ids.append(eid)
+            else:
+                not_found.append(str(ref))
+
+    if job_filter:
+        try:
+            all_evs = store.list_events(owner=owner)
+        except Exception as e:
+            return tool_error(f"Failed to list events: {e}")
+        for ev in all_evs:
+            ev_job = ev.get("job") or ""
+            if ev_job.strip().lower() == job_filter.lower():
+                if ev["id"] not in target_ids:
+                    target_ids.append(ev["id"])
+
+    if not target_ids and not not_found:
+        return tool_result({"updated": 0, "events": [], "not_found": []})
+
+    updated_count = 0
+    updated_events = []
+    for eid in target_ids:
+        ev = store.get_event(eid)
+        if ev is None:
+            not_found.append(eid)
+            continue
+        current_tags: List[str] = list(ev.get("tags") or [])
+        new_tags = [t for t in current_tags if t.strip().lower() not in remove_lower]
+        existing_lower = {t.strip().lower() for t in new_tags}
+        for t in add_tags:
+            if t.lower() not in existing_lower:
+                new_tags.append(t)
+                existing_lower.add(t.lower())
+        # Only write if something changed.
+        if new_tags != current_tags:
+            try:
+                store.update_event(eid, {"tags": new_tags if new_tags else None})
+            except Exception as e:
+                logger.warning("calendar_tag: failed to update %s: %s", eid, e)
+                continue
+            updated_count += 1
+        updated_events.append({
+            "number": ev.get("seq"),
+            "id": eid,
+            "title": ev.get("title"),
+            "job": ev.get("job"),
+            "tags": new_tags if new_tags else None,
+        })
+
+    return tool_result({
+        "updated": updated_count,
+        "events": updated_events,
+        "not_found": not_found,
+    })
+
+
+CALENDAR_CONVERT_TO_JOB_SCHEMA = {
+    "name": "calendar_convert_to_job",
+    "description": (
+        "Convert a regular calendar event INTO a job session in-place — keeps the same id "
+        "and #N, sets a job name, and writes a confirmed occurrence_status (source='timer') "
+        "so it aggregates in calendar_job_summary / calendar_list_jobs. "
+        "Requires a duration (from the event's existing duration_seconds, or an explicit "
+        "'duration'/'end' override). Notes cannot be converted."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "id": {
+                "type": "string",
+                "description": "Event ID or #number (e.g. '#3'). Requires owner to resolve a #number.",
+            },
+            "job": {
+                "type": "string",
+                "description": "Job name for the converted session. Defaults to the event's title.",
+            },
+            "category": {
+                "type": ["string", "null"],
+                "description": "Optional category override.",
+            },
+            "duration": {
+                "type": "string",
+                "description": "Override the session duration, e.g. '2 hours'. Uses the event's existing duration_seconds if omitted.",
+            },
+            "end": {
+                "type": "string",
+                "description": "Override end datetime (used to compute duration when 'duration' is omitted).",
+            },
+        },
+        "required": ["owner", "id"],
+    },
+}
+
+CALENDAR_CONVERT_TO_REGULAR_SCHEMA = {
+    "name": "calendar_convert_to_regular",
+    "description": (
+        "Convert a job event back to a regular calendar event in-place — clears its job "
+        "field and flips the occurrence_status source to 'manual' so it no longer "
+        "aggregates in job summaries. Retains the same id, #N, and duration_seconds. "
+        "Notes cannot be converted."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "id": {
+                "type": "string",
+                "description": "Event ID or #number (e.g. '#3'). Requires owner to resolve a #number.",
+            },
+        },
+        "required": ["owner", "id"],
+    },
+}
+
+
+def _handle_calendar_convert_to_job(args: Dict[str, Any], **kw) -> str:
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error("owner is required")
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    eid = _resolve_event_id(args.get("id"), owner=owner)
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    ev = store.get_event(eid)
+    if ev is None:
+        return tool_error(f"Event not found: {eid}")
+    if ev.get("kind") == "note":
+        return tool_error("Notes have no time range and can't be converted.")
+
+    # Determine duration_seconds: explicit override wins, else existing on event.
+    tz_name = ev.get("tz") or recurrence_mod.DEFAULT_TZ
+    dur_raw = args.get("duration")
+    end_raw = args.get("end")
+    if dur_raw is not None:
+        dur = _parse_lead(dur_raw)
+        if dur is None:
+            return tool_error(
+                f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'."
+            )
+        if dur <= 0:
+            return tool_error("duration must be positive — a job session needs a non-zero length.")
+    elif end_raw is not None:
+        end_dt = _parse_start(end_raw, tz_name)
+        if end_dt is None:
+            return tool_error(f"Could not parse end: {end_raw!r}")
+        start_iso = ev["start_utc"]
+        if start_iso.endswith("Z"):
+            start_iso = start_iso[:-1] + "+00:00"
+        start_dt_ev = datetime.fromisoformat(start_iso)
+        if start_dt_ev.tzinfo is None:
+            start_dt_ev = start_dt_ev.replace(tzinfo=timezone.utc)
+        dur = round((end_dt.astimezone(timezone.utc) - start_dt_ev.astimezone(timezone.utc)).total_seconds())
+        if dur <= 0:
+            return tool_error("end must be after start")
+    else:
+        dur = ev.get("duration_seconds")
+
+    if dur is None:
+        return tool_error("Provide a duration — this event has no time range to convert.")
+
+    job_name = (str(args.get("job") or "").strip()) or ev["title"]
+    cat_raw = args.get("category")
+    category = (str(cat_raw).strip() or None) if cat_raw is not None else ev.get("category")
+
+    start_utc = ev["start_utc"]
+    if start_utc.endswith("Z"):
+        start_utc = start_utc[:-1] + "+00:00"
+    try:
+        start_dt_ev2 = datetime.fromisoformat(start_utc)
+        if start_dt_ev2.tzinfo is None:
+            start_dt_ev2 = start_dt_ev2.replace(tzinfo=timezone.utc)
+        ended_utc = (start_dt_ev2 + timedelta(seconds=dur)).isoformat()
+    except Exception as e:
+        return tool_error(f"Could not compute end time: {e}")
+
+    update_fields: Dict[str, Any] = {
+        "job": job_name,
+        "duration_seconds": dur,
+    }
+    if cat_raw is not None:
+        update_fields["category"] = category
+
+    # Snapshot the fields we touch so we can roll back if the status write fails
+    # — otherwise the event would be left half-converted (job set, but no timer
+    # session), which won't aggregate correctly and is hard to diagnose.
+    prior = {k: ev.get(k) for k in update_fields}
+
+    try:
+        store.update_event(eid, update_fields)
+    except Exception as e:
+        logger.exception("calendar_convert_to_job update error")
+        return tool_error(f"Failed to update event: {e}")
+
+    try:
+        store.set_status(
+            eid, start_utc, "confirmed",
+            started_utc=start_utc,
+            ended_utc=ended_utc,
+            duration_seconds=dur,
+            source="timer",
+        )
+    except Exception as e:
+        logger.exception("calendar_convert_to_job set_status error")
+        try:
+            store.update_event(eid, prior)
+        except Exception:
+            logger.exception("calendar_convert_to_job rollback failed")
+        return tool_error(f"Failed to write occurrence status: {e}")
+
+    ev_after = store.get_event(eid)
+    return tool_result({"converted_to": "job", **_event_summary(ev_after)})
+
+
+def _handle_calendar_convert_to_regular(args: Dict[str, Any], **kw) -> str:
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error("owner is required")
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    eid = _resolve_event_id(args.get("id"), owner=owner)
+    if not eid:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
+    ev = store.get_event(eid)
+    if ev is None:
+        return tool_error(f"Event not found: {eid}")
+    if ev.get("kind") == "note":
+        return tool_error("Notes have no time range and can't be converted.")
+
+    # Preserve the span: if duration_seconds is NULL, try to recover from occurrence_status.
+    dur = ev.get("duration_seconds")
+    if dur is None:
+        try:
+            for s in store.list_statuses(eid):
+                if s.get("duration_seconds") is not None:
+                    dur = s["duration_seconds"]
+                    break
+        except Exception:
+            pass
+
+    update_fields: Dict[str, Any] = {"job": None}
+    if dur is not None and ev.get("duration_seconds") is None:
+        update_fields["duration_seconds"] = dur
+
+    try:
+        store.update_event(eid, update_fields)
+    except Exception as e:
+        logger.exception("calendar_convert_to_regular update error")
+        return tool_error(f"Failed to update event: {e}")
+
+    # Flip source='timer' status rows to source='manual' so they stop aggregating
+    # as job sessions (belt-and-suspenders alongside clearing the job field).
+    try:
+        for s in store.list_statuses(eid):
+            if s.get("source") == "timer":
+                store.set_status(
+                    eid, s["occurrence_utc"], s["status"],
+                    started_utc=s.get("started_utc"),
+                    ended_utc=s.get("ended_utc"),
+                    duration_seconds=s.get("duration_seconds"),
+                    source="manual",
+                )
+    except Exception:
+        pass
+
+    ev_after = store.get_event(eid)
+    return tool_result({"converted_to": "regular", **_event_summary(ev_after)})
+
+
+CALENDAR_TAG_SCHEMA = {
+    "name": "calendar_tag",
+    "description": (
+        "Add or remove tags on ANY event kind (regular event, note, or job session) "
+        "by #number, uuid, or job name — without clobbering existing tags. "
+        "Works across all dates including past job sessions that calendar_list_events' "
+        "default future window would miss. "
+        "Examples: 'add tag urgent to #1 #2 #4', 'tag the audrey job with client', "
+        "'remove tag draft from #3'. "
+        "Tags are merged case-insensitively (no duplicates, originals preserved)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Event references to tag — each can be a #number (e.g. '#3' or '3'), "
+                    "or a full event uuid. Requires owner to resolve #numbers."
+                ),
+            },
+            "job": {
+                "type": "string",
+                "description": (
+                    "Restrict to the owner's events whose job field matches this value "
+                    "(case-insensitive). All matching events are tagged."
+                ),
+            },
+            "add_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tags to add (merged; existing tags preserved). Case-insensitive dedup.",
+            },
+            "remove_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tags to remove (case-insensitive match).",
+            },
+        },
+        "required": ["owner"],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -2856,6 +3560,9 @@ _TOOLS = (
     ("calendar_job_summary",      CALENDAR_JOB_SUMMARY_SCHEMA,      _handle_calendar_job_summary,      "📊"),
     ("calendar_add_note",         CALENDAR_ADD_NOTE_SCHEMA,         _handle_calendar_add_note,         "🗒️"),
     ("calendar_list_notes",       CALENDAR_LIST_NOTES_SCHEMA,       _handle_calendar_list_notes,       "📒"),
+    ("calendar_tag",              CALENDAR_TAG_SCHEMA,              _handle_calendar_tag,              "🏷️"),
+    ("calendar_convert_to_job",     CALENDAR_CONVERT_TO_JOB_SCHEMA,     _handle_calendar_convert_to_job,     "🛠️"),
+    ("calendar_convert_to_regular", CALENDAR_CONVERT_TO_REGULAR_SCHEMA, _handle_calendar_convert_to_regular, "📅"),
 )
 
 

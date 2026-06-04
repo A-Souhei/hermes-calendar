@@ -278,6 +278,82 @@ def log_session(
     }
 
 
+def log_regular(
+    *,
+    owner: str,
+    title: str,
+    started_utc: str,
+    ended_utc: str,
+    duration_seconds: int,
+    category: Optional[str] = None,
+    description: Optional[str] = None,
+    location: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    language: Optional[str] = None,
+    notify_email: Optional[str] = None,
+    tz: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record a PAST, already-finished regular (non-job) event.
+
+    Mirrors ``log_session`` but for regular events: no ``job`` field, and the
+    occurrence_status is written with ``source='manual'`` (not 'timer') so this
+    event does NOT aggregate in ``summarize_jobs`` / ``list_jobs`` (which require
+    a non-empty job). Stores ``duration_seconds`` on the event itself as the
+    planned span, and writes a confirmed occurrence_status carrying the actual
+    started/ended/duration.
+
+    Does NOT auto-switch running timers and does NOT validate the registry.
+    """
+    tz_name = tz or recurrence.DEFAULT_TZ
+
+    def _utc_iso(s: str) -> str:
+        iso = s[:-1] + "+00:00" if isinstance(s, str) and s.endswith("Z") else s
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+
+    started_utc = _utc_iso(started_utc)
+    ended_utc = _utc_iso(ended_utc)
+
+    event_data: Dict[str, Any] = {
+        "title": title,
+        "description": description,
+        "start_utc": started_utc,
+        "tz": tz_name,
+        "all_day": False,
+        "recurrence": None,
+        "alert_lead_seconds": None,
+        "alert_channel": "none",
+        "meeting": None,
+        "location": location,
+        "tags": tags,
+        "language": language,
+        "owner": owner,
+        "notify_email": notify_email,
+        "job": None,
+        "category": category,
+        "duration_seconds": duration_seconds,
+    }
+    event_id = store.add_event(event_data)
+    store.set_status(
+        event_id, started_utc, "confirmed",
+        started_utc=started_utc,
+        ended_utc=ended_utc,
+        duration_seconds=duration_seconds,
+        source="manual",
+    )
+    return {
+        "id": event_id,
+        "title": title,
+        "started_utc": started_utc,
+        "ended_utc": ended_utc,
+        "duration_seconds": duration_seconds,
+        "status": "confirmed",
+        "logged": True,
+    }
+
+
 def resume_job(
     owner: str,
     job: str,
