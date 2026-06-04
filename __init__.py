@@ -1360,6 +1360,150 @@ def _handle_calendar_start_timer(args: Dict[str, Any], **kw) -> str:
     return tool_result(payload) if ok else tool_error(payload)
 
 
+def _log_job_impl(args: Dict[str, Any]) -> tuple:
+    """Core of calendar_log_job — record a PAST job session retroactively.
+
+    Returns (ok, payload). Validates owner (registered), job, and the time
+    range (start + end|duration, in the past), then delegates to
+    ``timers_mod.log_session``.
+    """
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return (False, "owner is required — log the job under the person who did it.")
+    if not users_mod.is_registered(owner):
+        return (False, _unregistered_owner_error(owner))
+
+    job = str(args.get("job") or "").strip()
+    if not job:
+        return (False, "job is required — the name of the job/task you worked on (e.g. 'client-acme').")
+
+    title = str(args.get("title") or "").strip() or job
+    tz_name = args.get("tz") or recurrence_mod.DEFAULT_TZ
+
+    start_raw = args.get("start")
+    if not start_raw:
+        return (False, "start is required — when the work began (a past datetime, e.g. '2026-06-03T14:00').")
+    start_dt = _parse_start(start_raw, tz_name)
+    if start_dt is None:
+        return (False, f"Couldn't parse start: {start_raw!r}")
+
+    end_raw = args.get("end")
+    dur_raw = args.get("duration")
+    if end_raw:
+        end_dt = _parse_start(end_raw, tz_name)
+        if end_dt is None:
+            return (False, f"Couldn't parse end: {end_raw!r}")
+    elif dur_raw is not None:
+        secs = _parse_lead(dur_raw)
+        if secs is None:
+            return (False, f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'.")
+        end_dt = start_dt + timedelta(seconds=secs)
+    else:
+        return (False, "Provide either 'end' (when it finished) or 'duration' (how long it took).")
+
+    started = start_dt.astimezone(timezone.utc)
+    ended = end_dt.astimezone(timezone.utc)
+    if ended <= started:
+        return (False, "end must be after start.")
+    now = datetime.now(timezone.utc)
+    if ended > now + timedelta(minutes=1):
+        return (False, "cannot log a job that ends in the future — use calendar_start_timer for ongoing work.")
+    duration_seconds = max(1, round((ended - started).total_seconds()))
+
+    tags_raw = args.get("tags")
+    tags: Optional[List[str]] = [str(t) for t in tags_raw] if isinstance(tags_raw, list) else None
+
+    lang_raw = args.get("language")
+    language: Optional[str] = None
+    if lang_raw is not None:
+        ll = str(lang_raw).strip().lower()
+        language = ll if ll in _LANGUAGE_ENUM else None
+
+    category_raw = args.get("category")
+    category = (str(category_raw).strip() or None) if category_raw is not None else None
+
+    try:
+        result = timers_mod.log_session(
+            owner=owner,
+            title=title,
+            started_utc=started.isoformat(),
+            ended_utc=ended.isoformat(),
+            duration_seconds=duration_seconds,
+            job=job,
+            category=category,
+            description=args.get("description"),
+            location=args.get("location"),
+            tags=tags,
+            language=language,
+            tz=tz_name,
+        )
+    except Exception as e:
+        logger.exception("calendar_log_job store error")
+        return (False, f"Failed to log job session: {e}")
+
+    return (True, result)
+
+
+def _handle_calendar_log_job(args: Dict[str, Any], **kw) -> str:
+    ok, payload = _log_job_impl(args)
+    return tool_result(payload) if ok else tool_error(payload)
+
+
+CALENDAR_LOG_JOB_SCHEMA = {
+    "name": "calendar_log_job",
+    "description": (
+        "Log a PAST, already-completed work session for time-tracking — use when the user "
+        "says they DID some work and want it recorded retroactively (e.g. 'I worked on "
+        "client-acme yesterday 2pm–4pm', 'log 3 hours on the thesis this morning'). Creates a "
+        "confirmed, timer-backed job session (source=timer with started/ended/duration) that "
+        "aggregates in calendar_job_summary / calendar_list_jobs, exactly like a stopped timer. "
+        "For work happening RIGHT NOW use calendar_start_timer instead. Provide 'start' plus "
+        "either 'end' or 'duration'."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "job": {
+                "type": "string",
+                "description": "The job/task name worked on (e.g. 'client-acme'). Use a CONSISTENT name so sessions aggregate.",
+            },
+            "start": {
+                "type": "string",
+                "description": (
+                    "When the work BEGAN — a past absolute datetime (resolve 'yesterday 2pm' to ISO "
+                    "yourself), e.g. '2026-06-03T14:00:00+03:00'."
+                ),
+            },
+            "end": {
+                "type": "string",
+                "description": "When the work FINISHED (absolute datetime). Provide this OR 'duration'.",
+            },
+            "duration": {
+                "description": "How long it took, if you don't give 'end' — e.g. '2 hours', '90 min', '1h30m'.",
+            },
+            "title": {"type": "string", "description": "Optional short label for the session (defaults to the job name)."},
+            "category": {"type": "string", "description": "Optional category for grouping (e.g. 'work', 'personal')."},
+            "description": {"type": "string", "description": "Optional notes about what was done."},
+            "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags."},
+            "language": {
+                "type": ["string", "null"],
+                "enum": ["en", "fr", None],
+                "description": _LANGUAGE_DESCRIPTION,
+            },
+            "tz": {
+                "type": "string",
+                "description": (
+                    f"IANA timezone for interpreting start/end. Defaults to {recurrence_mod.DEFAULT_TZ}."
+                ),
+            },
+        },
+        "required": ["owner", "job", "start"],
+    },
+}
+
+
 def _handle_calendar_resume_job(args: Dict[str, Any], **kw) -> str:
     owner_raw = args.get("owner")
     owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
@@ -2699,6 +2843,7 @@ _TOOLS = (
     ("calendar_start_timer",  CALENDAR_START_TIMER_SCHEMA,  _handle_calendar_start_timer,  "⏱️"),
     ("calendar_stop_timer",   CALENDAR_STOP_TIMER_SCHEMA,   _handle_calendar_stop_timer,   "⏹️"),
     ("calendar_resume_job",   CALENDAR_RESUME_JOB_SCHEMA,   _handle_calendar_resume_job,   "▶️"),
+    ("calendar_log_job",      CALENDAR_LOG_JOB_SCHEMA,      _handle_calendar_log_job,      "🧾"),
     ("calendar_set_user_email",   CALENDAR_SET_USER_EMAIL_SCHEMA,   _handle_calendar_set_user_email,   "📧"),
     ("calendar_list_user_emails", CALENDAR_LIST_USER_EMAILS_SCHEMA, _handle_calendar_list_user_emails, "📇"),
     ("calendar_create_planning",  CALENDAR_CREATE_PLANNING_SCHEMA,  _handle_calendar_create_planning,  "📋"),
