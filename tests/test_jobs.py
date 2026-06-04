@@ -51,6 +51,7 @@ _registry_data = {
         {"name": "u_log",      "email": "log@example.com",      "language": "en"},
         {"name": "u_seq",      "email": "seq@example.com",      "language": "en"},
         {"name": "u_seq2",     "email": "seq2@example.com",     "language": "en"},
+        {"name": "u_seq3",     "email": "seq3@example.com",     "language": "en"},
         {"name": "u_tag",      "email": "tag@example.com",      "language": "en"},
         {"name": "u_noemail"},  # registered but no email (for the planning gate test)
     ]
@@ -496,21 +497,9 @@ def test_seq_per_owner_numbering():
     assert e3["number"] == e2["number"] + 1
 
     # A completely fresh owner (no prior events) starts at 1.
-    # Use a unique per-test owner to guarantee a clean slate.
-    import uuid as _uuid
-    fresh_owner = "u_fresh_" + _uuid.uuid4().hex[:6]
-    # Register the fresh owner on-the-fly via the registry file.
-    import json as _json
-    with open(_registry_path, "r", encoding="utf-8") as _f:
-        reg = _json.load(_f)
-    reg["users"].append({"name": fresh_owner, "email": fresh_owner + "@example.com"})
-    with open(_registry_path, "w", encoding="utf-8") as _f:
-        _json.dump(reg, _f)
-    # Reload users module so it picks up the new registry entry.
-    cal.users_mod._registry_cache.clear() if hasattr(cal.users_mod, "_registry_cache") else None
-    import importlib
-    importlib.reload(cal.users_mod)
-
+    # Use the pre-registered, otherwise-unused 'u_seq2' owner so we don't mutate
+    # the shared registry file (which would leak into later tests).
+    fresh_owner = "u_seq2"
     e_fresh = res(cal._handle_calendar_add_event({
         "owner": fresh_owner, "title": "first ever", "start": "2026-07-01T10:00:00+03:00",
     }))
@@ -562,6 +551,34 @@ def test_resolve_event_id_variants():
 
     # Unknown uuid returns None.
     assert cal._resolve_event_id("deadbeef" * 4) is None
+
+
+def test_owner_change_reassigns_seq():
+    """Moving an event to a different owner gives it a fresh per-owner seq so
+    #N stays unique within the new owner's namespace (no collision with an
+    existing event the new owner already has)."""
+    # u_seqA already has an event #1; u_seq3 also gets its own #1.
+    a = "u_seq"
+    b = "u_seq3"
+    # Ensure u_seq2 has at least one event so its next seq is > 1.
+    res(cal._handle_calendar_add_event({
+        "owner": b, "title": "b-owns-1", "start": "2026-12-01T09:00:00+03:00",
+    }))
+    b_max = max(
+        r[0] for r in store._get_conn().execute(
+            "SELECT seq FROM events WHERE owner COLLATE NOCASE = ?", (b,)
+        ).fetchall()
+    )
+
+    # Create an event under owner a, then move it to owner b.
+    moved = res(cal._handle_calendar_add_event({
+        "owner": a, "title": "to-be-moved", "start": "2026-12-02T09:00:00+03:00",
+    }))
+    store.update_event(moved["id"], {"owner": b})
+    after = store.get_event(moved["id"])
+    # New seq is the next free number under b, and it resolves cleanly via #N.
+    assert after["seq"] == b_max + 1
+    assert cal._resolve_event_id(f"#{after['seq']}", owner=b) == moved["id"]
 
 
 def test_handler_accepts_number_reference():

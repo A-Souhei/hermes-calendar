@@ -347,6 +347,11 @@ def _resolve_event_id(ref: Any, owner: Optional[str] = None) -> Optional[str]:
         return None
     if s.startswith("#"):
         s = s[1:].strip()
+    # A 32-char hex string is an event id (uuid hex) — resolve it as such even
+    # though it is digit-friendly, so an all-digit id is never mistaken for a
+    # per-owner #number reference.
+    if len(s) == 32 and all(c in "0123456789abcdef" for c in s.lower()):
+        return s if store.get_event(s) else None
     if s.isdigit():
         if not owner:
             return None
@@ -1193,10 +1198,11 @@ def _report_event_id(args: Dict[str, Any]) -> str:
 
 def _handle_calendar_set_report(args: Dict[str, Any], **kw) -> str:
     raw_id = _report_event_id(args)
-    eid = _resolve_event_id(raw_id, owner=args.get("owner")) if raw_id else None
-    if not eid:
+    if not raw_id:
         return tool_error("id (the event id) is required")
-    event_id = eid
+    event_id = _resolve_event_id(raw_id, owner=args.get("owner"))
+    if not event_id:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1229,10 +1235,11 @@ def _handle_calendar_set_report(args: Dict[str, Any], **kw) -> str:
 
 def _handle_calendar_get_report(args: Dict[str, Any], **kw) -> str:
     raw_id = _report_event_id(args)
-    eid = _resolve_event_id(raw_id, owner=args.get("owner")) if raw_id else None
-    if not eid:
+    if not raw_id:
         return tool_error("id (the event id) is required")
-    event_id = eid
+    event_id = _resolve_event_id(raw_id, owner=args.get("owner"))
+    if not event_id:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")
@@ -1250,10 +1257,11 @@ def _handle_calendar_get_report(args: Dict[str, Any], **kw) -> str:
 
 def _handle_calendar_list_reports(args: Dict[str, Any], **kw) -> str:
     raw_id = _report_event_id(args)
-    eid = _resolve_event_id(raw_id, owner=args.get("owner")) if raw_id else None
-    if not eid:
+    if not raw_id:
         return tool_error("id (the event id) is required")
-    event_id = eid
+    event_id = _resolve_event_id(raw_id, owner=args.get("owner"))
+    if not event_id:
+        return tool_error("Event not found — pass its id, or a #number together with the owner.")
     ev = store.get_event(event_id)
     if ev is None:
         return tool_error(f"Event not found: {event_id}")

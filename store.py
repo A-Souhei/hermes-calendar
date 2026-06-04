@@ -295,10 +295,32 @@ def update_event(event_id: str, fields: Dict[str, Any]) -> bool:
             serialized[key] = val
     serialized["updated_utc"] = _now_iso()
 
-    set_clause = ", ".join(f"{k} = ?" for k in serialized)
-    values = list(serialized.values()) + [event_id]
     with _lock:
         conn = _get_conn()
+        # If the owner is changing, assign a fresh per-owner seq so #N stays
+        # unique within the new owner's namespace (the old seq belonged to the
+        # previous owner and could collide under the new one).
+        if "owner" in serialized:
+            cur = conn.execute(
+                "SELECT owner FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            old_owner = cur[0] if cur else None
+            new_owner = serialized["owner"]
+            same = (
+                (old_owner or "").strip().lower() == (new_owner or "").strip().lower()
+            )
+            if not same:
+                if new_owner:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(seq), 0) FROM events WHERE owner COLLATE NOCASE = ?",
+                        (new_owner,),
+                    ).fetchone()
+                    serialized["seq"] = (row[0] if row else 0) + 1
+                else:
+                    serialized["seq"] = None
+
+        set_clause = ", ".join(f"{k} = ?" for k in serialized)
+        values = list(serialized.values()) + [event_id]
         cursor = conn.execute(
             f"UPDATE events SET {set_clause} WHERE id = ?", values
         )
