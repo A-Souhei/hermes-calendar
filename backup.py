@@ -67,13 +67,20 @@ def _retention_days() -> int:
 
 
 def _snapshot(src_path: str, dest_path: str) -> None:
-    """Consistent online backup of ``src_path`` into ``dest_path`` (WAL-safe)."""
-    src = sqlite3.connect(src_path)
+    """Consistent online backup of ``src_path`` into ``dest_path`` (WAL-safe).
+
+    Uses a generous connect ``timeout`` and a per-step ``sleep`` so transient
+    'database is locked' contention from concurrent writers is waited out rather
+    than failing the backup.
+    """
+    src = sqlite3.connect(src_path, timeout=30)
     try:
-        dst = sqlite3.connect(dest_path)
+        dst = sqlite3.connect(dest_path, timeout=30)
         try:
             with dst:
-                src.backup(dst)
+                # pages>0 copies in batches, releasing the lock between steps;
+                # sleep waits out a busy writer instead of erroring immediately.
+                src.backup(dst, pages=200, sleep=0.25)
         finally:
             dst.close()
     finally:
@@ -104,7 +111,15 @@ def _upload(local_path: str, object_name: str) -> str | None:
         endpoint, secure = endpoint[len("http://"):], False
     endpoint = endpoint.rstrip("/")
 
-    from minio import Minio
+    try:
+        from minio import Minio
+    except ImportError:
+        # Configured for upload but the SDK isn't installed — degrade to
+        # local-only (README behaviour) while flagging it so it gets noticed.
+        print("calendar-backup: minio SDK not installed — upload skipped, "
+              "local backup kept (run: pip install minio)")
+        return None
+
     client = Minio(endpoint, access_key=access, secret_key=secret, secure=secure)
     # Best-effort create; ignore if it already exists or we lack create rights
     # (the object PUT below will surface a genuine permission problem).
@@ -150,13 +165,13 @@ def main() -> int:
     final = os.path.join(bdir, f"calendar-{stamp}.db.gz")
 
     tmp_db = None
+    tmp_gz = final + ".part"
     try:
         fd, tmp_db = tempfile.mkstemp(prefix="calbak-", suffix=".db", dir=bdir)
         os.close(fd)
         _snapshot(db, tmp_db)
         # gzip into a .part file, then atomically move into place so a reader
         # never sees a half-written backup.
-        tmp_gz = final + ".part"
         with open(tmp_db, "rb") as f_in, gzip.open(tmp_gz, "wb") as f_out:
             shutil.copyfileobj(f_in, f_out)
         os.replace(tmp_gz, final)
@@ -164,11 +179,14 @@ def main() -> int:
         print(f"calendar-backup FAILED: {exc}")
         return 1
     finally:
-        if tmp_db and os.path.exists(tmp_db):
-            try:
-                os.remove(tmp_db)
-            except OSError:
-                pass
+        # Clean up both temp artifacts; the .part lingers only if we failed
+        # before the atomic os.replace() above.
+        for leftover in (tmp_db, tmp_gz):
+            if leftover and os.path.exists(leftover):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
 
     try:
         _prune(bdir, _retention_days())
