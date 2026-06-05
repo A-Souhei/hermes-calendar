@@ -124,6 +124,35 @@ hermes cron create "0 7 * * *" --name calendar-digest --no-agent \
 **On-demand tool:** `calendar_digest` builds (and optionally emails) the digest
 for a given owner from within the agent conversation.
 
+## Daily backup
+
+`backup.py` takes a consistent snapshot of the calendar DB (SQLite online
+backup API — WAL-safe, unlike a plain `cp`), gzips it to
+`$HERMES_HOME/backups/calendar/calendar-YYYY-MM-DD.db.gz`, and prunes local
+copies older than `CALENDAR_BACKUP_RETENTION_DAYS` (default 14). It is silent on
+success and prints a single line only on failure (so the cron pings you).
+
+**Cron setup** — place `backup.py` in `~/.hermes/scripts/` and run:
+
+```
+hermes cron create "30 3 * * *" --name calendar-backup --no-agent \
+    --script backup.py
+```
+
+**Off-box upload (optional).** When the following env vars are set (read from
+`~/.hermes/.env`), the gzip is also uploaded to a MinIO/S3 bucket — additive,
+the local copy is always kept. Requires `pip install minio`; without the env
+vars (or the SDK) it stays local-only.
+
+```
+CALENDAR_BACKUP_MINIO_ENDPOINT=host:port      # scheme optional; https -> secure
+CALENDAR_BACKUP_MINIO_ACCESS_KEY=...
+CALENDAR_BACKUP_MINIO_SECRET_KEY=...
+CALENDAR_BACKUP_MINIO_BUCKET=hermes
+CALENDAR_BACKUP_MINIO_SECURE=true             # https (true) vs http (false)
+CALENDAR_BACKUP_MINIO_PREFIX=calendar-backups # optional object-key prefix
+```
+
 ## Plannings
 
 A **planning** is a named, period-bounded set of objectives (each objective is a
