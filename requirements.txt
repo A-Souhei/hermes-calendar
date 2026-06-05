@@ -13,5 +13,11 @@ python-dateutil>=2.8        # required: human/ISO datetime parsing (events, list
 #   pip install "weasyprint>=60"
 # weasyprint>=60
 
+# Optional — off-box backups for the daily backup.py cron (uploads the gzip
+# snapshot to a MinIO/S3 bucket). Only needed when the CALENDAR_BACKUP_MINIO_*
+# env vars are set; backup.py degrades to local-only snapshots when absent.
+#   pip install "minio>=7"
+# minio>=7
+
 # Provided by the Hermes dashboard host (do NOT pin here) — listed for reference:
 #   fastapi, pydantic   (dashboard/plugin_api.py; it also stubs FastAPI if absent)
