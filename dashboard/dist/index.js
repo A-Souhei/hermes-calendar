@@ -723,6 +723,42 @@
     );
   }
 
+  // Working-time cards (job events only) for the current day / week / month.
+  // The backend returns the logged (confirmed) seconds as a static base plus a
+  // list of in-progress sessions; we add each running session's live elapsed
+  // (now − started_utc) on top, re-rendering every second so the totals tick
+  // while work is underway. The 1s tick only runs when something is running.
+  function WorktimeCards(props) {
+    const wt = props.worktime;
+    const running = (wt && wt.running) || [];
+    const hasRunning = running.length > 0;
+    const [, setTick] = useState(0);
+    useEffect(function () {
+      if (!hasRunning) return undefined;
+      var iv = setInterval(function () { setTick(function (t) { return t + 1; }); }, 1000);
+      return function () { clearInterval(iv); };
+    }, [hasRunning]);
+
+    function value(key) {
+      if (!wt) return "—";
+      var secs = wt[key] || 0;
+      running.forEach(function (r) {
+        if (r[key] && r.started_utc) {
+          secs += Math.max(0, Math.floor((Date.now() - new Date(r.started_utc).getTime()) / 1000));
+        }
+      });
+      return secs ? fmtDuration(secs) : "0h";
+    }
+
+    return h(
+      "div",
+      { className: "cal-statrow" },
+      h(StatCard, { label: "Worked today", value: value("day") }),
+      h(StatCard, { label: "Worked this week", value: value("week") }),
+      h(StatCard, { label: "Worked this month", value: value("month") })
+    );
+  }
+
   // Live "running now" banner: names the currently-running session(s) with a
   // ticking elapsed clock. Owns its own 1s tick so only this re-renders.
   function RunningBanner(props) {
@@ -980,14 +1016,8 @@
       // currently-running session(s)
       h(RunningBanner, { timers: timers, onOpen: function (id, occ) { setOpenModal({ id: id, occ: occ || null }); } }),
 
-      // working time (job events only) for the current day / week / month
-      h(
-        "div",
-        { className: "cal-statrow" },
-        h(StatCard, { label: "Worked today", value: worktime ? (worktime.day ? fmtDuration(worktime.day) : "0h") : "—" }),
-        h(StatCard, { label: "Worked this week", value: worktime ? (worktime.week ? fmtDuration(worktime.week) : "0h") : "—" }),
-        h(StatCard, { label: "Worked this month", value: worktime ? (worktime.month ? fmtDuration(worktime.month) : "0h") : "—" })
-      ),
+      // working time (job events only) — ticks live while a session runs
+      h(WorktimeCards, { worktime: worktime }),
 
       // at-a-glance stat cards
       h(

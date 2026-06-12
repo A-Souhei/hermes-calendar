@@ -639,14 +639,17 @@ def _worktime_logged(
     return total
 
 
-def _worktime_running(
-    start_utc: datetime, now_utc: datetime, owner: Optional[str], category: Optional[str]
-) -> int:
-    """Live elapsed of currently-running job sessions whose start falls in the
-    window — so an in-progress session counts immediately (it has no logged
-    duration yet). Same started-in-window rule as the logged total."""
+def _running_sessions(
+    boundaries: Dict[str, datetime], owner: Optional[str], category: Optional[str]
+) -> List[Dict[str, Any]]:
+    """Currently-running job sessions, each with its ``started_utc`` and which
+    periods it falls into (day/week/month, by the same started-in-window rule as
+    the logged total). No duration is summed here — the frontend extrapolates
+    each session's live elapsed from ``started_utc`` so the cards tick every
+    second between polls (a stopped session moves into the logged base instead).
+    """
     cat = (category or "").strip().lower() or None
-    total = 0
+    out: List[Dict[str, Any]] = []
     try:
         actives = store.list_active(owner=owner or None)
     except Exception:
@@ -662,8 +665,6 @@ def _worktime_running(
             started_dt = started_dt.astimezone(timezone.utc)
         except Exception:
             continue
-        if started_dt < start_utc:
-            continue
         try:
             ev = store.get_event(row["event_id"])
         except Exception:
@@ -672,8 +673,13 @@ def _worktime_running(
             continue
         if cat is not None and (ev.get("category") or "").strip().lower() != cat:
             continue
-        total += max(0, round((now_utc - started_dt).total_seconds()))
-    return total
+        out.append({
+            "started_utc": started_dt.isoformat(),
+            "day": started_dt >= boundaries["day"],
+            "week": started_dt >= boundaries["week"],
+            "month": started_dt >= boundaries["month"],
+        })
+    return out
 
 
 @router.get("/worktime")
@@ -686,8 +692,10 @@ def worktime(
 
     Periods are delimited in the caller's timezone (``tz``, IANA name; defaults
     to the plugin's DEFAULT_TZ); weeks are Monday-first to match the calendar
-    grid. Each total sums confirmed sessions that started within the period plus
-    the live elapsed of any session still running. Returns seconds per period.
+    grid. ``day``/``week``/``month`` are the logged (confirmed) seconds that
+    started within each period — a static base. ``running`` lists the in-progress
+    sessions (start + period membership) the client adds live so the cards tick
+    each second between polls.
     """
     tz_name = tz or recurrence.DEFAULT_TZ
     try:
@@ -711,14 +719,25 @@ def worktime(
     end_iso = (now_utc + timedelta(minutes=1)).isoformat()
 
     cat = category or None
-    out: Dict[str, int] = {}
-    for key, start_local in (("day", day_start), ("week", week_start), ("month", month_start)):
-        start_utc = start_local.astimezone(timezone.utc)
-        secs = _worktime_logged(start_utc.isoformat(), end_iso, owner or None, cat)
-        secs += _worktime_running(start_utc, now_utc, owner or None, cat)
-        out[key] = secs
+    boundaries = {
+        "day": day_start.astimezone(timezone.utc),
+        "week": week_start.astimezone(timezone.utc),
+        "month": month_start.astimezone(timezone.utc),
+    }
+    # Logged totals are the static base; running sessions are returned separately
+    # so the client can tick their live elapsed each second between polls.
+    logged: Dict[str, int] = {}
+    for key, start_utc in boundaries.items():
+        logged[key] = _worktime_logged(start_utc.isoformat(), end_iso, owner or None, cat)
+    running = _running_sessions(boundaries, owner or None, cat)
 
-    return {"tz": tz_name, "day": out["day"], "week": out["week"], "month": out["month"]}
+    return {
+        "tz": tz_name,
+        "day": logged["day"],
+        "week": logged["week"],
+        "month": logged["month"],
+        "running": running,
+    }
 
 
 @router.get("/plannings")
