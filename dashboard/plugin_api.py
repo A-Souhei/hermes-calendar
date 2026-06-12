@@ -25,7 +25,7 @@ import importlib.util
 import os
 import sys
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -609,6 +609,116 @@ def list_timers(owner: Optional[str] = Query(None)):
             "elapsed_seconds": elapsed,
         })
     return {"timers": rows}
+
+
+def _dedupe_owners(owners: List[str]) -> List[str]:
+    """Distinct owners, case-insensitive, keeping one representative casing —
+    so two registry spellings of the same name aren't double-counted."""
+    seen: Dict[str, str] = {}
+    for o in owners or []:
+        name = (o or "").strip()
+        key = name.lower()
+        if key and key not in seen:
+            seen[key] = name
+    return list(seen.values())
+
+
+def _worktime_logged(
+    start_iso: str, end_iso: str, owner: Optional[str], category: Optional[str]
+) -> int:
+    """Confirmed timer-session seconds (job events only) that STARTED in
+    [start_iso, end_iso) — the same started-in-window semantics the job summary
+    uses. owner=None aggregates across every owner."""
+    owners = [owner] if owner else _dedupe_owners(store.list_owners())
+    total = 0
+    for o in owners:
+        try:
+            total += store.summarize_jobs(o, start_iso, end_iso, category=category)["total_seconds"]
+        except Exception:
+            pass
+    return total
+
+
+def _worktime_running(
+    start_utc: datetime, now_utc: datetime, owner: Optional[str], category: Optional[str]
+) -> int:
+    """Live elapsed of currently-running job sessions whose start falls in the
+    window — so an in-progress session counts immediately (it has no logged
+    duration yet). Same started-in-window rule as the logged total."""
+    cat = (category or "").strip().lower() or None
+    total = 0
+    try:
+        actives = store.list_active(owner=owner or None)
+    except Exception:
+        actives = []
+    for row in actives:
+        started_iso = row.get("started_utc")
+        if not started_iso:
+            continue
+        try:
+            started_dt = datetime.fromisoformat(started_iso)
+            if started_dt.tzinfo is None:
+                started_dt = started_dt.replace(tzinfo=timezone.utc)
+            started_dt = started_dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+        if started_dt < start_utc:
+            continue
+        try:
+            ev = store.get_event(row["event_id"])
+        except Exception:
+            ev = None
+        if not ev or not (ev.get("job") or "").strip():
+            continue
+        if cat is not None and (ev.get("category") or "").strip().lower() != cat:
+            continue
+        total += max(0, round((now_utc - started_dt).total_seconds()))
+    return total
+
+
+@router.get("/worktime")
+def worktime(
+    owner: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    tz: Optional[str] = Query(None),
+):
+    """Total working time (job events only) for the current day, week and month.
+
+    Periods are delimited in the caller's timezone (``tz``, IANA name; defaults
+    to the plugin's DEFAULT_TZ); weeks are Monday-first to match the calendar
+    grid. Each total sums confirmed sessions that started within the period plus
+    the live elapsed of any session still running. Returns seconds per period.
+    """
+    tz_name = tz or recurrence.DEFAULT_TZ
+    try:
+        zone = ZoneInfo(tz_name)
+    except Exception:
+        zone = ZoneInfo(recurrence.DEFAULT_TZ)
+        tz_name = recurrence.DEFAULT_TZ
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.astimezone(zone).date()
+    # Build each boundary as a fresh local midnight via datetime.combine so the
+    # correct (post-transition) UTC offset is picked per date — naive .replace()/
+    # timedelta on an aware datetime would carry the wrong offset across a DST
+    # change. Day arithmetic on date objects is pure calendar math (no DST).
+    def _local_midnight(d):
+        return datetime.combine(d, time(0, 0), tzinfo=zone)
+    day_start = _local_midnight(today)
+    week_start = _local_midnight(today - timedelta(days=today.weekday()))  # Monday-first
+    month_start = _local_midnight(today.replace(day=1))
+    # Upper bound just past now — sessions never start in the future, so this
+    # captures everything up to the present moment for every period.
+    end_iso = (now_utc + timedelta(minutes=1)).isoformat()
+
+    cat = category or None
+    out: Dict[str, int] = {}
+    for key, start_local in (("day", day_start), ("week", week_start), ("month", month_start)):
+        start_utc = start_local.astimezone(timezone.utc)
+        secs = _worktime_logged(start_utc.isoformat(), end_iso, owner or None, cat)
+        secs += _worktime_running(start_utc, now_utc, owner or None, cat)
+        out[key] = secs
+
+    return {"tz": tz_name, "day": out["day"], "week": out["week"], "month": out["month"]}
 
 
 @router.get("/plannings")
