@@ -168,6 +168,32 @@
     return timers;
   }
 
+  // Total working time (job events only) for the current day / week / month,
+  // delimited in the browser's local timezone. Polled every 30s so a running
+  // session's live elapsed creeps up without a manual refresh; also reloadable
+  // on demand (refresh button, session stop).
+  function useWorktime(owner, category) {
+    const [worktime, setWorktime] = useState(null);
+    const load = useCallback(function () {
+      var tz = null;
+      try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) { tz = null; }
+      var qs = [];
+      if (owner) qs.push("owner=" + encodeURIComponent(owner));
+      if (category) qs.push("category=" + encodeURIComponent(category));
+      if (tz) qs.push("tz=" + encodeURIComponent(tz));
+      var url = API + "/worktime" + (qs.length ? "?" + qs.join("&") : "");
+      SDK.fetchJSON(url)
+        .then(function (d) { setWorktime(d || null); })
+        .catch(function () { setWorktime(null); });
+    }, [owner, category]);
+    useEffect(function () {
+      load();
+      var iv = setInterval(load, 30000);
+      return function () { clearInterval(iv); };
+    }, [load]);
+    return { worktime: worktime, reload: load };
+  }
+
   function useEvents(anchor, owner, category) {
     const [events, setEvents] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -861,6 +887,11 @@
     const [selectedDay, setSelectedDay] = useState(function () { return new Date(); });
     const [openModal, setOpenModal] = useState(null); // {id, occ}
     const { events, loading, error, reload } = useEvents(anchor, owner, category);
+    const { worktime, reload: reloadWorktime } = useWorktime(owner, category);
+
+    // Refresh both the grid and the working-time totals together (the totals
+    // change when a session is stopped, not just on a month change).
+    const reloadAll = useCallback(function () { reload(); reloadWorktime(); }, [reload, reloadWorktime]);
 
     const byDate = useMemo(function () {
       const m = {};
@@ -942,12 +973,21 @@
           h(Button, { variant: "outline", size: "sm", onClick: function () { goMonth(-1); } }, "◀"),
           h(Button, { variant: "outline", size: "sm", onClick: goToday }, "Today"),
           h(Button, { variant: "outline", size: "sm", onClick: function () { goMonth(1); } }, "▶"),
-          h(Button, { variant: "ghost", size: "sm", onClick: reload, title: "Refresh" }, "⟳")
+          h(Button, { variant: "ghost", size: "sm", onClick: reloadAll, title: "Refresh" }, "⟳")
         )
       ),
 
       // currently-running session(s)
       h(RunningBanner, { timers: timers, onOpen: function (id, occ) { setOpenModal({ id: id, occ: occ || null }); } }),
+
+      // working time (job events only) for the current day / week / month
+      h(
+        "div",
+        { className: "cal-statrow" },
+        h(StatCard, { label: "Worked today", value: worktime ? (worktime.day ? fmtDuration(worktime.day) : "0h") : "—" }),
+        h(StatCard, { label: "Worked this week", value: worktime ? (worktime.week ? fmtDuration(worktime.week) : "0h") : "—" }),
+        h(StatCard, { label: "Worked this month", value: worktime ? (worktime.month ? fmtDuration(worktime.month) : "0h") : "—" })
+      ),
 
       // at-a-glance stat cards
       h(
@@ -999,7 +1039,7 @@
         eventId: openModal.id,
         occurrence: openModal.occ,
         onClose: function () { setOpenModal(null); },
-        onResumed: reload,
+        onResumed: reloadAll,
       }) : null
     );
   }
