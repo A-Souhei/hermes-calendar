@@ -97,7 +97,7 @@ def build_owner_digest(
 
             status_row = store.get_status(ev["id"], occ_iso)
             stored_status = status_row["status"] if status_row else "floating"
-            effective = _effective_status(stored_status, occ_utc, now)
+            effective = _effective_status(stored_status, occ_utc, now, is_job=bool(ev.get("job")))
 
             today_items.append({
                 "occurrence_utc": occ_iso,
@@ -154,14 +154,18 @@ def build_owner_digest(
     }
 
 
-def _effective_status(stored: str, occ: datetime, now: datetime) -> str:
+def _effective_status(stored: str, occ: datetime, now: datetime, is_job: bool = False) -> str:
     """Mirror of dashboard/plugin_api._effective_status.
 
     A floating past occurrence reads as 'missed' (unconfirmed); a floating
     future one stays 'floating'. Non-floating statuses pass through unchanged.
+    A job/timer session is never 'missed' — it is tracked (confirmed/active) or
+    simply untracked, so a floating job stays 'floating'.
     """
     if stored != "floating":
         return stored
+    if is_job:
+        return "floating"
     return "missed" if occ < now else "floating"
 
 

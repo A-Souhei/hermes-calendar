@@ -33,7 +33,11 @@
   // Effective display status (backend-derived): a past, still-floating
   // occurrence reads as "missed" while staying floating underneath.
   function effStatus(ev) {
-    return ev.effective_status || ev.status || "floating";
+    var s = ev.effective_status || ev.status || "floating";
+    // A job/timer session is never "missed" — it's tracked (confirmed/active)
+    // or simply untracked. Guard here too in case the backend ever sends one.
+    if (ev.job && s === "missed") return "floating";
+    return s;
   }
   // True when "missed" is only inferred from the past date, not explicitly set.
   function isDerivedMiss(ev) {
@@ -897,10 +901,10 @@
                   h(
                     "span",
                     { className: "agenda-sub" },
-                    // Notes have no status; job events are inherently confirmed
-                    // (timer sessions) so don't show a 'confirmed' badge for them
-                    // — a live 'running' session still shows.
-                    (ev.kind === "note" || (ev.job && effStatus(ev) === "confirmed")) ? null : statusBadge(ev),
+                    // Notes have no status. A job/timer session is tracked, not
+                    // scheduled, so it only ever shows a 'running' badge — never
+                    // confirmed/upcoming/missed (a floating job is just untracked).
+                    (ev.kind === "note" || (ev.job && effStatus(ev) !== "active")) ? null : statusBadge(ev),
                     ev.category ? h("span", { className: "agenda-cat" }, ev.category) : null,
                     ev.job ? h("span", { className: "agenda-job" }, "▸ " + ev.job) : null,
                     ev.location ? h("span", { className: "agenda-loc" }, "📍 " + ev.location) : null
