@@ -249,6 +249,11 @@ missing file or parse error returns an empty registry (all owners refused).
 
 ## Realtime jobs & time tracking
 
+A job/timer session is **never "missed"** — it's tracked work, not a scheduled
+event, so it shows as confirmed/running or simply untracked (a past job with no
+session reads as floating, not missed). `calendar_set_status` rejects setting
+`missed` on a job, and the dashboard/digest never infer it for one.
+
 ### One timer per user
 
 Only one timer can run at a time per user. Starting a new timer with

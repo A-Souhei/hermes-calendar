@@ -191,12 +191,16 @@ def _parse_range(frm: Optional[str], to: Optional[str]):
     return start, end
 
 
-def _effective_status(stored: str, occ: datetime, now: datetime) -> str:
+def _effective_status(stored: str, occ: datetime, now: datetime, is_job: bool = False) -> str:
     """Display status: a still-floating occurrence whose time has passed reads
     as 'missed' (unconfirmed), while the STORED status stays 'floating' so it
-    can still be confirmed later. Non-floating stored statuses pass through."""
+    can still be confirmed later. Non-floating stored statuses pass through.
+    A job/timer session is never 'missed' — tracked (confirmed/active) or simply
+    untracked — so a floating job stays 'floating'."""
     if stored != "floating":
         return stored
+    if is_job:
+        return "floating"
     return "missed" if occ < now else "floating"
 
 
@@ -277,7 +281,8 @@ def _occurrences_in_range(
                 "has_report": occ_iso in report_keys,
                 "status": "floating" if is_note else (status_row["status"] if status_row else "floating"),
                 "effective_status": "floating" if is_note else _effective_status(
-                    status_row["status"] if status_row else "floating", occ, now
+                    status_row["status"] if status_row else "floating", occ, now,
+                    is_job=bool(ev.get("job"))
                 ),
                 "duration_seconds": occ_dur,
             })

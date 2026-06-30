@@ -1611,6 +1611,13 @@ def _handle_calendar_set_status(args: Dict[str, Any], **kw) -> str:
     if status not in _STATUS_ENUM:
         return tool_error(f"status must be one of: {_STATUS_ENUM}")
 
+    if status == "missed" and (ev.get("job") or "").strip():
+        return tool_error(
+            "A job/timer session can't be 'missed' — it's tracked work, not a scheduled "
+            "event. Use calendar_stop_timer / calendar_edit_session to set its time, or "
+            "mark it 'confirmed'."
+        )
+
     note = args.get("note")
 
     if status == "floating":
