@@ -15,7 +15,9 @@ Alerts: fired via Home Assistant (ha_notify or ha_speak channel) on a
 from __future__ import annotations
 
 import logging
+import os
 import re
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -3530,6 +3532,148 @@ CALENDAR_TAG_SCHEMA = {
 }
 
 
+# Default download bucket for calendar_share_file. The junkyard is a
+# download-only (anonymous GetObject, no listing) MinIO bucket. The upload
+# endpoint (CALENDAR_BACKUP_MINIO_ENDPOINT, often plain http) differs from the
+# public download base (HTTPS, e.g. fronted by a reverse proxy), so the base is
+# configured separately via CALENDAR_JUNKYARD_PUBLIC_BASE (no default — set it).
+_JUNKYARD_DEFAULT_BUCKET = "junkyard"
+
+
+def _minio_endpoint_secure() -> tuple[Optional[str], bool]:
+    """Resolve (host:port, secure) from CALENDAR_BACKUP_MINIO_* env, mirroring
+    backup.py: a scheme on the endpoint wins over the SECURE flag."""
+    endpoint = (os.environ.get("CALENDAR_BACKUP_MINIO_ENDPOINT") or "").strip()
+    if not endpoint:
+        return None, False
+    secure = (os.environ.get("CALENDAR_BACKUP_MINIO_SECURE", "false")
+              .strip().lower() in ("1", "true", "yes", "on"))
+    if endpoint.startswith("https://"):
+        endpoint, secure = endpoint[len("https://"):], True
+    elif endpoint.startswith("http://"):
+        endpoint, secure = endpoint[len("http://"):], False
+    return endpoint.rstrip("/"), secure
+
+
+def _handle_calendar_share_file(args: Dict[str, Any], **kw) -> str:
+    """Publish text/a local file to the junkyard bucket; return a download URL."""
+    filename = str(args.get("filename") or "").strip().strip("/")
+    content = args.get("content")
+    path = (str(args.get("path") or "").strip() or None)
+    if content is None and not path:
+        return tool_error("provide 'content' (text to publish) or 'path' (a local file to upload)")
+    if path and not filename:
+        filename = os.path.basename(path)
+    if not filename:
+        return tool_error("filename is required (the download name, e.g. 'month-backup-2026-06-toavina.txt')")
+
+    endpoint, secure = _minio_endpoint_secure()
+    # Prefer a dedicated write-only junkyard key (least privilege — it can only
+    # PutObject into the junkyard); fall back to the calendar-backup creds.
+    access = (os.environ.get("CALENDAR_JUNKYARD_ACCESS_KEY")
+              or os.environ.get("CALENDAR_BACKUP_MINIO_ACCESS_KEY"))
+    secret = (os.environ.get("CALENDAR_JUNKYARD_SECRET_KEY")
+              or os.environ.get("CALENDAR_BACKUP_MINIO_SECRET_KEY"))
+    if not (endpoint and access and secret):
+        return tool_error(
+            "junkyard upload not configured — set CALENDAR_BACKUP_MINIO_ENDPOINT plus a "
+            "write key (CALENDAR_JUNKYARD_ACCESS_KEY/SECRET_KEY, or the "
+            "CALENDAR_BACKUP_MINIO_ACCESS_KEY/SECRET_KEY fallback) in ~/.hermes/.env"
+        )
+
+    bucket = (os.environ.get("CALENDAR_JUNKYARD_BUCKET") or _JUNKYARD_DEFAULT_BUCKET).strip()
+    prefix = (os.environ.get("CALENDAR_JUNKYARD_PREFIX") or "").strip().strip("/")
+    # Unguessable token segment makes this a capability URL: the bucket serves
+    # anonymous GetObject, so possession of the link is the only access grant.
+    # Without it, predictable keys (e.g. month-backup-<month>-<user>.txt) would
+    # be fetchable by anyone who can guess them. The human-readable filename is
+    # kept as the last segment so the download still has a sensible name.
+    token = secrets.token_urlsafe(12)
+    object_name = "/".join(p for p in (prefix, token, filename) if p)
+
+    if path and not os.path.isfile(path):
+        return tool_error(f"path not found: {path}")
+
+    try:
+        from minio import Minio
+    except ImportError:
+        return tool_error("minio SDK not installed on the agent host (run: pip install minio)")
+
+    import io
+    import mimetypes
+    from urllib.parse import quote
+
+    ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    if ctype.startswith("text/") and "charset" not in ctype:
+        ctype = f"{ctype}; charset=utf-8"
+
+    client = Minio(endpoint, access_key=access, secret_key=secret, secure=secure)
+    try:
+        if path:
+            size = os.path.getsize(path)
+            client.fput_object(bucket, object_name, path, content_type=ctype)
+        else:
+            data = content if isinstance(content, bytes) else str(content).encode("utf-8")
+            size = len(data)
+            client.put_object(bucket, object_name, io.BytesIO(data), length=size, content_type=ctype)
+    except Exception as exc:  # noqa: BLE001
+        return tool_error(f"junkyard upload failed: {exc}")
+
+    public_base = (os.environ.get("CALENDAR_JUNKYARD_PUBLIC_BASE") or "").strip().rstrip("/")
+    if not public_base:
+        return tool_error(
+            "object uploaded but no download URL — set CALENDAR_JUNKYARD_PUBLIC_BASE "
+            "(the public HTTPS base for the bucket) in ~/.hermes/.env"
+        )
+    # Rendered verbatim as a clickable download link, so it needs a scheme;
+    # default a bare "host:port" to https so it stays a valid URL.
+    if not public_base.startswith(("http://", "https://")):
+        public_base = f"https://{public_base}"
+    url = f"{public_base}/{quote(bucket)}/{quote(object_name)}"
+    return tool_result({
+        "published": True,
+        "url": url,
+        "bucket": bucket,
+        "object": object_name,
+        "bytes": size,
+        "note": "passwordless download link, reachable only inside the tailnet",
+    })
+
+
+CALENDAR_SHARE_FILE_SCHEMA = {
+    "name": "calendar_share_file",
+    "description": (
+        "Publish inline text or an existing local file to the MinIO 'junkyard' bucket and return a "
+        "passwordless download URL. Use this INSTEAD of write_file whenever the user should receive "
+        "a file as a LINK rather than a chat attachment — e.g. a month backup, an export, or a "
+        "report. The link needs no login but is reachable only inside the tailnet; the bucket is "
+        "download-only (not browsable). Provide either 'content' (inline text) or 'path' (an "
+        "existing file), plus a 'filename' for the download. Returns {url, bucket, object, bytes}."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "filename": {
+                "type": "string",
+                "description": (
+                    "Download filename / object key, e.g. 'month-backup-2026-06-toavina.txt'. "
+                    "Required unless 'path' is given (then defaults to the file's basename)."
+                ),
+            },
+            "content": {
+                "type": "string",
+                "description": "Inline text to publish. Provide this OR 'path'.",
+            },
+            "path": {
+                "type": "string",
+                "description": "Path to an existing local file to upload instead of inline content. Provide this OR 'content'.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
@@ -3563,6 +3707,7 @@ _TOOLS = (
     ("calendar_tag",              CALENDAR_TAG_SCHEMA,              _handle_calendar_tag,              "🏷️"),
     ("calendar_convert_to_job",     CALENDAR_CONVERT_TO_JOB_SCHEMA,     _handle_calendar_convert_to_job,     "🛠️"),
     ("calendar_convert_to_regular", CALENDAR_CONVERT_TO_REGULAR_SCHEMA, _handle_calendar_convert_to_regular, "📅"),
+    ("calendar_share_file",         CALENDAR_SHARE_FILE_SCHEMA,         _handle_calendar_share_file,         "🔗"),
 )
 
 

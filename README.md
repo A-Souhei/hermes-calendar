@@ -60,6 +60,7 @@ Every event gets a short per-owner sequential number (`#1`, `#2`, …). You can 
 |---|---|
 | `calendar_set_user_email` / `calendar_list_user_emails` | Associate a person with an email (for email-channel reminders/reports) / list associations. |
 | `calendar_digest` | Build (and optionally email) a per-owner daily digest. |
+| `calendar_share_file` | Publish text or a local file to the download-only "junkyard" bucket and return a passwordless URL — use instead of `write_file` to deliver a file as a link. See [Sharing files as a download link](#sharing-files-as-a-download-link-calendar_share_file). |
 
 Reports are stored per `(event, occurrence)`, so each instance of a recurring event (e.g. every weekly standup) keeps its own minutes/transcription, and one-off meetings get a report too.
 
@@ -152,6 +153,39 @@ CALENDAR_BACKUP_MINIO_BUCKET=hermes
 CALENDAR_BACKUP_MINIO_SECURE=true             # https (true) vs http (false)
 CALENDAR_BACKUP_MINIO_PREFIX=calendar-backups # optional object-key prefix
 ```
+
+## Sharing files as a download link (`calendar_share_file`)
+
+`calendar_share_file` publishes inline text or an existing local file to a
+download-only MinIO bucket (the "junkyard") and returns a passwordless URL — use
+it INSTEAD of `write_file` when the user should receive a file as a *link*
+(month backups, exports, reports) rather than a chat attachment. The bucket is
+anonymous-GetObject only (not browsable) and reachable only inside the tailnet,
+so the link needs no login but isn't world-readable. Uploads still use the
+MinIO key; only download is anonymous.
+
+Reuses the `CALENDAR_BACKUP_MINIO_ENDPOINT`/`SECURE` connection settings above
+(needs `pip install minio`), plus:
+
+```
+CALENDAR_JUNKYARD_BUCKET=junkyard                  # download-only bucket
+CALENDAR_JUNKYARD_PUBLIC_BASE=https://<minio-host> # public base for download links (required; bare host:port defaults to https)
+CALENDAR_JUNKYARD_PREFIX=                           # optional object-key prefix
+CALENDAR_JUNKYARD_ACCESS_KEY=...                    # optional: dedicated write-only key (recommended)
+CALENDAR_JUNKYARD_SECRET_KEY=...                    #   falls back to CALENDAR_BACKUP_MINIO_* if unset
+```
+
+Prefer a dedicated key scoped to `s3:PutObject` on `junkyard/*` only — least
+privilege, since it can only drop files into the (already download-public)
+bucket, not read or delete other backups. If `CALENDAR_JUNKYARD_ACCESS_KEY`/
+`SECRET_KEY` are unset, the calendar-backup creds are used as a fallback.
+
+The public base is configured separately because the upload endpoint (often
+plain http) differs from the public HTTPS download URL (e.g. fronted by a
+reverse proxy). The download URL is `<public-base>/<bucket>/<token>/<filename>`,
+where `<token>` is a random per-upload segment — since the bucket serves
+anonymous GetObject, this makes the link a capability URL (only someone handed
+the link can fetch it; predictable filenames can't be guessed).
 
 ## Plannings
 
