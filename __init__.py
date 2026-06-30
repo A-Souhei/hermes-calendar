@@ -3555,17 +3555,27 @@ def _minio_endpoint_secure() -> tuple[Optional[str], bool]:
     return endpoint.rstrip("/"), secure
 
 
-def _handle_calendar_share_file(args: Dict[str, Any], **kw) -> str:
-    """Publish text/a local file to the junkyard bucket; return a download URL."""
-    filename = str(args.get("filename") or "").strip().strip("/")
-    content = args.get("content")
-    path = (str(args.get("path") or "").strip() or None)
+class _JunkyardError(Exception):
+    """Raised on a junkyard publish problem; the message is user-facing."""
+
+
+def _junkyard_publish(*, filename: str, content: Any = None,
+                      path: Optional[str] = None) -> Dict[str, Any]:
+    """Upload text (``content``) or an existing ``path`` to the download-only
+    junkyard bucket and return ``{url, bucket, object, bytes}``.
+
+    Raises :class:`_JunkyardError` (user-facing message) on any configuration or
+    upload problem. Shared by ``calendar_share_file`` and ``calendar_backup_events``.
+    """
+    filename = (filename or "").strip().strip("/")
     if content is None and not path:
-        return tool_error("provide 'content' (text to publish) or 'path' (a local file to upload)")
+        raise _JunkyardError("nothing to publish — provide content or a file path")
     if path and not filename:
         filename = os.path.basename(path)
     if not filename:
-        return tool_error("filename is required (the download name, e.g. 'month-backup-2026-06-toavina.txt')")
+        raise _JunkyardError("filename is required (the download name)")
+    if path and not os.path.isfile(path):
+        raise _JunkyardError(f"path not found: {path}")
 
     endpoint, secure = _minio_endpoint_secure()
     # Prefer a dedicated write-only junkyard key (least privilege — it can only
@@ -3575,33 +3585,38 @@ def _handle_calendar_share_file(args: Dict[str, Any], **kw) -> str:
     secret = (os.environ.get("CALENDAR_JUNKYARD_SECRET_KEY")
               or os.environ.get("CALENDAR_BACKUP_MINIO_SECRET_KEY"))
     if not (endpoint and access and secret):
-        return tool_error(
+        raise _JunkyardError(
             "junkyard upload not configured — set CALENDAR_BACKUP_MINIO_ENDPOINT plus a "
             "write key (CALENDAR_JUNKYARD_ACCESS_KEY/SECRET_KEY, or the "
-            "CALENDAR_BACKUP_MINIO_ACCESS_KEY/SECRET_KEY fallback) in ~/.hermes/.env"
-        )
+            "CALENDAR_BACKUP_MINIO_ACCESS_KEY/SECRET_KEY fallback) in ~/.hermes/.env")
+
+    public_base = (os.environ.get("CALENDAR_JUNKYARD_PUBLIC_BASE") or "").strip().rstrip("/")
+    if not public_base:
+        raise _JunkyardError(
+            "no download URL base — set CALENDAR_JUNKYARD_PUBLIC_BASE in ~/.hermes/.env")
+    # Rendered verbatim as a clickable link, so it needs a scheme; default a bare
+    # "host:port" to https so it stays a valid URL.
+    if not public_base.startswith(("http://", "https://")):
+        public_base = f"https://{public_base}"
+
+    try:
+        from minio import Minio
+    except ImportError:
+        raise _JunkyardError("minio SDK not installed on the agent host (run: pip install minio)")
+
+    import io
+    import mimetypes
+    from urllib.parse import quote
 
     bucket = (os.environ.get("CALENDAR_JUNKYARD_BUCKET") or _JUNKYARD_DEFAULT_BUCKET).strip()
     prefix = (os.environ.get("CALENDAR_JUNKYARD_PREFIX") or "").strip().strip("/")
     # Unguessable token segment makes this a capability URL: the bucket serves
     # anonymous GetObject, so possession of the link is the only access grant.
-    # Without it, predictable keys (e.g. month-backup-<month>-<user>.txt) would
+    # Without it, predictable keys (e.g. events-backup-<month>-<user>.txt) would
     # be fetchable by anyone who can guess them. The human-readable filename is
     # kept as the last segment so the download still has a sensible name.
     token = secrets.token_urlsafe(12)
     object_name = "/".join(p for p in (prefix, token, filename) if p)
-
-    if path and not os.path.isfile(path):
-        return tool_error(f"path not found: {path}")
-
-    try:
-        from minio import Minio
-    except ImportError:
-        return tool_error("minio SDK not installed on the agent host (run: pip install minio)")
-
-    import io
-    import mimetypes
-    from urllib.parse import quote
 
     ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     if ctype.startswith("text/") and "charset" not in ctype:
@@ -3617,26 +3632,293 @@ def _handle_calendar_share_file(args: Dict[str, Any], **kw) -> str:
             size = len(data)
             client.put_object(bucket, object_name, io.BytesIO(data), length=size, content_type=ctype)
     except Exception as exc:  # noqa: BLE001
-        return tool_error(f"junkyard upload failed: {exc}")
+        raise _JunkyardError(f"junkyard upload failed: {exc}")
 
-    public_base = (os.environ.get("CALENDAR_JUNKYARD_PUBLIC_BASE") or "").strip().rstrip("/")
-    if not public_base:
-        return tool_error(
-            "object uploaded but no download URL — set CALENDAR_JUNKYARD_PUBLIC_BASE "
-            "(the public HTTPS base for the bucket) in ~/.hermes/.env"
-        )
-    # Rendered verbatim as a clickable download link, so it needs a scheme;
-    # default a bare "host:port" to https so it stays a valid URL.
-    if not public_base.startswith(("http://", "https://")):
-        public_base = f"https://{public_base}"
-    url = f"{public_base}/{quote(bucket)}/{quote(object_name)}"
-    return tool_result({
-        "published": True,
-        "url": url,
+    return {
+        "url": f"{public_base}/{quote(bucket)}/{quote(object_name)}",
         "bucket": bucket,
         "object": object_name,
         "bytes": size,
+    }
+
+
+def _handle_calendar_share_file(args: Dict[str, Any], **kw) -> str:
+    """Publish text/a local file to the junkyard bucket; return a download URL."""
+    content = args.get("content")
+    path = (str(args.get("path") or "").strip() or None)
+    if content is None and not path:
+        return tool_error("provide 'content' (text to publish) or 'path' (a local file to upload)")
+    try:
+        result = _junkyard_publish(
+            filename=str(args.get("filename") or "").strip().strip("/"),
+            content=content, path=path)
+    except _JunkyardError as exc:
+        return tool_error(str(exc))
+    return tool_result({
+        "published": True, **result,
         "note": "passwordless download link, reachable only inside the tailnet",
+    })
+
+
+def _parse_utc(raw: Any) -> Optional[datetime]:
+    """Parse a stored ``start_utc``-style timestamp into an aware UTC datetime."""
+    if not raw:
+        return None
+    s = str(raw)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_events_backup(owner: str, tz_name: str, range_start: datetime,
+                          range_end: datetime, start_iso: str, end_iso: str,
+                          period_desc: str) -> str:
+    """Render a plain-text backup of an owner's events, jobs, and notes for the
+    [range_start, range_end) window."""
+    from zoneinfo import ZoneInfo
+    try:
+        default_tz = ZoneInfo(tz_name)
+    except Exception:
+        default_tz = timezone.utc
+
+    out: List[str] = [
+        f"Calendar backup — {period_desc}",
+        f"Owner: {owner}",
+        f"Window: {start_iso} … {end_iso}",
+        f"Generated (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+        "",
+    ]
+
+    # --- Events (regular, recurrence-expanded over the window) ---
+    try:
+        events = store.list_events(owner=owner, kind="event")
+    except Exception as e:  # noqa: BLE001
+        events, _ = [], out.append(f"[events unavailable: {e}]")
+    occ_rows = []
+    for ev in events:
+        ev_copy = dict(ev)
+        try:
+            ev_copy["_exceptions"] = store.get_exceptions(ev["id"])
+        except Exception:
+            ev_copy["_exceptions"] = set()
+        try:
+            occs = recurrence_mod.occurrences(ev_copy, range_start, range_end)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("backup: recurrence error for %s: %s", ev.get("id"), e)
+            continue
+        try:
+            ev_tz = ZoneInfo(ev.get("tz") or tz_name)
+        except Exception:
+            ev_tz = default_tz
+        for occ_utc in occs:
+            status_row = store.get_status(ev["id"], occ_utc.isoformat())
+            occ_rows.append({
+                "when": occ_utc.astimezone(ev_tz),
+                "title": ev.get("title", ""),
+                "job": ev.get("job"),
+                "category": ev.get("category"),
+                "location": ev.get("location"),
+                "tags": ev.get("tags") or [],
+                "status": status_row["status"] if status_row else "floating",
+                "recurring": bool(ev.get("recurrence")),
+            })
+    occ_rows.sort(key=lambda r: r["when"])
+    out.append(f"== EVENTS ({len(occ_rows)}) ==")
+    if not occ_rows:
+        out.append("  (none)")
+    for r in occ_rows:
+        meta = []
+        if r["job"]:
+            meta.append(f"job={r['job']}")
+        if r["category"]:
+            meta.append(f"cat={r['category']}")
+        if r["location"]:
+            meta.append(f"@{r['location']}")
+        if r["tags"]:
+            meta.append("#" + ",".join(r["tags"]))
+        rec = " (recurring)" if r["recurring"] else ""
+        suffix = ("  " + " ".join(meta)) if meta else ""
+        out.append(f"  {r['when'].strftime('%Y-%m-%d %H:%M')}  [{r['status']}]{rec} {r['title']}{suffix}")
+    out.append("")
+
+    # --- Jobs / time tracking (already window-bounded by the store) ---
+    try:
+        jobs = store.list_jobs(owner, start_iso=start_iso, end_iso=end_iso)
+    except Exception as e:  # noqa: BLE001
+        jobs, _ = [], out.append(f"[jobs unavailable: {e}]")
+    out.append(f"== JOBS / TIME TRACKING ({len(jobs)}) ==")
+    if not jobs:
+        out.append("  (none)")
+    total = 0
+    for j in jobs:
+        secs = int(j.get("total_seconds") or 0)
+        total += secs
+        cat = f" [{j['category']}]" if j.get("category") else ""
+        out.append(f"  {j.get('job', '?')}{cat}: {job_report_mod._fmt_hms(secs)}"
+                   f" over {j.get('count', 0)} session(s)")
+    if jobs:
+        out.append(f"  -- total tracked: {job_report_mod._fmt_hms(total)}")
+    out.append("")
+
+    # --- Notes (alertless; filtered to the window by timestamp) ---
+    try:
+        all_notes = store.list_events(owner=owner, kind="note")
+    except Exception as e:  # noqa: BLE001
+        all_notes, _ = [], out.append(f"[notes unavailable: {e}]")
+    note_rows = []
+    for note in all_notes:
+        dt = _parse_utc(note.get("start_utc"))
+        if dt is None or dt < range_start or dt >= range_end:
+            continue
+        try:
+            ntz = ZoneInfo(note.get("tz") or tz_name)
+        except Exception:
+            ntz = default_tz
+        note_rows.append({
+            "when": dt.astimezone(ntz),
+            "content": note.get("title", ""),
+            "details": note.get("description"),
+            "tags": note.get("tags") or [],
+        })
+    note_rows.sort(key=lambda r: r["when"])
+    out.append(f"== NOTES ({len(note_rows)}) ==")
+    if not note_rows:
+        out.append("  (none)")
+    for r in note_rows:
+        tagstr = ("  #" + ",".join(r["tags"])) if r["tags"] else ""
+        out.append(f"  {r['when'].strftime('%Y-%m-%d %H:%M')}  {r['content']}{tagstr}")
+        if r["details"]:
+            for dl in str(r["details"]).splitlines():
+                out.append(f"      {dl}")
+    out.append("")
+    return "\n".join(out)
+
+
+def _resolve_backup_window(args: Dict[str, Any], tz_name: str):
+    """Resolve the backup window from the tool args, mirroring calendar_job_summary:
+    an explicit from/to range, a named period (daily/weekly/monthly/yearly) anchored
+    on 'date', a 'month' convenience (YYYY-MM), or — by default — the current month.
+
+    Returns (start_iso, end_iso, period_desc, kind) or a tool_error string on bad
+    input. ``kind`` is one of daily/weekly/monthly/yearly/range.
+    """
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+
+    period = str(args.get("period") or "").strip().lower() or None
+    date_raw = args.get("date")
+    from_raw = args.get("from")
+    to_raw = args.get("to")
+    month_raw = args.get("month")
+
+    # 'month=YYYY-MM' is a convenience for period=monthly anchored on that month.
+    if month_raw and not period and not (from_raw and to_raw):
+        m = str(month_raw).strip()
+        if re.fullmatch(r"\d{4}-\d{2}", m):
+            m = f"{m}-01"
+        period, date_raw = "monthly", m
+
+    def _label(start_iso: str, end_iso: str, kind: str) -> str:
+        s = datetime.fromisoformat(start_iso).astimezone(tz)
+        e = datetime.fromisoformat(end_iso).astimezone(tz)
+        if kind == "monthly":
+            return s.strftime("%B %Y")
+        if kind == "yearly":
+            return s.strftime("%Y")
+        if kind == "weekly":
+            return f"week of {s.strftime('%Y-%m-%d')}"
+        if kind == "daily":
+            return s.strftime("%Y-%m-%d")
+        return f"{s.strftime('%Y-%m-%d')} → {e.strftime('%Y-%m-%d')}"
+
+    if period:
+        window = _resolve_period_window(period, date_raw, tz_name)
+        if window is None:
+            return tool_error(
+                f"Could not compute window for period={period!r}. "
+                "Use daily, weekly, monthly, or yearly — or pass 'from'/'to'.")
+        start_iso, end_iso = window
+        return start_iso, end_iso, _label(start_iso, end_iso, period), period
+
+    if from_raw and to_raw:
+        from_dt = _parse_start(from_raw, tz_name)
+        to_dt = _parse_start(to_raw, tz_name)
+        if from_dt is None:
+            return tool_error(f"Could not parse 'from': {from_raw!r}")
+        if to_dt is None:
+            return tool_error(f"Could not parse 'to': {to_raw!r}")
+        start_iso = from_dt.astimezone(timezone.utc).isoformat()
+        end_iso = to_dt.astimezone(timezone.utc).isoformat()
+        if start_iso >= end_iso:
+            return tool_error("'from' must be before 'to'")
+        return start_iso, end_iso, _label(start_iso, end_iso, "range"), "range"
+
+    # Default: current month.
+    start_iso, end_iso = _resolve_period_window("monthly", None, tz_name)
+    return start_iso, end_iso, _label(start_iso, end_iso, "monthly"), "monthly"
+
+
+def _backup_filename_label(start_iso: str, end_iso: str, kind: str, tz_name: str) -> str:
+    """Compact, filesystem-safe window label for the backup filename."""
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    s = datetime.fromisoformat(start_iso).astimezone(tz)
+    e = datetime.fromisoformat(end_iso).astimezone(tz)
+    if kind == "yearly":
+        return s.strftime("%Y")
+    if kind == "monthly":
+        return s.strftime("%Y-%m")
+    if kind == "weekly":
+        return f"{s.strftime('%Y%m%d')}-wk"
+    if kind == "daily":
+        return s.strftime("%Y-%m-%d")
+    return f"{s.strftime('%Y%m%d')}-{e.strftime('%Y%m%d')}"  # range
+
+
+def _handle_calendar_backup_events(args: Dict[str, Any], **kw) -> str:
+    """Back up an owner's events/jobs/notes for a period to the junkyard; return a link."""
+    owner = str(args.get("owner") or "").strip()
+    if not owner:
+        return tool_error("owner is required — whose events to back up (typically the asker).")
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    tz_name = str(args.get("tz") or recurrence_mod.DEFAULT_TZ)
+    resolved = _resolve_backup_window(args, tz_name)
+    if isinstance(resolved, str):  # tool_error
+        return resolved
+    start_iso, end_iso, period_desc, kind = resolved
+    range_start = datetime.fromisoformat(start_iso)
+    range_end = datetime.fromisoformat(end_iso)
+
+    text = _format_events_backup(owner, tz_name, range_start, range_end,
+                                 start_iso, end_iso, period_desc)
+
+    label = _backup_filename_label(start_iso, end_iso, kind, tz_name)
+    safe_owner = re.sub(r"[^A-Za-z0-9._-]+", "-", owner).strip("-") or "user"
+    filename = (str(args.get("filename") or "").strip().strip("/")
+                or f"events-backup-{label}-{safe_owner}.txt")
+
+    try:
+        result = _junkyard_publish(filename=filename, content=text)
+    except _JunkyardError as exc:
+        return tool_error(str(exc))
+    return tool_result({
+        "published": True, "owner": owner, "period": period_desc,
+        "from": start_iso, "to": end_iso, **result,
+        "note": "passwordless download link — send this to the user instead of a file attachment",
     })
 
 
@@ -3670,6 +3952,62 @@ CALENDAR_SHARE_FILE_SCHEMA = {
             },
         },
         "required": [],
+    },
+}
+
+CALENDAR_BACKUP_EVENTS_SCHEMA = {
+    "name": "calendar_backup_events",
+    "description": (
+        "Back up an owner's calendar for a period — regular events, jobs/time-tracking, and notes — "
+        "into a single text file, publish it to the download-only 'junkyard' bucket, and return a "
+        "passwordless download link. Use this in ONE call when the user asks for 'a backup/export of "
+        "my events/jobs/notes' for a month, week, year, or a date range — do NOT manually list "
+        "events/notes/jobs and assemble a file with write_file. The window is chosen by (in order): "
+        "an explicit 'from'/'to' range; a named 'period' (daily/weekly/monthly/yearly) anchored on "
+        "'date'; a 'month' (YYYY-MM); otherwise the current month. The link needs no login but is "
+        "reachable only inside the tailnet. Returns {url, owner, period, from, to, bytes}."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "period": {
+                "type": "string",
+                "enum": ["daily", "weekly", "monthly", "yearly"],
+                "description": (
+                    "Named period to back up, anchored on 'date' (or today). "
+                    "For an arbitrary span use 'from'/'to' instead."
+                ),
+            },
+            "date": {
+                "type": "string",
+                "description": "Anchor date (ISO) for 'period'. Defaults to today. E.g. period=yearly + date=2025-07-01 backs up all of 2025.",
+            },
+            "from": {
+                "type": "string",
+                "description": "Start of a custom range (ISO date/datetime). Use with 'to' for an arbitrary span between two dates.",
+            },
+            "to": {
+                "type": "string",
+                "description": "End of a custom range (ISO date/datetime), exclusive. Use with 'from'.",
+            },
+            "month": {
+                "type": "string",
+                "description": "Convenience for a single month as 'YYYY-MM' (e.g. '2026-06'). Equivalent to period=monthly anchored on that month.",
+            },
+            "tz": {
+                "type": "string",
+                "description": (
+                    f"IANA timezone for the window boundaries and displayed times. "
+                    f"Defaults to {recurrence_mod.DEFAULT_TZ}."
+                ),
+            },
+            "filename": {
+                "type": "string",
+                "description": "Optional download filename. Defaults to 'events-backup-<window>-<owner>.txt'.",
+            },
+        },
+        "required": ["owner"],
     },
 }
 
@@ -3708,6 +4046,7 @@ _TOOLS = (
     ("calendar_convert_to_job",     CALENDAR_CONVERT_TO_JOB_SCHEMA,     _handle_calendar_convert_to_job,     "🛠️"),
     ("calendar_convert_to_regular", CALENDAR_CONVERT_TO_REGULAR_SCHEMA, _handle_calendar_convert_to_regular, "📅"),
     ("calendar_share_file",         CALENDAR_SHARE_FILE_SCHEMA,         _handle_calendar_share_file,         "🔗"),
+    ("calendar_backup_events",      CALENDAR_BACKUP_EVENTS_SCHEMA,      _handle_calendar_backup_events,      "💾"),
 )
 
 

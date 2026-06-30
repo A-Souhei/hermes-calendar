@@ -61,6 +61,7 @@ Every event gets a short per-owner sequential number (`#1`, `#2`, …). You can 
 | `calendar_set_user_email` / `calendar_list_user_emails` | Associate a person with an email (for email-channel reminders/reports) / list associations. |
 | `calendar_digest` | Build (and optionally email) a per-owner daily digest. |
 | `calendar_share_file` | Publish text or a local file to the download-only "junkyard" bucket and return a passwordless URL — use instead of `write_file` to deliver a file as a link. See [Sharing files as a download link](#sharing-files-as-a-download-link-calendar_share_file). |
+| `calendar_backup_events` | One-call backup: gather an owner's events + jobs + notes for a window into a text file, publish it to the junkyard, and return the download link. Window = `period` (daily/weekly/monthly/yearly anchored on `date`), a `from`/`to` range, a `month` (YYYY-MM), or the current month by default. Use this for "back up / export my events" instead of assembling a file by hand. |
 
 Reports are stored per `(event, occurrence)`, so each instance of a recurring event (e.g. every weekly standup) keeps its own minutes/transcription, and one-off meetings get a report too.
 
@@ -175,10 +176,18 @@ CALENDAR_JUNKYARD_ACCESS_KEY=...                    # optional: dedicated write-
 CALENDAR_JUNKYARD_SECRET_KEY=...                    #   falls back to CALENDAR_BACKUP_MINIO_* if unset
 ```
 
-Prefer a dedicated key scoped to `s3:PutObject` on `junkyard/*` only — least
-privilege, since it can only drop files into the (already download-public)
-bucket, not read or delete other backups. If `CALENDAR_JUNKYARD_ACCESS_KEY`/
-`SECRET_KEY` are unset, the calendar-backup creds are used as a fallback.
+Prefer a dedicated key scoped to `s3:PutObject` **and `s3:GetBucketLocation`** on
+the bucket only — least privilege, since it can only drop files into the
+(already download-public) bucket, not read or delete other backups.
+`GetBucketLocation` is required because the MinIO SDK resolves the bucket region
+before uploading; without it a `PutObject`-only key gets `AccessDenied`. If
+`CALENDAR_JUNKYARD_ACCESS_KEY`/`SECRET_KEY` are unset, the calendar-backup creds
+are used as a fallback.
+
+For a ready-made backup, `calendar_backup_events` gathers an owner's events,
+jobs, and notes for a window — `period` (daily/weekly/monthly/yearly), a
+`from`/`to` range, a `month`, or the current month — into a single text file and
+publishes it via the same junkyard path in one call, returning the link.
 
 The public base is configured separately because the upload endpoint (often
 plain http) differs from the public HTTPS download URL (e.g. fronted by a
