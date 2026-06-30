@@ -42,6 +42,7 @@ Every event gets a short per-owner sequential number (`#1`, `#2`, …). You can 
 | `calendar_stop_timer` | Stop the running timer and record the measured duration. |
 | `calendar_resume_job` | Start a fresh session of an existing job, reusing its exact name + category so sessions aggregate. |
 | `calendar_log_job` | **Retroactively log a past, finished job session** (`start` + `end`/`duration`) — a confirmed timer-backed record that aggregates in summaries, for work already done. |
+| `calendar_edit_session` | **Edit a recorded (stopped) job session's start and/or end** (or `duration`) — updates the session's tracked time and the event together, e.g. extend a session that was cut short with `end='now'`. Rejects a window that overlaps another of the owner's sessions. (For a running timer use `calendar_stop_timer`; for a plain event use `calendar_update_event`.) |
 | `calendar_list_jobs` | List distinct jobs for an owner with total time and session counts. |
 | `calendar_job_summary` | Aggregate tracked time by job/category for a period; optionally email a styled report (HTML + PDF). |
 
@@ -282,6 +283,7 @@ silently creating a near-duplicate.
 |---|---|
 | `calendar_resume_job` | Start a fresh session of an existing job, reusing its exact name + category so sessions aggregate. |
 | `calendar_log_job` | **Retroactively log a past, finished job session** (`start` + `end`/`duration`) — a confirmed timer-backed record that aggregates in summaries, for work already done. |
+| `calendar_edit_session` | **Edit a recorded (stopped) job session's start and/or end** (or `duration`) — updates the session's tracked time and the event together, e.g. extend a session that was cut short with `end='now'`. Rejects a window that overlaps another of the owner's sessions. (For a running timer use `calendar_stop_timer`; for a plain event use `calendar_update_event`.) |
 | `calendar_list_jobs` | List distinct jobs for an owner with total time and session counts. |
 | `calendar_job_summary` | Aggregate tracked time by job/category for a period; optionally email a styled report (HTML + PDF). |
 
