@@ -1,5 +1,5 @@
 name: calendar
-version: 1.9.0
+version: 1.9.1
 description: "A 'secretary book' calendar for Hermes — one-time & recurring events with reminders (ha_notify / ha_speak / chat / email), meeting details, per-occurrence status (floating/confirmed/missed/active) & reports, work timers with per-user single-timer enforcement and job/category time-tracking, EN/FR localized reminders, a per-user email registry, period plannings with completion stats + auto end-of-period email reports (with a styled PDF), daily digest, and job summary reports (calendar_list_jobs, calendar_job_summary). CRUD entirely through the agent; SQLite storage; read-only dashboard tab (Calendar | Plannings)."
 author: local
 kind: backend

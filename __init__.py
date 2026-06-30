@@ -51,13 +51,16 @@ _LEAD_KEYWORDS = {
     "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
     "minute": 60, "minutes": 60, "min": 60, "mins": 60,
     "second": 1, "seconds": 1, "sec": 1, "secs": 1,
+    "d": 86400, "h": 3600, "m": 60, "s": 1,  # compact single-letter units
 }
 
 
 def _parse_lead(value: Any) -> Optional[int]:
-    """Parse an alert lead into seconds.
+    """Parse a duration / alert lead into seconds.
 
-    Accepts: int seconds | "1 hour" | "30 minutes" | "2 days" | "90" | None
+    Accepts: int seconds | "90" | spaced forms ("1 hour", "30 minutes",
+    "2 days 3 hours") | compact forms ("2h", "1h30m", "90m", "45s", "1d6h").
+    A bare number is seconds. Returns None if it isn't a recognizable duration.
     """
     if value is None:
         return None
@@ -66,28 +69,25 @@ def _parse_lead(value: Any) -> Optional[int]:
     s = str(value).strip().lower()
     if not s:
         return None
-    # Pure integer string
-    if s.isdigit():
+    if s.isdigit():  # bare number = seconds
         return int(s)
-    # Keyword form: "1 hour", "30 minutes", "2 days 3 hours"
+    # Number+unit groups — spaced ("2 days 3 hours") or compact ("1h30m").
+    # Require the WHOLE string to be such groups so junk fails cleanly.
+    if not re.fullmatch(r"(?:\d+\s*[a-z.]*\s*)+", s):
+        return None
     total = 0
     found = False
-    parts = re.split(r"[\s,]+", s)
-    i = 0
-    while i < len(parts):
-        part = parts[i]
-        if part.isdigit() and i + 1 < len(parts):
-            unit = parts[i + 1].rstrip("s.")
-            multiplier = _LEAD_KEYWORDS.get(unit) or _LEAD_KEYWORDS.get(unit + "s")
-            if multiplier:
-                total += int(part) * multiplier
-                found = True
-                i += 2
-                continue
-        elif part.isdigit():
-            total += int(part)
-            found = True
-        i += 1
+    for num, unit in re.findall(r"(\d+)\s*([a-z.]*)", s):
+        unit = unit.rstrip(".")
+        if unit:
+            mult = (_LEAD_KEYWORDS.get(unit) or _LEAD_KEYWORDS.get(unit.rstrip("s"))
+                    or _LEAD_KEYWORDS.get(unit + "s"))
+            if not mult:
+                return None  # unknown unit -> not a valid duration
+            total += int(num) * mult
+        else:
+            total += int(num)  # bare number = seconds
+        found = True
     return total if found else None
 
 
