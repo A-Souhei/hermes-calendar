@@ -1939,6 +1939,191 @@ def _handle_calendar_stop_timer(args: Dict[str, Any], **kw) -> str:
     return tool_result(result)
 
 
+def _overlapping_session(owner: str, event_id: str, occ_key: str,
+                         new_start: datetime, new_end: datetime) -> Optional[Dict[str, Any]]:
+    """Return another of the owner's work sessions whose time window overlaps
+    [new_start, new_end), or None. A still-running (active) session counts as
+    occupying up to now. Half-open intervals: back-to-back sessions don't clash.
+    """
+    now = datetime.now(timezone.utc)
+    for r in store.list_owner_sessions(owner):
+        if r["event_id"] == event_id and r["occurrence_utc"] == occ_key:
+            continue  # the session being edited
+        s = _parse_utc(r.get("started_utc"))
+        if s is None:
+            continue
+        e = _parse_utc(r.get("ended_utc")) or now  # active/open -> up to now
+        if new_start < e and s < new_end:
+            return r
+    return None
+
+
+def _handle_calendar_edit_session(args: Dict[str, Any], **kw) -> str:
+    """Edit a recorded (stopped) job/timer session's start and/or end."""
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return tool_error("owner is required — the user this job session belongs to.")
+    if not users_mod.is_registered(owner):
+        return tool_error(_unregistered_owner_error(owner))
+
+    eid = _resolve_event_id(args.get("id"), owner=owner)
+    if not eid:
+        return tool_error("Session not found — pass the job event's id or #number together with the owner.")
+    ev = store.get_event(eid)
+    if ev is None:
+        return tool_error(f"Event not found: {eid}")
+
+    # Locate the session's occurrence_status row. These one-time job events have a
+    # single row keyed at the event's start; an explicit 'occurrence' overrides.
+    occ_arg = args.get("occurrence")
+    if occ_arg:
+        occ_key = str(occ_arg).strip()
+        row = store.get_status(eid, occ_key)
+    else:
+        occ_key = ev.get("start_utc")
+        row = store.get_status(eid, occ_key) if occ_key else None
+        if row is None:
+            rows = store.list_statuses(eid)
+            if len(rows) == 1:
+                row, occ_key = rows[0], rows[0]["occurrence_utc"]
+            elif len(rows) > 1:
+                return tool_error(
+                    "This event has multiple sessions — pass 'occurrence' (the occurrence_utc) to pick one.")
+    if row is None:
+        return tool_error(
+            "No recorded session found for this event — there is no job/timer session to edit. "
+            "For a plain calendar event, use calendar_update_event instead.")
+    if row.get("status") == "active":
+        return tool_error(
+            "That timer is still running — stop it with calendar_stop_timer (records end=now), "
+            "then use this tool only if you need to adjust the times further.")
+
+    start_raw = args.get("start")
+    end_raw = args.get("end")
+    dur_raw = args.get("duration")
+    if start_raw is None and end_raw is None and dur_raw is None:
+        return tool_error("Provide at least one of 'start', 'end', or 'duration' to change.")
+    if end_raw is not None and dur_raw is not None:
+        return tool_error("Pass either 'end' or 'duration', not both.")
+
+    tz_name = str(args.get("tz") or ev.get("tz") or recurrence_mod.DEFAULT_TZ)
+
+    if start_raw is not None:
+        sdt = _parse_start(start_raw, tz_name)
+        if sdt is None:
+            return tool_error(f"Could not parse start: {start_raw!r}")
+        new_start = sdt.astimezone(timezone.utc)
+    else:
+        new_start = _parse_utc(row.get("started_utc") or row.get("occurrence_utc") or occ_key)
+        if new_start is None:
+            return tool_error("This session has no recorded start — pass 'start'.")
+
+    if end_raw is not None:
+        if str(end_raw).strip().lower() == "now":
+            new_end = datetime.now(timezone.utc)
+        else:
+            edt = _parse_start(end_raw, tz_name)
+            if edt is None:
+                return tool_error(f"Could not parse end: {end_raw!r}")
+            new_end = edt.astimezone(timezone.utc)
+    elif dur_raw is not None:
+        secs = _parse_lead(dur_raw)
+        if secs is None or secs <= 0:
+            return tool_error(
+                f"Couldn't understand duration {dur_raw!r} — use e.g. '2 hours', '90 min', '1h30m'.")
+        new_end = new_start + timedelta(seconds=secs)
+    else:
+        new_end = _parse_utc(row.get("ended_utc"))
+        if new_end is None:
+            return tool_error("This session has no recorded end — pass 'end' or 'duration' too.")
+
+    dur_secs = round((new_end - new_start).total_seconds())
+    if dur_secs <= 0:
+        return tool_error("end must be after start")
+
+    clash = _overlapping_session(owner, eid, occ_key, new_start, new_end)
+    if clash:
+        clash_job = f" (job {clash['job']!r})" if clash.get("job") else ""
+        return tool_error(
+            f"That window overlaps another session of {owner}'s: #{clash.get('seq')} "
+            f"{clash.get('title')!r}{clash_job}, {clash.get('started_utc')} → "
+            f"{clash.get('ended_utc') or 'running'}. Sessions can't overlap — adjust the times.")
+
+    new_start_iso, new_end_iso = new_start.isoformat(), new_end.isoformat()
+    # Re-key the row to the new start so occurrence_utc == started_utc (matching how
+    # sessions are created), and sync the event row so lists/summaries agree.
+    try:
+        if occ_key != new_start_iso:
+            store.clear_status(eid, occ_key)
+        store.set_status(
+            eid, new_start_iso, "confirmed",
+            started_utc=new_start_iso, ended_utc=new_end_iso, duration_seconds=dur_secs,
+            note=row.get("note"), source=row.get("source") or "timer")
+        store.update_event(eid, {"start_utc": new_start_iso, "duration_seconds": dur_secs})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("calendar_edit_session store error")
+        return tool_error(f"Failed to edit session: {e}")
+
+    ev2 = store.get_event(eid) or ev
+    return tool_result({
+        "updated": True,
+        "id": eid,
+        "number": ev2.get("seq"),
+        "job": ev2.get("job"),
+        "title": ev2.get("title"),
+        "started_utc": new_start_iso,
+        "ended_utc": new_end_iso,
+        "duration_seconds": dur_secs,
+        "duration": job_report_mod._fmt_hms(dur_secs),
+    })
+
+
+CALENDAR_EDIT_SESSION_SCHEMA = {
+    "name": "calendar_edit_session",
+    "description": (
+        "Edit a recorded (stopped) job/timer SESSION's start and/or end — the worked time that "
+        "calendar_job_summary and calendar_list_jobs aggregate. Use this to correct or extend a "
+        "job session: e.g. a session cut short can be extended with end='now', or a wrong start "
+        "fixed. Pass 'start' and/or 'end' (or 'duration'); the session's started/ended and the "
+        "event's start/duration are updated together and kept consistent. For a STILL-RUNNING "
+        "timer use calendar_stop_timer (it records end=now) instead; for a plain non-job event "
+        "use calendar_update_event."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "The job event's id or #number (e.g. '#58')."},
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "start": {
+                "type": "string",
+                "description": "New session start (ISO datetime). Omit to keep the current start.",
+            },
+            "end": {
+                "type": "string",
+                "description": "New session end (ISO datetime, or 'now'). Omit to keep the current end. Use this OR 'duration'.",
+            },
+            "duration": {
+                "type": "string",
+                "description": "Set the end as start + this duration (e.g. '2h30m', '90 min'). Use this OR 'end'.",
+            },
+            "occurrence": {
+                "type": "string",
+                "description": "For an event with multiple sessions, the occurrence_utc to target. Defaults to the event's single session.",
+            },
+            "tz": {
+                "type": "string",
+                "description": (
+                    f"IANA timezone for interpreting a naive 'start'/'end'. "
+                    f"Defaults to the event's tz or {recurrence_mod.DEFAULT_TZ}."
+                ),
+            },
+        },
+        "required": ["id", "owner"],
+    },
+}
+
+
 CALENDAR_SET_STATUS_SCHEMA = {
     "name": "calendar_set_status",
     "description": (
@@ -4010,6 +4195,7 @@ _TOOLS = (
     ("calendar_set_status",   CALENDAR_SET_STATUS_SCHEMA,   _handle_calendar_set_status,   "✅"),
     ("calendar_start_timer",  CALENDAR_START_TIMER_SCHEMA,  _handle_calendar_start_timer,  "⏱️"),
     ("calendar_stop_timer",   CALENDAR_STOP_TIMER_SCHEMA,   _handle_calendar_stop_timer,   "⏹️"),
+    ("calendar_edit_session", CALENDAR_EDIT_SESSION_SCHEMA, _handle_calendar_edit_session, "✏️"),
     ("calendar_resume_job",   CALENDAR_RESUME_JOB_SCHEMA,   _handle_calendar_resume_job,   "▶️"),
     ("calendar_log_job",      CALENDAR_LOG_JOB_SCHEMA,      _handle_calendar_log_job,      "🧾"),
     ("calendar_set_user_email",   CALENDAR_SET_USER_EMAIL_SCHEMA,   _handle_calendar_set_user_email,   "📧"),

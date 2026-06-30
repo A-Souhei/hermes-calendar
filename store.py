@@ -873,6 +873,29 @@ def list_active(owner: Optional[str] = None) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def list_owner_sessions(owner: str) -> List[Dict[str, Any]]:
+    """Return timer-backed occurrence_status rows (started_utc set) for an owner's
+    events, with the event's seq/title/job, ordered by start. Used to detect
+    time overlaps between work sessions.
+    """
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            """
+            SELECT os.event_id, os.occurrence_utc, os.status,
+                   os.started_utc, os.ended_utc, os.duration_seconds,
+                   e.seq AS seq, e.title AS title, e.job AS job
+            FROM occurrence_status os
+            JOIN events e ON e.id = os.event_id
+            WHERE e.owner COLLATE NOCASE = ?
+              AND os.started_utc IS NOT NULL
+            ORDER BY os.started_utc
+            """,
+            (owner,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def summarize_jobs(
     owner: str,
     start_iso: str,
