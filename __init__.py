@@ -3805,8 +3805,9 @@ def _resolve_backup_window(args: Dict[str, Any], tz_name: str):
     an explicit from/to range, a named period (daily/weekly/monthly/yearly) anchored
     on 'date', a 'month' convenience (YYYY-MM), or — by default — the current month.
 
-    Returns (start_iso, end_iso, period_desc, kind) or a tool_error string on bad
-    input. ``kind`` is one of daily/weekly/monthly/yearly/range.
+    Returns (start_iso, end_iso, period_desc, file_label) or a tool_error string on
+    bad input. ``period_desc`` is a human label; ``file_label`` is a compact,
+    filesystem-safe window tag for the filename. The window end is exclusive.
     """
     from zoneinfo import ZoneInfo
     try:
@@ -3827,19 +3828,6 @@ def _resolve_backup_window(args: Dict[str, Any], tz_name: str):
             m = f"{m}-01"
         period, date_raw = "monthly", m
 
-    def _label(start_iso: str, end_iso: str, kind: str) -> str:
-        s = datetime.fromisoformat(start_iso).astimezone(tz)
-        e = datetime.fromisoformat(end_iso).astimezone(tz)
-        if kind == "monthly":
-            return s.strftime("%B %Y")
-        if kind == "yearly":
-            return s.strftime("%Y")
-        if kind == "weekly":
-            return f"week of {s.strftime('%Y-%m-%d')}"
-        if kind == "daily":
-            return s.strftime("%Y-%m-%d")
-        return f"{s.strftime('%Y-%m-%d')} → {e.strftime('%Y-%m-%d')}"
-
     if period:
         window = _resolve_period_window(period, date_raw, tz_name)
         if window is None:
@@ -3847,7 +3835,14 @@ def _resolve_backup_window(args: Dict[str, Any], tz_name: str):
                 f"Could not compute window for period={period!r}. "
                 "Use daily, weekly, monthly, or yearly — or pass 'from'/'to'.")
         start_iso, end_iso = window
-        return start_iso, end_iso, _label(start_iso, end_iso, period), period
+        s = datetime.fromisoformat(start_iso).astimezone(tz)
+        if period == "yearly":
+            return start_iso, end_iso, s.strftime("%Y"), s.strftime("%Y")
+        if period == "weekly":
+            return start_iso, end_iso, f"week of {s.strftime('%Y-%m-%d')}", f"{s.strftime('%Y%m%d')}-wk"
+        if period == "daily":
+            return start_iso, end_iso, s.strftime("%Y-%m-%d"), s.strftime("%Y-%m-%d")
+        return start_iso, end_iso, s.strftime("%B %Y"), s.strftime("%Y-%m")  # monthly
 
     if from_raw and to_raw:
         from_dt = _parse_start(from_raw, tz_name)
@@ -3856,35 +3851,23 @@ def _resolve_backup_window(args: Dict[str, Any], tz_name: str):
             return tool_error(f"Could not parse 'from': {from_raw!r}")
         if to_dt is None:
             return tool_error(f"Could not parse 'to': {to_raw!r}")
+        # A bare-date 'to' (no time component) is INCLUSIVE of that whole day, so
+        # "between the 1st and the 30th" covers all of the 30th. The window end
+        # stays exclusive internally, so we roll a date-only 'to' forward a day.
+        end_dt = to_dt + timedelta(days=1) if ":" not in str(to_raw) else to_dt
         start_iso = from_dt.astimezone(timezone.utc).isoformat()
-        end_iso = to_dt.astimezone(timezone.utc).isoformat()
+        end_iso = end_dt.astimezone(timezone.utc).isoformat()
         if start_iso >= end_iso:
             return tool_error("'from' must be before 'to'")
-        return start_iso, end_iso, _label(start_iso, end_iso, "range"), "range"
+        # Labels show the user-facing dates (the inclusive 'to', not the rolled end).
+        fs, ts = from_dt.astimezone(tz), to_dt.astimezone(tz)
+        desc = f"{fs.strftime('%Y-%m-%d')} → {ts.strftime('%Y-%m-%d')}"
+        return start_iso, end_iso, desc, f"{fs.strftime('%Y%m%d')}-{ts.strftime('%Y%m%d')}"
 
     # Default: current month.
     start_iso, end_iso = _resolve_period_window("monthly", None, tz_name)
-    return start_iso, end_iso, _label(start_iso, end_iso, "monthly"), "monthly"
-
-
-def _backup_filename_label(start_iso: str, end_iso: str, kind: str, tz_name: str) -> str:
-    """Compact, filesystem-safe window label for the backup filename."""
-    from zoneinfo import ZoneInfo
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
     s = datetime.fromisoformat(start_iso).astimezone(tz)
-    e = datetime.fromisoformat(end_iso).astimezone(tz)
-    if kind == "yearly":
-        return s.strftime("%Y")
-    if kind == "monthly":
-        return s.strftime("%Y-%m")
-    if kind == "weekly":
-        return f"{s.strftime('%Y%m%d')}-wk"
-    if kind == "daily":
-        return s.strftime("%Y-%m-%d")
-    return f"{s.strftime('%Y%m%d')}-{e.strftime('%Y%m%d')}"  # range
+    return start_iso, end_iso, s.strftime("%B %Y"), s.strftime("%Y-%m")
 
 
 def _handle_calendar_backup_events(args: Dict[str, Any], **kw) -> str:
@@ -3899,17 +3882,16 @@ def _handle_calendar_backup_events(args: Dict[str, Any], **kw) -> str:
     resolved = _resolve_backup_window(args, tz_name)
     if isinstance(resolved, str):  # tool_error
         return resolved
-    start_iso, end_iso, period_desc, kind = resolved
+    start_iso, end_iso, period_desc, file_label = resolved
     range_start = datetime.fromisoformat(start_iso)
     range_end = datetime.fromisoformat(end_iso)
 
     text = _format_events_backup(owner, tz_name, range_start, range_end,
                                  start_iso, end_iso, period_desc)
 
-    label = _backup_filename_label(start_iso, end_iso, kind, tz_name)
     safe_owner = re.sub(r"[^A-Za-z0-9._-]+", "-", owner).strip("-") or "user"
     filename = (str(args.get("filename") or "").strip().strip("/")
-                or f"events-backup-{label}-{safe_owner}.txt")
+                or f"events-backup-{file_label}-{safe_owner}.txt")
 
     try:
         result = _junkyard_publish(filename=filename, content=text)
@@ -3989,7 +3971,7 @@ CALENDAR_BACKUP_EVENTS_SCHEMA = {
             },
             "to": {
                 "type": "string",
-                "description": "End of a custom range (ISO date/datetime), exclusive. Use with 'from'.",
+                "description": "End of a custom range. A bare date (e.g. '2026-06-30') is inclusive of that whole day; add a time for an exact cutoff. Use with 'from'.",
             },
             "month": {
                 "type": "string",
