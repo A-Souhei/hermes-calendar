@@ -89,6 +89,12 @@ def occurrences(
     if byweekday:
         kwargs["byweekday"] = [_WEEKDAY_MAP[d] for d in byweekday if 0 <= d <= 6]
 
+    # bysetpos is only meaningful with a weekday set on a monthly/yearly freq;
+    # applying it otherwise selects an out-of-range position -> zero occurrences.
+    bysetpos = rec.get("bysetpos")
+    if bysetpos and byweekday and rec.get("freq") in ("monthly", "yearly"):
+        kwargs["bysetpos"] = int(bysetpos)
+
     count = rec.get("count")
     if count is not None:
         kwargs["count"] = int(count)
