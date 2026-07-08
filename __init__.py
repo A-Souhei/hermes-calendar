@@ -108,6 +108,30 @@ _DAY_NAMES: Dict[str, int] = {
     "sun": 6, "sunday": 6,
 }
 
+_VALID_BYSETPOS = {-1, 1, 2, 3, 4, 5}
+
+# Ordinal words/digits -> bysetpos (1=first ... 5=fifth, -1=last).
+_ORDINAL_WORDS: Dict[str, int] = {
+    "first": 1, "1st": 1,
+    "second": 2, "2nd": 2,
+    "third": 3, "3rd": 3,
+    "fourth": 4, "4th": 4,
+    "fifth": 5, "5th": 5,
+    "last": -1,
+}
+
+
+def _normalize_bysetpos(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep bysetpos only where it expands as written — a single weekday on a
+    monthly/yearly freq — so the stored rule, its human label, and its
+    occurrences always agree. Drop it otherwise (e.g. a weekly freq, or several
+    weekdays, where the canonical single-bysetpos model can't represent it)."""
+    if "bysetpos" in rec:
+        bwd = rec.get("byweekday")
+        if rec.get("freq") not in ("monthly", "yearly") or not isinstance(bwd, list) or len(bwd) != 1:
+            rec.pop("bysetpos", None)
+    return rec
+
 
 def _parse_recurrence(value: Any) -> Optional[Dict[str, Any]]:
     """Parse a recurrence spec into the canonical dict.
@@ -131,15 +155,37 @@ def _parse_recurrence(value: Any) -> Optional[Dict[str, Any]]:
         bwd = value.get("byweekday")
         if bwd is not None:
             result["byweekday"] = [int(d) for d in bwd if 0 <= int(d) <= 6]
+        bysetpos = value.get("bysetpos")
+        if bysetpos is not None:
+            try:
+                bysetpos = int(bysetpos)
+            except (TypeError, ValueError):
+                bysetpos = 0
+            if bysetpos in _VALID_BYSETPOS:
+                result["bysetpos"] = bysetpos
         if value.get("count") is not None:
             result["count"] = int(value["count"])
         if value.get("until") is not None:
             result["until"] = str(value["until"])
-        return result
+        return _normalize_bysetpos(result)
 
     s = str(value).strip().lower()
     if not s:
         return None
+
+    # Natural nth-weekday form: "second monday", "2nd monday", "last friday",
+    # optionally suffixed with "of the month" / "of every month".
+    nat_s = re.sub(r"\s+of\s+(the|every)\s+month$", "", s).strip()
+    nat_m = re.match(r"^(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|last)\s+(\w+)$", nat_s)
+    if nat_m:
+        ord_word, day_word = nat_m.groups()
+        if day_word in _DAY_NAMES:
+            return _normalize_bysetpos({
+                "freq": "monthly",
+                "interval": 1,
+                "byweekday": [_DAY_NAMES[day_word]],
+                "bysetpos": _ORDINAL_WORDS[ord_word],
+            })
 
     # "every N weeks" / "every N days" etc.
     interval = 1
@@ -149,13 +195,25 @@ def _parse_recurrence(value: Any) -> Optional[Dict[str, Any]]:
         unit_word = every_m.group(2).rstrip("s")
         s = unit_word  # reduce to the base keyword
 
-    # "weekly:mon,wed"
+    # "weekly:mon,wed" or the nth-weekday colon form "monthly:2mon" / "monthly:2nd mon" / "monthly:last fri"
     byweekday = None
+    bysetpos = None
     if ":" in s:
         base, days_part = s.split(":", 1)
         s = base.strip()
         day_tokens = [d.strip() for d in days_part.split(",")]
-        byweekday = [_DAY_NAMES[d] for d in day_tokens if d in _DAY_NAMES]
+        byweekday = []
+        for tok in day_tokens:
+            setpos_m = re.match(
+                r"^(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|last|[1-5])\s*(\w+)$", tok
+            )
+            if setpos_m:
+                ord_token, day_word = setpos_m.groups()
+                if day_word in _DAY_NAMES:
+                    byweekday.append(_DAY_NAMES[day_word])
+                    bysetpos = _ORDINAL_WORDS.get(ord_token) or int(ord_token)
+            elif tok in _DAY_NAMES:
+                byweekday.append(_DAY_NAMES[tok])
 
     freq = _FREQ_ALIASES.get(s.strip())
     if freq is None:
@@ -164,7 +222,9 @@ def _parse_recurrence(value: Any) -> Optional[Dict[str, Any]]:
     result = {"freq": freq, "interval": interval}
     if byweekday is not None:
         result["byweekday"] = byweekday
-    return result
+    if bysetpos is not None:
+        result["bysetpos"] = bysetpos
+    return _normalize_bysetpos(result)
 
 
 def _unregistered_owner_error(owner: str) -> str:
@@ -263,12 +323,23 @@ def _until_local_date(until_iso: str, tz_name: Optional[str]) -> str:
         return str(until_iso)[:10]
 
 
+_FULL_DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _ordinal_label(bysetpos: int) -> str:
+    if bysetpos == -1:
+        return "last"
+    suffix = "th" if 11 <= bysetpos % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(bysetpos % 10, "th")
+    return f"{bysetpos}{suffix}"
+
+
 def _human_recurrence(rec: Optional[Dict], tz_name: Optional[str] = None) -> Optional[str]:
     if not rec:
         return None
     freq = rec.get("freq", "weekly")
     interval = rec.get("interval", 1)
     bwd = rec.get("byweekday")
+    bysetpos = rec.get("bysetpos")
     day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
     if interval == 1:
@@ -276,7 +347,9 @@ def _human_recurrence(rec: Optional[Dict], tz_name: Optional[str] = None) -> Opt
     else:
         label = f"Every {interval} {freq[:-2] if freq.endswith('ly') else freq}s"
 
-    if bwd:
+    if bwd and bysetpos and len(bwd) == 1 and 0 <= bwd[0] <= 6:
+        label += f" on the {_ordinal_label(bysetpos)} {_FULL_DAY_NAMES[bwd[0]]}"
+    elif bwd:
         label += " on " + ", ".join(day_names[d] for d in bwd if 0 <= d <= 6)
     if rec.get("until"):
         label += f" until {_until_local_date(rec['until'], tz_name)}"
@@ -1073,7 +1146,12 @@ _RECURRENCE_DESCRIPTION = (
     "'weekly:mon,wed,fri', 'monthly', 'yearly'. "
     "Or a structured object: {\"freq\": \"weekly\", \"interval\": 2, "
     "\"byweekday\": [0, 2], \"count\": 10, \"until\": \"2027-01-01T00:00:00Z\"}. "
-    "byweekday uses 0=Mon … 6=Sun. Omit or set null for a one-time event."
+    "byweekday uses 0=Mon … 6=Sun. Omit or set null for a one-time event. "
+    "For the Nth weekday of the month use freq 'monthly' with a single byweekday "
+    "plus bysetpos (1=first … 5=fifth, -1=last): e.g. the 2nd Monday of every "
+    "month = {\"freq\": \"monthly\", \"byweekday\": [0], \"bysetpos\": 2}; the "
+    "last Friday = {\"freq\": \"monthly\", \"byweekday\": [4], \"bysetpos\": -1}. "
+    "String forms 'monthly:2mon' or 'second monday' are also accepted."
 )
 
 _ALERT_LEAD_DESCRIPTION = (
