@@ -121,6 +121,18 @@ _ORDINAL_WORDS: Dict[str, int] = {
 }
 
 
+def _normalize_bysetpos(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep bysetpos only where it expands as written — a single weekday on a
+    monthly/yearly freq — so the stored rule, its human label, and its
+    occurrences always agree. Drop it otherwise (e.g. a weekly freq, or several
+    weekdays, where the canonical single-bysetpos model can't represent it)."""
+    if "bysetpos" in rec:
+        bwd = rec.get("byweekday")
+        if rec.get("freq") not in ("monthly", "yearly") or not isinstance(bwd, list) or len(bwd) != 1:
+            rec.pop("bysetpos", None)
+    return rec
+
+
 def _parse_recurrence(value: Any) -> Optional[Dict[str, Any]]:
     """Parse a recurrence spec into the canonical dict.
 
@@ -155,7 +167,7 @@ def _parse_recurrence(value: Any) -> Optional[Dict[str, Any]]:
             result["count"] = int(value["count"])
         if value.get("until") is not None:
             result["until"] = str(value["until"])
-        return result
+        return _normalize_bysetpos(result)
 
     s = str(value).strip().lower()
     if not s:
@@ -168,12 +180,12 @@ def _parse_recurrence(value: Any) -> Optional[Dict[str, Any]]:
     if nat_m:
         ord_word, day_word = nat_m.groups()
         if day_word in _DAY_NAMES:
-            return {
+            return _normalize_bysetpos({
                 "freq": "monthly",
                 "interval": 1,
                 "byweekday": [_DAY_NAMES[day_word]],
                 "bysetpos": _ORDINAL_WORDS[ord_word],
-            }
+            })
 
     # "every N weeks" / "every N days" etc.
     interval = 1
@@ -212,7 +224,7 @@ def _parse_recurrence(value: Any) -> Optional[Dict[str, Any]]:
         result["byweekday"] = byweekday
     if bysetpos is not None:
         result["bysetpos"] = bysetpos
-    return result
+    return _normalize_bysetpos(result)
 
 
 def _unregistered_owner_error(owner: str) -> str:

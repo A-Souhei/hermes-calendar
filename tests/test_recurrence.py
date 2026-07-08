@@ -131,6 +131,21 @@ def test_parse_plain_weekly_unchanged():
     assert "bysetpos" not in rec
 
 
+def test_parse_bysetpos_dropped_when_not_monthly_or_single_weekday():
+    """bysetpos must not survive on rules where it doesn't expand as written —
+    otherwise the label would lie about the schedule (codex findings 1 & 2)."""
+    # freq weekly: expands every Monday, so no positional constraint is kept
+    weekly_dict = cal._parse_recurrence({"freq": "weekly", "byweekday": [0], "bysetpos": 2})
+    assert "bysetpos" not in weekly_dict
+    assert cal._human_recurrence(weekly_dict) == "Weekly on Mon"
+    assert "bysetpos" not in cal._parse_recurrence("weekly:2mon")
+
+    # multiple ordinal day tokens can't be one bysetpos -> drop it, keep the days
+    multi = cal._parse_recurrence("monthly:first monday,last friday")
+    assert multi["byweekday"] == [0, 4]
+    assert "bysetpos" not in multi
+
+
 # ---------------------------------------------------------------------------
 # recurrence.occurrences()
 # ---------------------------------------------------------------------------
