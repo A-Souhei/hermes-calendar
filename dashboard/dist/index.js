@@ -1386,6 +1386,184 @@
     );
   }
 
+  // --- tracked notes (remediation queue) ------------------------------------
+
+  var NOTE_ARCHIVE_FILTERS = [["open", "Open"], ["archived", "Archived"], ["all", "All"]];
+  var NOTES_PAGE_SIZE = 10;
+
+  function notePriorityBadge(priority) {
+    var p = (priority || "").toLowerCase();
+    var cls = p === "immediate" ? "cal-note-priority-immediate"
+      : p === "soon" ? "cal-note-priority-soon"
+      : "cal-note-priority-later";
+    return h("span", { className: cn("cal-note-priority", cls) }, p || "unset");
+  }
+
+  function NoteCard(props) {
+    const note = props.note;
+    const busy = props.busy;
+    const archived = note.archived;
+    return h(
+      Card,
+      { key: note.id },
+      h(
+        CardContent,
+        { className: "p-3 space-y-2" },
+        h(
+          "div",
+          { className: "flex items-start justify-between gap-3" },
+          h(
+            "div",
+            { className: "space-y-1 min-w-0" },
+            h(
+              "div",
+              { className: "flex items-center gap-2 flex-wrap" },
+              notePriorityBadge(note.priority),
+              note.number != null ? h("span", { className: "cal-evnum" }, "#" + note.number) : null
+            ),
+            h("div", { className: "text-sm font-medium" }, note.content),
+            note.details ? h("div", { className: "text-sm opacity-70 whitespace-pre-wrap" }, note.details) : null,
+            note.tags && note.tags.length
+              ? h(
+                  "div",
+                  { className: "flex flex-wrap gap-1" },
+                  note.tags.map(function (t, i) { return h(Badge, { key: i, variant: "outline" }, t); })
+                )
+              : null,
+            h("div", { className: "text-xs opacity-50" }, fmtDateTime(note.when_local || note.when_utc))
+          ),
+          h(
+            Button,
+            {
+              variant: archived ? "outline" : "destructive",
+              size: "sm",
+              disabled: busy,
+              onClick: function () { props.onToggle(note); },
+              title: archived ? "Restore this note" : "Archive this note",
+            },
+            busy ? "…" : (archived ? "↺ Restore" : "✓ Archive")
+          )
+        )
+      )
+    );
+  }
+
+  function NotesView(props) {
+    const owner = props.owner || null;
+    const [archivedFilter, setArchivedFilter] = useState("open");
+    const [offset, setOffset] = useState(0);
+    const [data, setData] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [busyId, setBusyId] = useState(null);
+    const [actionError, setActionError] = useState(null);
+
+    useEffect(function () { setOffset(0); }, [owner, archivedFilter]);
+
+    const load = useCallback(function () {
+      setLoading(true);
+      setError(null);
+      var qs = ["archived=" + encodeURIComponent(archivedFilter), "limit=" + NOTES_PAGE_SIZE, "offset=" + offset];
+      if (owner) qs.push("owner=" + encodeURIComponent(owner));
+      SDK.fetchJSON(API + "/notes?" + qs.join("&"))
+        .then(function (d) { setData(d); setLoading(false); })
+        .catch(function (err) { setError((err && err.message) || "Failed to load notes"); setLoading(false); });
+    }, [owner, archivedFilter, offset]);
+
+    useEffect(load, [load]);
+
+    function toggleArchive(note) {
+      setBusyId(note.id);
+      setActionError(null);
+      var url = API + "/notes/" + (note.archived ? "unarchive" : "archive");
+      SDK.fetchJSON(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: note.id, owner: owner || undefined }),
+      })
+        .then(function () {
+          setBusyId(null);
+          load();
+          if (props.onChanged) props.onChanged();
+        })
+        .catch(function (err) {
+          setActionError((err && err.message) || "Action failed");
+          setBusyId(null);
+        });
+    }
+
+    const notes = (data && data.notes) || [];
+    const total = (data && data.total) || 0;
+    const limit = (data && data.limit) || NOTES_PAGE_SIZE;
+    const rangeStart = total ? offset + 1 : 0;
+    const rangeEnd = Math.min(offset + limit, total);
+
+    return h(
+      "div",
+      { className: "p-4 sm:p-6 space-y-4" },
+      h(
+        "div",
+        { className: "flex items-center justify-between gap-3 flex-wrap" },
+        h(
+          "div",
+          { className: "cal-tabs" },
+          NOTE_ARCHIVE_FILTERS.map(function (f) {
+            return h(
+              "button",
+              {
+                key: f[0],
+                className: cn("cal-tab", archivedFilter === f[0] && "cal-tab-active"),
+                onClick: function () { setArchivedFilter(f[0]); },
+              },
+              f[1]
+            );
+          })
+        ),
+        h(Button, { variant: "ghost", size: "sm", onClick: load, title: "Refresh" }, "⟳")
+      ),
+
+      actionError ? h("div", { className: "text-sm text-red-600" }, "⚠ " + actionError) : null,
+      error ? h("div", { className: "text-sm text-red-600" }, "⚠ " + error) : null,
+      loading ? h("div", { className: "text-sm opacity-60" }, "Loading…") : null,
+
+      !loading && !error && notes.length === 0
+        ? h("div", { className: "text-sm opacity-60" }, "No " + archivedFilter + " notes.")
+        : null,
+
+      !loading && notes.length
+        ? h(
+            "div",
+            { className: "space-y-2" },
+            notes.map(function (n) {
+              return h(NoteCard, { key: n.id, note: n, busy: busyId === n.id, onToggle: toggleArchive });
+            })
+          )
+        : null,
+
+      !loading && total > 0
+        ? h(
+            "div",
+            { className: "flex items-center justify-between gap-3 text-sm opacity-70" },
+            h("span", null, "Showing " + rangeStart + "–" + rangeEnd + " of " + total),
+            h(
+              "div",
+              { className: "flex items-center gap-2" },
+              h(Button, {
+                variant: "outline", size: "sm",
+                disabled: offset === 0,
+                onClick: function () { setOffset(Math.max(0, offset - limit)); },
+              }, "Prev"),
+              h(Button, {
+                variant: "outline", size: "sm",
+                disabled: offset + limit >= total,
+                onClick: function () { setOffset(offset + limit); },
+              }, "Next")
+            )
+          )
+        : null
+    );
+  }
+
   // --- app wrapper (tab toggle) --------------------------------------------
 
   function CalendarHero(props) {
@@ -1397,7 +1575,9 @@
     const setSelectedOwner = props.setSelectedOwner;
     const selectedCategory = props.selectedCategory;
     const setSelectedCategory = props.setSelectedCategory;
+    const notesCount = props.notesCount || 0;
     const isPlan = view === "plannings";
+    const isNotes = view === "notes";
     return h(
       "div",
       { className: "cal-hero" },
@@ -1410,14 +1590,16 @@
           h(
             "h1",
             { className: "cal-hero-title" },
-            isPlan ? "🗜️ Plannings" : "📅 Calendar"
+            isNotes ? "🗒️ Tracked Notes" : (isPlan ? "🗜️ Plannings" : "📅 Calendar")
           ),
           h(
             "p",
             { className: "cal-hero-sub" },
-            isPlan
-              ? "Objectives & completion for a period."
-              : "Your events, reminders, status & timers."
+            isNotes
+              ? "Priority notes awaiting remediation."
+              : (isPlan
+                  ? "Objectives & completion for a period."
+                  : "Your events, reminders, status & timers.")
           )
         ),
         h(
@@ -1471,6 +1653,15 @@
                 onClick: function () { setView("plannings"); },
               },
               "🗜️ Plannings"
+            ),
+            h(
+              "button",
+              {
+                className: cn("cal-tab", view === "notes" && "cal-tab-active"),
+                onClick: function () { setView("notes"); },
+              },
+              "🗒️ Notes",
+              notesCount > 0 ? h("span", { className: "cal-tab-badge" }, notesCount) : null
             )
           )
         )
@@ -1478,12 +1669,28 @@
     );
   }
 
+  // Open-notes count for the tab badge; re-polls on owner change or when
+  // `bump` increments (after an archive/unarchive action elsewhere).
+  function useNotesCount(owner, bump) {
+    const [count, setCount] = useState(0);
+    useEffect(function () {
+      var url = API + "/notes?archived=open&limit=1";
+      if (owner) url += "&owner=" + encodeURIComponent(owner);
+      SDK.fetchJSON(url)
+        .then(function (d) { setCount((d && d.total) || 0); })
+        .catch(function () { setCount(0); });
+    }, [owner, bump]);
+    return count;
+  }
+
   function CalendarApp() {
     const [view, setView] = useState("calendar");
     const [selectedOwner, setSelectedOwner] = useState(null);
     const [selectedCategory, setSelectedCategory] = useState(null);
+    const [notesBump, setNotesBump] = useState(0);
     const users = useUsers();
     const categories = useCategories(selectedOwner);
+    const notesCount = useNotesCount(selectedOwner, notesBump);
     return h(
       "div",
       null,
@@ -1496,10 +1703,16 @@
         setSelectedOwner: setSelectedOwner,
         selectedCategory: selectedCategory,
         setSelectedCategory: setSelectedCategory,
+        notesCount: notesCount,
       }),
       view === "plannings"
         ? h(PlanningsView, { owner: selectedOwner })
-        : h(CalendarView, { owner: selectedOwner, category: selectedCategory })
+        : (view === "notes"
+            ? h(NotesView, {
+                owner: selectedOwner,
+                onChanged: function () { setNotesBump(function (t) { return t + 1; }); },
+              })
+            : h(CalendarView, { owner: selectedOwner, category: selectedCategory }))
     );
   }
 
