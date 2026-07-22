@@ -477,3 +477,49 @@
   padding: 8px 10px; font-size: 0.85rem; font-family: inherit;
 }
 .cal-report-textarea:focus { outline: none; border-color: var(--color-primary); }
+
+/* ---- Tracked notes (remediation queue) ------------------------------------ */
+
+.cal-tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  margin-left: 6px;
+  border-radius: 999px;
+  font-size: 0.62rem;
+  font-weight: 700;
+  background: var(--color-destructive);
+  color: var(--color-destructive-foreground, #fff);
+}
+
+.cal-note-priority {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  line-height: 1.4;
+  text-transform: capitalize;
+}
+
+.cal-note-priority-immediate {
+  background: color-mix(in srgb, var(--color-destructive) 15%, transparent);
+  color: var(--color-destructive);
+  border: 1px solid color-mix(in srgb, var(--color-destructive) 30%, transparent);
+}
+
+.cal-note-priority-soon {
+  background: rgba(217, 119, 6, 0.12);
+  color: #d97706;
+  border: 1px solid rgba(217, 119, 6, 0.35);
+}
+
+.cal-note-priority-later {
+  background: var(--color-muted);
+  color: var(--color-muted-foreground);
+  border: 1px solid var(--color-border, rgba(127, 127, 127, 0.25));
+}

@@ -204,6 +204,14 @@ def _effective_status(stored: str, occ: datetime, now: datetime, is_job: bool = 
     return "missed" if occ < now else "floating"
 
 
+_NOTE_PRIORITY_RANK = {"immediate": 0, "soon": 1, "later": 2}
+
+
+def _note_priority_rank(priority: Optional[str]) -> int:
+    """Sort rank for a note's priority; unset/unknown sorts last."""
+    return _NOTE_PRIORITY_RANK.get((priority or "").strip().lower(), 3)
+
+
 def _occurrences_in_range(
     start_utc: datetime,
     end_utc: datetime,
@@ -324,6 +332,62 @@ def list_categories(owner: Optional[str] = Query(None)):
         return {"categories": store.list_categories(owner=owner or None)}
     except Exception:
         return {"categories": []}
+
+
+@router.get("/notes")
+def list_notes(
+    owner: Optional[str] = Query(None),
+    archived: str = Query("open"),
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Tracked notes (kind='note') for the dashboard remediation-queue panel,
+    sorted by priority (immediate > soon > later > unset) then most recent
+    first. `archived`: 'open' (default, archived_utc unset), 'archived'
+    (archived_utc set), or 'all' (no filter)."""
+    notes = store.list_events(owner=owner or None, kind="note")
+    if archived == "archived":
+        notes = [n for n in notes if n.get("archived_utc")]
+    elif archived != "all":
+        notes = [n for n in notes if not n.get("archived_utc")]
+    # Stable double-sort: newest first within a priority, priority ascending overall.
+    notes.sort(key=lambda n: n.get("start_utc") or "", reverse=True)
+    notes.sort(key=lambda n: _note_priority_rank(n.get("priority")))
+    total = len(notes)
+    page = notes[offset:offset + limit]
+
+    def _note_item(ev: Dict[str, Any]) -> Dict[str, Any]:
+        when_utc = ev.get("start_utc")
+        when_local = when_utc
+        if when_utc:
+            try:
+                s = when_utc[:-1] + "+00:00" if when_utc.endswith("Z") else when_utc
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                when_local = dt.astimezone(_event_tz(ev)).isoformat()
+            except Exception:
+                when_local = when_utc
+        return {
+            "id": ev["id"],
+            "number": ev.get("seq"),
+            "content": ev.get("title"),
+            "details": ev.get("description"),
+            "tags": ev.get("tags") or [],
+            "priority": ev.get("priority"),
+            "archived": bool(ev.get("archived_utc")),
+            "archived_utc": ev.get("archived_utc"),
+            "when_utc": when_utc,
+            "when_local": when_local,
+            "created_utc": ev.get("created_utc"),
+        }
+
+    return {
+        "notes": [_note_item(n) for n in page],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 class ResumeJobRequest(BaseModel):
@@ -450,6 +514,39 @@ def stop_job(body: StopJobRequest):
     if res is None:
         raise HTTPException(404, detail="no running session for this event")
     return res
+
+
+class NoteArchiveRequest(BaseModel):
+    id: str
+    owner: Optional[str] = None
+
+
+def _set_note_archived(body: "NoteArchiveRequest", archived: bool):
+    """Shared logic for the dashboard Archive/Restore buttons on a tracked note."""
+    if not body.id or not body.id.strip():
+        raise HTTPException(400, detail="id is required")
+    eid = body.id.strip()
+    ev = store.get_event(eid)
+    if not ev:
+        raise HTTPException(404, detail="note not found")
+    if (ev.get("kind") or "event") != "note":
+        raise HTTPException(400, detail="not a note")
+    store.update_event(eid, {
+        "archived_utc": datetime.now(timezone.utc).isoformat() if archived else None,
+    })
+    return {"id": eid, "archived": archived}
+
+
+@router.post("/notes/archive")
+def archive_note(body: NoteArchiveRequest):
+    """Archive a tracked note (dashboard remediation-queue Archive button)."""
+    return _set_note_archived(body, True)
+
+
+@router.post("/notes/unarchive")
+def unarchive_note(body: NoteArchiveRequest):
+    """Restore an archived note (dashboard remediation-queue Restore button)."""
+    return _set_note_archived(body, False)
 
 
 @router.get("/events")
