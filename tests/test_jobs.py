@@ -48,6 +48,8 @@ _registry_data = {
         {"name": "u_note",     "email": "note@example.com",     "language": "en"},
         {"name": "u_notelist", "email": "notelist@example.com", "language": "en"},
         {"name": "u_noteflt",  "email": "noteflt@example.com",  "language": "en"},
+        {"name": "u_notelife", "email": "notelife@example.com", "language": "en"},
+        {"name": "u_noteprio", "email": "noteprio@example.com", "language": "en"},
         {"name": "u_log",      "email": "log@example.com",      "language": "en"},
         {"name": "u_seq",      "email": "seq@example.com",      "language": "en"},
         {"name": "u_seq2",     "email": "seq2@example.com",     "language": "en"},
@@ -421,6 +423,83 @@ def test_notes_excluded_from_agenda_and_digest():
     # daily digest excludes the note
     dtitles = {i["title"] for i in cal.digest_mod.build_owner_digest(o)["today"]}
     assert "Real event" in dtitles and "A note today" not in dtitles
+
+
+def test_add_note_with_priority_persists():
+    r = res(cal._handle_calendar_add_note({
+        "owner": "u_notelife", "content": "fix the leak", "priority": "immediate",
+    }))
+    assert r["priority"] == "immediate"
+    ev = store.get_event(r["id"])
+    assert ev["priority"] == "immediate"
+    assert ev["archived_utc"] is None
+
+
+def test_add_note_invalid_priority_rejected():
+    bad = json.loads(cal._handle_calendar_add_note({
+        "owner": "u_notelife", "content": "x", "priority": "urgent"}))
+    assert not bad["ok"] and "immediate" in bad["error"]
+
+
+def test_archive_and_unarchive_note_by_seq_and_owner():
+    o = "u_notelife"
+    added = res(cal._handle_calendar_add_note({"owner": o, "content": "call the plumber"}))
+    seq = store.get_event(added["id"])["seq"]
+
+    open_list = res(cal._handle_calendar_list_notes({"owner": o}))
+    assert any(n["id"] == added["id"] for n in open_list["notes"])
+
+    arch = res(cal._handle_calendar_archive_note({"owner": o, "id": f"#{seq}"}))
+    assert arch["archived"] is True
+    assert arch["archived_utc"]
+
+    open_after = res(cal._handle_calendar_list_notes({"owner": o}))
+    assert added["id"] not in {n["id"] for n in open_after["notes"]}
+
+    archived_list = res(cal._handle_calendar_list_notes({"owner": o, "archived": "archived"}))
+    assert added["id"] in {n["id"] for n in archived_list["notes"]}
+    assert {n["id"] for n in archived_list["notes"]} <= {n["id"] for n in
+        res(cal._handle_calendar_list_notes({"owner": o, "archived": "all"}))["notes"]}
+
+    unarch = res(cal._handle_calendar_archive_note({"owner": o, "id": added["id"], "unarchive": True}))
+    assert unarch["archived"] is False
+    assert unarch["archived_utc"] is None
+
+    open_restored = res(cal._handle_calendar_list_notes({"owner": o}))
+    assert added["id"] in {n["id"] for n in open_restored["notes"]}
+
+
+def test_list_notes_priority_ordering():
+    o = "u_noteprio"
+    res(cal._handle_calendar_add_note({"owner": o, "content": "no priority"}))
+    res(cal._handle_calendar_add_note({"owner": o, "content": "later thing", "priority": "later"}))
+    res(cal._handle_calendar_add_note({"owner": o, "content": "urgent thing", "priority": "immediate"}))
+    res(cal._handle_calendar_add_note({"owner": o, "content": "soonish thing", "priority": "soon"}))
+
+    notes = res(cal._handle_calendar_list_notes({"owner": o}))["notes"]
+    assert [n["content"] for n in notes] == [
+        "urgent thing", "soonish thing", "later thing", "no priority",
+    ]
+
+
+def test_delete_note_removes_it():
+    o = "u_notelife"
+    added = res(cal._handle_calendar_add_note({"owner": o, "content": "throwaway"}))
+    r = res(cal._handle_calendar_delete_note({"owner": o, "id": added["id"]}))
+    assert r["deleted"] is True
+    assert store.get_event(added["id"]) is None
+
+
+def test_archive_and_delete_note_reject_non_note_kind():
+    o = "u_notelife"
+    ev = res(cal._handle_calendar_add_event({
+        "owner": o, "title": "real event", "start": "2026-08-01T09:00:00+03:00",
+    }))
+    bad_archive = json.loads(cal._handle_calendar_archive_note({"owner": o, "id": ev["id"]}))
+    assert not bad_archive["ok"] and "not a note" in bad_archive["error"].lower()
+
+    bad_delete = json.loads(cal._handle_calendar_delete_note({"owner": o, "id": ev["id"]}))
+    assert not bad_delete["ok"] and "not a note" in bad_delete["error"].lower()
 
 
 def test_log_job_records_past_session_and_aggregates():

@@ -147,6 +147,12 @@ def init_db() -> None:
         if "kind" not in cols:
             conn.execute("ALTER TABLE events ADD COLUMN kind TEXT")
             conn.commit()
+        if "priority" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN priority TEXT")
+            conn.commit()
+        if "archived_utc" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN archived_utc TEXT")
+            conn.commit()
         # Re-fetch cols after potential additions above.
         cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
         if "seq" not in cols:
@@ -233,9 +239,9 @@ def add_event(d: Dict[str, Any]) -> str:
                 (id, title, description, start_utc, tz, all_day,
                  recurrence, alert_lead_seconds, alert_channel,
                  meeting, location, tags, language, owner, notify_email,
-                 planning_id, job, category, kind, seq, duration_seconds,
-                 created_utc, updated_utc)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 planning_id, job, category, kind, priority, archived_utc,
+                 seq, duration_seconds, created_utc, updated_utc)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 event_id,
@@ -257,6 +263,8 @@ def add_event(d: Dict[str, Any]) -> str:
                 d.get("job"),
                 d.get("category"),
                 d.get("kind"),
+                d.get("priority"),
+                d.get("archived_utc"),
                 seq_val,
                 d.get("duration_seconds"),
                 now,
