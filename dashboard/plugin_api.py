@@ -549,6 +549,33 @@ def unarchive_note(body: NoteArchiveRequest):
     return _set_note_archived(body, False)
 
 
+_NOTE_PRIORITIES = {"immediate", "soon", "later"}
+
+
+class NotePriorityRequest(BaseModel):
+    id: str
+    owner: Optional[str] = None
+    priority: Optional[str] = None
+
+
+@router.post("/notes/priority")
+def set_note_priority(body: NotePriorityRequest):
+    """Set, change, or clear the priority of a tracked note (dashboard priority buttons)."""
+    if not body.id or not body.id.strip():
+        raise HTTPException(400, detail="id is required")
+    eid = body.id.strip()
+    prio = (body.priority or "").strip().lower() or None
+    if prio is not None and prio not in _NOTE_PRIORITIES:
+        raise HTTPException(400, detail="priority must be immediate, soon, later, or null")
+    ev = store.get_event(eid)
+    if not ev:
+        raise HTTPException(404, detail="note not found")
+    if (ev.get("kind") or "event") != "note":
+        raise HTTPException(400, detail="not a note")
+    store.update_event(eid, {"priority": prio})
+    return {"id": eid, "priority": prio}
+
+
 @router.get("/events")
 def list_events(
     frm: Optional[str] = Query(None, alias="from"),
