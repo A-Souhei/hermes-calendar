@@ -1389,6 +1389,7 @@
   // --- tracked notes (remediation queue) ------------------------------------
 
   var NOTE_ARCHIVE_FILTERS = [["open", "Open"], ["archived", "Archived"], ["all", "All"]];
+  var NOTE_PRIORITY_OPTIONS = [["immediate", "Immediate"], ["soon", "Soon"], ["later", "Later"]];
   var NOTES_PAGE_SIZE = 10;
 
   function notePriorityBadge(priority) {
@@ -1443,6 +1444,25 @@
             },
             busy ? "…" : (archived ? "↺ Restore" : "✓ Archive")
           )
+        ),
+        h(
+          "div",
+          { className: "cal-note-priority-set" },
+          NOTE_PRIORITY_OPTIONS.map(function (opt) {
+            const active = (note.priority || "").toLowerCase() === opt[0];
+            return h(
+              Button,
+              {
+                key: opt[0],
+                variant: active ? "secondary" : "outline",
+                size: "sm",
+                disabled: busy,
+                onClick: function () { props.onSetPriority(note, active ? null : opt[0]); },
+                title: active ? "Clear priority" : "Set priority to " + opt[1],
+              },
+              opt[1]
+            );
+          })
         )
       )
     );
@@ -1492,6 +1512,18 @@
         });
     }
 
+    function setPriority(note, priority) {
+      setBusyId(note.id);
+      setActionError(null);
+      SDK.fetchJSON(API + "/notes/priority", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: note.id, owner: owner || undefined, priority: priority }),
+      })
+        .then(function () { setBusyId(null); load(); if (props.onChanged) props.onChanged(); })
+        .catch(function (err) { setActionError((err && err.message) || "Action failed"); setBusyId(null); });
+    }
+
     const notes = (data && data.notes) || [];
     const total = (data && data.total) || 0;
     const limit = (data && data.limit) || NOTES_PAGE_SIZE;
@@ -1535,7 +1567,7 @@
             "div",
             { className: "space-y-2" },
             notes.map(function (n) {
-              return h(NoteCard, { key: n.id, note: n, busy: busyId === n.id, onToggle: toggleArchive });
+              return h(NoteCard, { key: n.id, note: n, busy: busyId === n.id, onToggle: toggleArchive, onSetPriority: setPriority });
             })
           )
         : null,
