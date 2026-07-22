@@ -3196,6 +3196,15 @@ CALENDAR_JOB_SUMMARY_SCHEMA = {
 # Notes (alertless quick-capture entries)
 # ---------------------------------------------------------------------------
 
+_NOTE_PRIORITY_ENUM = ["immediate", "soon", "later"]
+_NOTE_PRIORITY_RANK = {"immediate": 0, "soon": 1, "later": 2}
+
+
+def _note_priority_rank(priority: Optional[str]) -> int:
+    """Sort rank for a note priority; unprioritized/unknown sorts last."""
+    return _NOTE_PRIORITY_RANK.get(priority or "", 3)
+
+
 def _handle_calendar_add_note(args: Dict[str, Any], **kw) -> str:
     """Create an alertless note entry stored in the calendar DB."""
     content = str(args.get("content") or "").strip()
@@ -3235,6 +3244,15 @@ def _handle_calendar_add_note(args: Dict[str, Any], **kw) -> str:
         lang_lower = str(lang_raw).strip().lower()
         language = lang_lower if lang_lower in _LANGUAGE_ENUM else None
 
+    priority_raw = args.get("priority")
+    priority: Optional[str] = None
+    if priority_raw is not None and str(priority_raw).strip():
+        priority = str(priority_raw).strip().lower()
+        if priority not in _NOTE_PRIORITY_ENUM:
+            return tool_error(
+                f"Invalid priority {priority_raw!r} — use one of: {', '.join(_NOTE_PRIORITY_ENUM)}."
+            )
+
     d = {
         "title": content,
         "description": args.get("details"),
@@ -3252,6 +3270,7 @@ def _handle_calendar_add_note(args: Dict[str, Any], **kw) -> str:
         "notify_email": None,
         "planning_id": None,
         "kind": "note",
+        "priority": priority,
     }
     try:
         event_id = store.add_event(d)
@@ -3267,11 +3286,12 @@ def _handle_calendar_add_note(args: Dict[str, Any], **kw) -> str:
         "when_utc": start_utc,
         "tags": tags,
         "owner": owner,
+        "priority": priority,
     })
 
 
 def _handle_calendar_list_notes(args: Dict[str, Any], **kw) -> str:
-    """Search and return notes for an owner, most recent first."""
+    """Search and return notes for an owner, priority-ordered then most recent first."""
     from zoneinfo import ZoneInfo
 
     owner_raw = args.get("owner")
@@ -3279,10 +3299,18 @@ def _handle_calendar_list_notes(args: Dict[str, Any], **kw) -> str:
     if not owner:
         return tool_error("owner is required")
 
+    archived_raw = str(args.get("archived") or "open").strip().lower()
+    if archived_raw not in ("open", "archived", "all"):
+        archived_raw = "open"
+
     try:
         notes = store.list_events(owner=owner, kind="note")
     except Exception as e:
         return tool_error(f"Failed to list notes: {e}")
+
+    if archived_raw != "all":
+        want_archived = archived_raw == "archived"
+        notes = [n for n in notes if bool(n.get("archived_utc")) == want_archived]
 
     # Optional date-range filter on note timestamp (start_utc).
     from_raw = args.get("from")
@@ -3356,12 +3384,84 @@ def _handle_calendar_list_notes(args: Dict[str, Any], **kw) -> str:
             "when_local": when_local,
             "tags": note.get("tags"),
             "created_utc": note.get("created_utc"),
+            "priority": note.get("priority"),
+            "archived": bool(note.get("archived_utc")),
+            "archived_utc": note.get("archived_utc"),
         })
 
-    # Most recent first.
+    # Most recent first within a priority, then priority first (immediate > soon >
+    # later > unset) — two stable sorts compose into the combined ordering.
     result_notes.sort(key=lambda n: n["when_utc"], reverse=True)
+    result_notes.sort(key=lambda n: _note_priority_rank(n["priority"]))
 
     return tool_result({"count": len(result_notes), "notes": result_notes})
+
+
+def _resolve_note(args: Dict[str, Any]) -> tuple:
+    """Shared owner/id resolution + kind check for archive/delete note handlers.
+
+    Returns (event_dict, None) on success, or (None, error_json_str) on failure.
+    """
+    owner_raw = args.get("owner")
+    owner = (str(owner_raw).strip() or None) if owner_raw is not None else None
+    if not owner:
+        return None, tool_error("owner is required")
+    if not users_mod.is_registered(owner):
+        return None, tool_error(_unregistered_owner_error(owner))
+
+    eid = _resolve_event_id(args.get("id"), owner=owner)
+    if not eid:
+        return None, tool_error("Note not found — pass its id, or a #number together with the owner.")
+    ev = store.get_event(eid)
+    if ev is None:
+        return None, tool_error(f"Note not found: {eid}")
+    if ev.get("kind") != "note":
+        return None, tool_error("Not a note (use calendar_remove_event for events).")
+    return ev, None
+
+
+def _handle_calendar_archive_note(args: Dict[str, Any], **kw) -> str:
+    """Archive (or unarchive) a note, taking it out of (or back into) the open queue."""
+    ev, err = _resolve_note(args)
+    if err:
+        return err
+    event_id = ev["id"]
+
+    unarchive = bool(args.get("unarchive", False))
+    archived_utc = None if unarchive else datetime.now(timezone.utc).isoformat()
+    try:
+        store.update_event(event_id, {"archived_utc": archived_utc})
+    except Exception as e:
+        logger.exception("calendar_archive_note store error")
+        return tool_error(f"Failed to update note: {e}")
+
+    result: Dict[str, Any] = {
+        "archived": not unarchive,
+        "id": event_id,
+        "content": ev["title"],
+        "archived_utc": archived_utc,
+    }
+    if unarchive:
+        result["unarchived"] = True
+    return tool_result(result)
+
+
+def _handle_calendar_delete_note(args: Dict[str, Any], **kw) -> str:
+    """Permanently delete a note — no confirmation gate (single lightweight entry)."""
+    ev, err = _resolve_note(args)
+    if err:
+        return err
+    event_id = ev["id"]
+
+    try:
+        removed = store.remove_event(event_id)
+    except Exception as e:
+        logger.exception("calendar_delete_note store error")
+        return tool_error(f"Failed to delete note: {e}")
+    if not removed:
+        return tool_error(f"Note not found: {event_id}")
+
+    return tool_result({"deleted": True, "id": event_id})
 
 
 CALENDAR_ADD_NOTE_SCHEMA = {
@@ -3411,6 +3511,15 @@ CALENDAR_ADD_NOTE_SCHEMA = {
                     f"Defaults to {recurrence_mod.DEFAULT_TZ}."
                 ),
             },
+            "priority": {
+                "type": ["string", "null"],
+                "enum": _NOTE_PRIORITY_ENUM + [None],
+                "description": (
+                    "Urgency for remediation: 'immediate' = needs action now, "
+                    "'soon' = act in the near term, 'later' = no rush. Drives ordering "
+                    "in calendar_list_notes. Omit if the note has no urgency."
+                ),
+            },
         },
         "required": ["content", "owner"],
     },
@@ -3419,11 +3528,13 @@ CALENDAR_ADD_NOTE_SCHEMA = {
 CALENDAR_LIST_NOTES_SCHEMA = {
     "name": "calendar_list_notes",
     "description": (
-        "Search an owner's notes for recall. Returns notes most-recent-first. "
-        "Supports an optional text query (substring match over content, details, and tags), "
-        "and optional 'from'/'to' date-range bounds over the note's timestamp "
-        "(e.g. pass last Monday … today for 'what did I note last week?'). "
-        "Notes never appear in the agenda or digest — use this tool to recall them."
+        "Search an owner's notes for recall. Returns notes ordered by priority "
+        "(immediate, then soon, then later, then unprioritized) and most-recent-first "
+        "within each priority — so this doubles as a remediation queue: work the top "
+        "of the list down. Supports an optional text query (substring match over "
+        "content, details, and tags), and optional 'from'/'to' date-range bounds over "
+        "the note's timestamp (e.g. pass last Monday … today for 'what did I note last "
+        "week?'). Notes never appear in the agenda or digest — use this tool to recall them."
     ),
     "parameters": {
         "type": "object",
@@ -3441,8 +3552,61 @@ CALENDAR_LIST_NOTES_SCHEMA = {
                 "type": "string",
                 "description": "Upper bound on note timestamp (ISO datetime). E.g. end of last week.",
             },
+            "archived": {
+                "type": "string",
+                "enum": ["open", "archived", "all"],
+                "description": (
+                    "Filter by archive state (default 'open'): 'open' = not yet archived "
+                    "(the active remediation queue), 'archived' = resolved notes, "
+                    "'all' = both."
+                ),
+            },
         },
         "required": ["owner"],
+    },
+}
+
+CALENDAR_ARCHIVE_NOTE_SCHEMA = {
+    "name": "calendar_archive_note",
+    "description": (
+        "Mark a note as archived (resolved) so it drops out of the default "
+        "calendar_list_notes remediation queue, or pass unarchive=true to restore "
+        "it to open."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "id": {
+                "type": "string",
+                "description": "Note ID or #number (e.g. '#3'). Requires owner to resolve a #number.",
+            },
+            "unarchive": {
+                "type": "boolean",
+                "description": "Set true to restore an archived note back to open. Default false.",
+            },
+        },
+        "required": ["owner", "id"],
+    },
+}
+
+CALENDAR_DELETE_NOTE_SCHEMA = {
+    "name": "calendar_delete_note",
+    "description": (
+        "Permanently delete a note. Unlike calendar_remove_event, this deletes "
+        "immediately with no confirmation step — notes are lightweight, alertless "
+        "entries with no series or reports to lose."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string", "description": _OWNER_DESCRIPTION},
+            "id": {
+                "type": "string",
+                "description": "Note ID or #number (e.g. '#3'). Requires owner to resolve a #number.",
+            },
+        },
+        "required": ["owner", "id"],
     },
 }
 
@@ -4295,6 +4459,8 @@ _TOOLS = (
     ("calendar_job_summary",      CALENDAR_JOB_SUMMARY_SCHEMA,      _handle_calendar_job_summary,      "📊"),
     ("calendar_add_note",         CALENDAR_ADD_NOTE_SCHEMA,         _handle_calendar_add_note,         "🗒️"),
     ("calendar_list_notes",       CALENDAR_LIST_NOTES_SCHEMA,       _handle_calendar_list_notes,       "📒"),
+    ("calendar_archive_note",     CALENDAR_ARCHIVE_NOTE_SCHEMA,     _handle_calendar_archive_note,     "📦"),
+    ("calendar_delete_note",      CALENDAR_DELETE_NOTE_SCHEMA,      _handle_calendar_delete_note,      "🗑️"),
     ("calendar_tag",              CALENDAR_TAG_SCHEMA,              _handle_calendar_tag,              "🏷️"),
     ("calendar_convert_to_job",     CALENDAR_CONVERT_TO_JOB_SCHEMA,     _handle_calendar_convert_to_job,     "🛠️"),
     ("calendar_convert_to_regular", CALENDAR_CONVERT_TO_REGULAR_SCHEMA, _handle_calendar_convert_to_regular, "📅"),
